@@ -1,0 +1,7 @@
+apiVersion: etcd.lllamnyp.su/v1alpha1
+kind: EtcdPeer
+metadata:
+  name: etcdpeer-sample
+spec:
+  # Add fields here
+  foo: bar
