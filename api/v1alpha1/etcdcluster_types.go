@@ -28,17 +28,47 @@ type EtcdClusterSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
 
-	// Foo is an example field of EtcdCluster. Edit EtcdCluster_types.go to remove/update
-	Foo string `json:"foo,omitempty"`
+	// ClusterSize is the number of peers, including any preconfigured imported
+	// peers that will form the etcd cluster
+	ClusterSize int `json:"clusterSize,omitempty"`
 }
 
 // EtcdClusterStatus defines the observed state of EtcdCluster
 type EtcdClusterStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
+
+	// HealthyManagedPeers represents the number of etcd cluster members that have
+	// been created by the controller and are in a healthy state
+	HealthyManagedPeers int `json:"healthyManagedPeers"`
+
+	// TODO: type def here
+	HealthyImportedPeers int `json:"healthyImportedPeers"`
+
+	// TODO: type def here
+	ImportedPeers int `json:"importedPeers"`
+
+	// TODO: type def here
+	ManagedPeers int `json:"managedPeers"`
+
+	// Phase
+	// +kubebuilder:default:=New
+	Phase Phase `json:"phase"`
+
+	// Peers are the total number of EtcdPeers targeted by this cluster
+	Peers int `json:"peers,omitempty"`
 }
 
+// +kubebuilder:validation:Enum=New
+type Phase string
+
+const (
+	PhaseNew Phase = "New"
+)
+
 // +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:subresource:scale:specpath=.spec.clusterSize,statuspath=.status.peers
 
 // EtcdCluster is the Schema for the etcdclusters API
 type EtcdCluster struct {

@@ -20,6 +20,7 @@ import (
 	"context"
 
 	"github.com/go-logr/logr"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -38,10 +39,22 @@ type EtcdClusterReconciler struct {
 // +kubebuilder:rbac:groups=etcd.lllamnyp.su,resources=etcdclusters/status,verbs=get;update;patch
 
 func (r *EtcdClusterReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
-	_ = context.Background()
-	_ = r.Log.WithValues("etcdcluster", req.NamespacedName)
+	ctx := context.Background()
+	log := r.Log.WithValues("etcdcluster", req.NamespacedName)
 
 	// your logic here
+	var c etcdv1alpha1.EtcdCluster
+
+	if err := r.Get(ctx, req.NamespacedName, &c); err != nil {
+		if errors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+		log.Error(err, "Failed to retrieve object", "EtcdCluster", req.NamespacedName)
+	}
+
+	if c.Status.Phase == etcdv1alpha1.PhaseNew {
+		log.Info("New cluster")
+	}
 
 	return ctrl.Result{}, nil
 }
