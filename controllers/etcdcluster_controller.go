@@ -26,6 +26,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	etcdv1alpha1 "github.com/lllamnyp/etcd-operator/api/v1alpha1"
+
+	_ "github.com/lllamnyp/etcd-operator/internal/etcd"
 )
 
 // EtcdClusterReconciler reconciles a EtcdCluster object
