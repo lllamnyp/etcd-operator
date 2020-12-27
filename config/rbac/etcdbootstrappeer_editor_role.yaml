@@ -1,0 +1,24 @@
+# permissions for end users to edit etcdbootstrappeers.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: etcdbootstrappeer-editor-role
+rules:
+- apiGroups:
+  - etcd.lllamnyp.su
+  resources:
+  - etcdbootstrappeers
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - etcd.lllamnyp.su
+  resources:
+  - etcdbootstrappeers/status
+  verbs:
+  - get

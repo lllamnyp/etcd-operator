@@ -82,6 +82,14 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "EtcdPeer")
 		os.Exit(1)
 	}
+	if err = (&controllers.EtcdBootstrapPeerReconciler{
+		Client: mgr.GetClient(),
+		Log:    ctrl.Log.WithName("controllers").WithName("EtcdBootstrapPeer"),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "EtcdBootstrapPeer")
+		os.Exit(1)
+	}
 	// +kubebuilder:scaffold:builder
 
 	setupLog.Info("starting manager")
