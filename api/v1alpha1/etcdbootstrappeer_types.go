@@ -34,6 +34,9 @@ type EtcdBootstrapPeerSpec struct {
 type EtcdBootstrapPeerStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
+	Healthy bool   `json:"healthy"`
+	Phase   Phase  `json:"phase"`
+	Status  string `json:"status"`
 }
 
 // +kubebuilder:object:root=true

@@ -30,9 +30,7 @@ type EtcdClusterSpec struct {
 	Selector map[string]string `json:"selector"`
 
 	// ClusterSize is the number of peers, excluding bootstrap peers.
-	// +kubebuilder:default:=1
-	// TODO: expect problems here as omitempty and zero value of int interact in weird ways
-	ClusterSize int `json:"clusterSize,omitempty"`
+	ClusterSize int `json:"clusterSize"`
 
 	// BootstrapSpec describes the rules by which the EtcdCluster attaches
 	// existing members of an etcd cluster.
@@ -68,19 +66,29 @@ type EtcdClusterSpec struct {
 	AntiAffinityMode AntiAffinityMode `json:"antiAffinityMode"`
 
 	// StorageSpec describes the underlying storage for the managed peers.
-	// Possible types of storage are `hostPath´ and `emptyDir´. The
-	// emptyDir can be backed by memory.
+	// Possible types of storage are `HostPath´ and `EmptyDir´. The
+	// EmptyDir can be backed by memory.
 	StorageSpec StorageSpec `json:"storageSpec"`
+}
+
+type PeerStatus struct {
+	Name           string `json:"name"`
+	EtcdPeerStatus `json:",inline"`
+}
+
+type BootstrapPeerStatus struct {
+	Name                    string `json:"name"`
+	EtcdBootstrapPeerStatus `json:",inline"`
 }
 
 // EtcdClusterStatus defines the observed state of EtcdCluster
 type EtcdClusterStatus struct {
 
 	// TODO: type def here
-	Peers int `json:"peers"`
+	Peers []PeerStatus `json:"peers"`
 
 	// TODO: type def here
-	BootstrapPeers int `json:"bootstrapPeers"`
+	BootstrapPeers []BootstrapPeerStatus `json:"bootstrapPeers"`
 
 	// Phase
 	// +kubebuilder:default:=New
@@ -109,7 +117,7 @@ type StorageSpec struct {
 	Backend BackendType `json:"backend"`
 }
 
-// TODO: correct spec for enum
+// +kubebuilder:validation:Enum=HostPath;EmptyDir
 type StorageType string
 
 const (
@@ -117,7 +125,7 @@ const (
 	StorageTypeEmptyDir StorageType = "EmptyDir"
 )
 
-// TODO: correct spec for enum
+// +kubebuilder:validation:Enum=Disk;Memory
 type BackendType string
 
 const (
@@ -125,8 +133,7 @@ const (
 	BackendTypeMemory BackendType = "Memory"
 )
 
-// TODO: correct spec for enum
-// +kubebuilder:validation:Enum=Required
+// +kubebuilder:validation:Enum=Required;Preferred;None
 type AntiAffinityMode string
 
 const (
@@ -139,7 +146,8 @@ const (
 type Phase string
 
 const (
-	PhaseNew Phase = "New"
+	PhaseNew      Phase = "New"
+	PhaseCreating Phase = "Creating"
 )
 
 // +kubebuilder:object:root=true
@@ -166,4 +174,44 @@ type EtcdClusterList struct {
 
 func init() {
 	SchemeBuilder.Register(&EtcdCluster{}, &EtcdClusterList{})
+}
+
+func (c *EtcdCluster) CreatePeer() *EtcdPeer {
+	var p = &EtcdPeer{}
+	p.GenerateName = c.Name + "-"
+	p.SetLabels(c.GetLabels())
+	p.Namespace = c.Namespace
+	owner := metav1.NewControllerRef(c, c.GroupVersionKind())
+	p.SetOwnerReferences([]metav1.OwnerReference{*owner})
+	return p
+}
+
+func (c *EtcdCluster) HealthyPeerCount() int {
+	count := 0
+	for _, v := range c.Status.Peers {
+		if v.Healthy {
+			count += 1
+		}
+	}
+	for _, v := range c.Status.BootstrapPeers {
+		if v.Healthy {
+			count += 1
+		}
+	}
+	return count
+}
+
+func (c *EtcdCluster) PeerCount() int {
+	count := 0
+	for _, v := range c.Status.Peers {
+		if v.Status != "Evicted" {
+			count += 1
+		}
+	}
+	for _, v := range c.Status.BootstrapPeers {
+		if v.Status != "Evicted" {
+			count += 1
+		}
+	}
+	return count
 }

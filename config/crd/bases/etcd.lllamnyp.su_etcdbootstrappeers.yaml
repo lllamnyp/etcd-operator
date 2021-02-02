@@ -6,20 +6,20 @@ metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.3.0
   creationTimestamp: null
-  name: etcdpeers.etcd.lllamnyp.su
+  name: etcdbootstrappeers.etcd.lllamnyp.su
 spec:
   group: etcd.lllamnyp.su
   names:
-    kind: EtcdPeer
-    listKind: EtcdPeerList
-    plural: etcdpeers
-    singular: etcdpeer
+    kind: EtcdBootstrapPeer
+    listKind: EtcdBootstrapPeerList
+    plural: etcdbootstrappeers
+    singular: etcdbootstrappeer
   scope: Namespaced
   versions:
   - name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: EtcdPeer is the Schema for the etcdpeers API
+        description: EtcdBootstrapPeer is the Schema for the etcdbootstrappeers API
         properties:
           apiVersion:
             description: 'APIVersion defines the versioned schema of this representation
@@ -34,17 +34,20 @@ spec:
           metadata:
             type: object
           spec:
-            description: EtcdPeerSpec defines the desired state of EtcdPeer
+            description: EtcdBootstrapPeerSpec defines the desired state of EtcdBootstrapPeer
             properties:
               foo:
-                description: Foo is an example field of EtcdPeer. Edit EtcdPeer_types.go
+                description: Foo is an example field of EtcdBootstrapPeer. Edit EtcdBootstrapPeer_types.go
                   to remove/update
                 type: string
             type: object
           status:
-            description: EtcdPeerStatus defines the observed state of EtcdPeer
+            description: EtcdBootstrapPeerStatus defines the observed state of EtcdBootstrapPeer
             properties:
               healthy:
+                description: 'INSERT ADDITIONAL STATUS FIELD - define observed state
+                  of cluster Important: Run "make" to regenerate code after modifying
+                  this file'
                 type: boolean
               phase:
                 enum:

@@ -18,9 +18,10 @@ package controllers
 
 import (
 	"context"
+	"time"
 
 	"github.com/go-logr/logr"
-	"k8s.io/apimachinery/pkg/api/errors"
+	_ "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -48,17 +49,29 @@ func (r *EtcdClusterReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error)
 	var c etcdv1alpha1.EtcdCluster
 
 	if err := r.Get(ctx, req.NamespacedName, &c); err != nil {
-		if errors.IsNotFound(err) {
-			return ctrl.Result{}, nil
-		}
-		log.Error(err, "Failed to retrieve object", "EtcdCluster", req.NamespacedName)
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	var pL etcdv1alpha1.EtcdPeerList
+	var matchingLabels client.MatchingLabels = c.Spec.Selector
+	if err := r.List(ctx, &pL, client.InNamespace(req.Namespace), matchingLabels); err != nil {
+		log.Error(err, "Couldn't get controlled peers")
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	for _ = range pL.Items {
 	}
 
 	if c.Status.Phase == etcdv1alpha1.PhaseNew {
 		log.Info("New cluster")
 	}
 
-	return ctrl.Result{}, nil
+	if c.PeerCount() < c.Spec.ClusterSize {
+		p := c.CreatePeer()
+		r.Create(ctx, p)
+	}
+
+	return ctrl.Result{RequeueAfter: time.Second * 5}, nil
 }
 
 func (r *EtcdClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {

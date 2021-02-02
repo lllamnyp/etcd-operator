@@ -9,6 +9,26 @@ rules:
 - apiGroups:
   - etcd.lllamnyp.su
   resources:
+  - etcdbootstrappeers
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - etcd.lllamnyp.su
+  resources:
+  - etcdbootstrappeers/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - etcd.lllamnyp.su
+  resources:
   - etcdclusters
   verbs:
   - create

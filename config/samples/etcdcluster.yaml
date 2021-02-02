@@ -1,0 +1,18 @@
+apiVersion: etcd.lllamnyp.su/v1alpha1
+kind: EtcdCluster
+metadata:
+  name: etcdcluster
+spec:
+  antiAffinityMode: Required
+  bootstrapSpec:
+    enabled: false
+  clusterSize: 3
+  hostNetwork: true
+  selector:
+    cluster: mycluster
+  peerTrustedCA: peerTrustedCA
+  trustedCA: trustedCA
+  storageSpec:
+    type: EmptyDir
+    backend: Memory
+    hostPath: /etcd

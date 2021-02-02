@@ -36,32 +36,152 @@ spec:
           spec:
             description: EtcdClusterSpec defines the desired state of EtcdCluster
             properties:
+              antiAffinityMode:
+                description: AntiAffinityMode determines the type of affinity rules
+                  applied to the etcd pods. Valid values are `Required´, `Preferred´,
+                  or `None´. By default, the etcd pods of a single cluster are created
+                  with an inter-pod anti-affinity rule preventing them from being
+                  scheduled on one node. This restriction can be softened to the equivalent
+                  of `preferredDuringSchedulingIgnoredDuringExecution´. When hostNetwork
+                  == true, the behavior is always equivalent to `Required´ since the
+                  pods are claiming the same host port.
+                enum:
+                - Required
+                - Preferred
+                - None
+                type: string
+              bootstrapSpec:
+                description: BootstrapSpec describes the rules by which the EtcdCluster
+                  attaches existing members of an etcd cluster.
+                properties:
+                  enabled:
+                    default: false
+                    description: Enabled shows if this EtcdCluster attaches itself
+                      to existing etcd peers.
+                    type: boolean
+                  selector:
+                    additionalProperties:
+                      type: string
+                    description: Selector contains a set of labels matching existing
+                      EtcdBootstrapPeers
+                    type: object
+                required:
+                - enabled
+                type: object
               clusterSize:
-                description: ClusterSize is the number of peers, including any preconfigured
-                  imported peers that will form the etcd cluster
+                description: ClusterSize is the number of peers, excluding bootstrap
+                  peers.
                 type: integer
+              hostNetwork:
+                default: true
+                description: HostNetwork determines whether etcd pods are launched
+                  in the host network namespace or usage of the in-cluster CNI is
+                  attempted.
+                type: boolean
+              peerTrustedCA:
+                description: PeerTrustedCA is the name of the TLS-secret holding the
+                  CA key pair which must sign certificates used for authentication
+                  during peer- to-peer communication within the etcd cluster. The
+                  secret can be automatically generated, but must already exist and
+                  correspond to the key pair of the bootstrap cluster when attaching
+                  to one.
+                type: string
+              selector:
+                additionalProperties:
+                  type: string
+                description: Selector is the set of labels to match managed EtcdPeers
+                  against.
+                type: object
+              storageSpec:
+                description: StorageSpec describes the underlying storage for the
+                  managed peers. Possible types of storage are `HostPath´ and `EmptyDir´.
+                  The EmptyDir can be backed by memory.
+                properties:
+                  backend:
+                    description: 'TODO: description'
+                    enum:
+                    - Disk
+                    - Memory
+                    type: string
+                  hostPath:
+                    description: 'TODO: description'
+                    type: string
+                  type:
+                    description: 'TODO: description'
+                    enum:
+                    - HostPath
+                    - EmptyDir
+                    type: string
+                required:
+                - backend
+                - hostPath
+                - type
+                type: object
+              trustedCA:
+                description: TrustedCA is the name of the TLS-secret holding the CA
+                  key pair which must sign client certificates used for client authentication
+                  when attempting to connect to the etcd cluster. The secret can be
+                  automatically generated, but must already exist and correspond to
+                  the key pair of the bootstrap cluster when attaching to one.
+                type: string
+            required:
+            - antiAffinityMode
+            - bootstrapSpec
+            - clusterSize
+            - hostNetwork
+            - peerTrustedCA
+            - selector
+            - storageSpec
+            - trustedCA
             type: object
           status:
             description: EtcdClusterStatus defines the observed state of EtcdCluster
             properties:
-              healthyImportedPeers:
+              bootstrapPeers:
                 description: 'TODO: type def here'
-                type: integer
-              healthyManagedPeers:
-                description: HealthyManagedPeers represents the number of etcd cluster
-                  members that have been created by the controller and are in a healthy
-                  state
-                type: integer
-              importedPeers:
-                description: 'TODO: type def here'
-                type: integer
-              managedPeers:
-                description: 'TODO: type def here'
-                type: integer
+                items:
+                  properties:
+                    healthy:
+                      description: 'INSERT ADDITIONAL STATUS FIELD - define observed
+                        state of cluster Important: Run "make" to regenerate code
+                        after modifying this file'
+                      type: boolean
+                    name:
+                      type: string
+                    phase:
+                      enum:
+                      - New
+                      type: string
+                    status:
+                      type: string
+                  required:
+                  - healthy
+                  - name
+                  - phase
+                  - status
+                  type: object
+                type: array
               peers:
-                description: Peers are the total number of EtcdPeers targeted by this
-                  cluster
-                type: integer
+                description: 'TODO: type def here'
+                items:
+                  properties:
+                    healthy:
+                      type: boolean
+                    name:
+                      type: string
+                    phase:
+                      enum:
+                      - New
+                      type: string
+                    status:
+                      type: string
+                  required:
+                  - healthy
+                  - name
+                  - phase
+                  - status
+                  type: object
+                type: array
               phase:
                 default: New
                 description: Phase
@@ -69,10 +189,8 @@ spec:
                 - New
                 type: string
             required:
-            - healthyImportedPeers
-            - healthyManagedPeers
-            - importedPeers
-            - managedPeers
+            - bootstrapPeers
+            - peers
             - phase
             type: object
         type: object
