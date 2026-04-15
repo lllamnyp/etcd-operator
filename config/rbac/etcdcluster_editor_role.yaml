@@ -2,10 +2,17 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
+  labels:
+    app.kubernetes.io/name: clusterrole
+    app.kubernetes.io/instance: etcdcluster-editor-role
+    app.kubernetes.io/component: rbac
+    app.kubernetes.io/created-by: etcd-operator
+    app.kubernetes.io/part-of: etcd-operator
+    app.kubernetes.io/managed-by: kustomize
   name: etcdcluster-editor-role
 rules:
 - apiGroups:
-  - etcd.lllamnyp.su
+  - lllamnyp.su
   resources:
   - etcdclusters
   verbs:
@@ -17,7 +24,7 @@ rules:
   - update
   - watch
 - apiGroups:
-  - etcd.lllamnyp.su
+  - lllamnyp.su
   resources:
   - etcdclusters/status
   verbs:

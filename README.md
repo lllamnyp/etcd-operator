@@ -1,43 +1,94 @@
-# etcd operator
+# etcd-operator
+// TODO(user): Add simple overview of use/purpose
 
-This project is in early design stages, hence even architectural decisions are likely to change and internal inconsistencies are possible and even likely.
+## Description
+// TODO(user): An in-depth paragraph about your project and overview of use
 
-## Motivation
+## Getting Started
+You’ll need a Kubernetes cluster to run against. You can use [KIND](https://sigs.k8s.io/kind) to get a local cluster for testing, or run against a remote cluster.
+**Note:** Your controller will automatically use the current context in your kubeconfig file (i.e. whatever cluster `kubectl cluster-info` shows).
 
-This operator is designed with the primary intent of self-hosting a kubernetes' etcd cluster and optionally using the servers' RAM as a storage medium. Consequently, a necessary ability is to connect to an existing etcd cluster (i.e. the initial cluster used by the kubernetes cluster) and enlarge it by spawning new etcd peers.
+### Running on the cluster
+1. Install Instances of Custom Resources:
 
-Other desirable or mandatory features include:
+```sh
+kubectl apply -f config/samples/
+```
 
-- Self-healing, i.e. deletion of unhealthy members and the creation of new peers in their place.
-- Rapid creation of etcd clusters for general purposes.
-- Simplified TLS certificate and key management.
-- Enforcement of secure defaults.
-- A far-reaching goal may be to support persistent clusters that survive a complete outage when using persistent storage (`hostpath`). This is inapplicable for etcd clusters backing kubernetes.
-- An even further goal may be, nonetheless, to provide a simplified path to recovery in the event of a complete outage of such a cluster.
+2. Build and push your image to the location specified by `IMG`:
 
-Non-goals are:
+```sh
+make docker-build docker-push IMG=<some-registry>/etcd-operator:tag
+```
 
-- Arbitrary configurability, such as the implementation of support for the entire set of flags of the etcd binary.
-- etcdV2 support.
-- Management of the bootstrap cluster.
-- Provisioning and management of storage beyond `hostPath` and `emptyDir`.
+3. Deploy the controller to the cluster with the image specified by `IMG`:
 
-## Workflow
+```sh
+make deploy IMG=<some-registry>/etcd-operator:tag
+```
 
-### Attaching to an existing cluster
+### Uninstall CRDs
+To delete the CRDs from the cluster:
 
-1. The set of CAs, certificates, and private keys of the existing cluster is gathered and added to the target namespace as kubernetes secrets by the user.
-2. The existing etcd peers are described as `EtcdBootstrapPeer` objects and created in the cluster.
-3. An `EtcdCluster` object is created, targeting the `EtcdBootstrapPeer` objects.
-4. The operator generates keys and certificates for new members of the etcd cluster.
-5. A new etcd peer is spawned as an `EtcdPeer` object.
-6. The operator waits for the new `EtcdPeer` to report as healthy.
-7. The previous two steps are repeated as many times as necessary.
+```sh
+make uninstall
+```
 
-### Removing the bootstrap cluster
+### Undeploy controller
+UnDeploy the controller from the cluster:
 
-1. The user updates the `EtcdCluster` object to signal that the bootstrap cluster is no longer necessary.
-2. The operator calls the etcd API to remove the initial members.
-3. The operator updates the `EtcdCluster` object to disown and stop tracking the `EtcdBootstrapPeer` objects.
-4. The user manually stops the initial etcd peers.
+```sh
+make undeploy
+```
+
+## Contributing
+// TODO(user): Add detailed information on how you would like others to contribute to this project
+
+### How it works
+This project aims to follow the Kubernetes [Operator pattern](https://kubernetes.io/docs/concepts/extend-kubernetes/operator/).
+
+It uses [Controllers](https://kubernetes.io/docs/concepts/architecture/controller/),
+which provide a reconcile function responsible for synchronizing resources until the desired state is reached on the cluster.
+
+### Test It Out
+1. Install the CRDs into the cluster:
+
+```sh
+make install
+```
+
+2. Run your controller (this will run in the foreground, so switch to a new terminal if you want to leave it running):
+
+```sh
+make run
+```
+
+**NOTE:** You can also run this in one step by running: `make install run`
+
+### Modifying the API definitions
+If you are editing the API definitions, generate the manifests such as CRs or CRDs using:
+
+```sh
+make manifests
+```
+
+**NOTE:** Run `make --help` for more information on all potential `make` targets
+
+More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
+
+## License
+
+Copyright 2023 Timofey Larkin.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
 

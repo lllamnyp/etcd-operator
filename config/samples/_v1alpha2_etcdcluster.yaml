@@ -1,0 +1,8 @@
+apiVersion: lllamnyp.su/v1alpha2
+kind: EtcdCluster
+metadata:
+  name: etcdcluster-sample
+spec:
+  replicas: 3
+  version: "3.5.17"
+  storage: 1Gi
