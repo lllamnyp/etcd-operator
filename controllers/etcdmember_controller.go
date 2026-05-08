@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -111,7 +112,7 @@ func (r *EtcdMemberReconciler) handleDeletion(ctx context.Context, member *lll.E
 		clusterDeleting = true
 	}
 
-	if !clusterDeleting && member.Status.MemberID != nil {
+	if !clusterDeleting && member.Status.MemberID != "" {
 		if err := r.removeMemberFromEtcd(ctx, member); err != nil {
 			log.Error(err, "failed to remove member from etcd, will retry")
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
@@ -157,7 +158,11 @@ func (r *EtcdMemberReconciler) removeMemberFromEtcd(ctx context.Context, member 
 	rmCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	_, err = etcdClient.MemberRemove(rmCtx, *member.Status.MemberID)
+	id, err := strconv.ParseUint(member.Status.MemberID, 16, 64)
+	if err != nil {
+		return fmt.Errorf("parse memberID %q: %w", member.Status.MemberID, err)
+	}
+	_, err = etcdClient.MemberRemove(rmCtx, id)
 	return err
 }
 
@@ -242,9 +247,20 @@ func (r *EtcdMemberReconciler) buildPod(member *lll.EtcdMember) *corev1.Pod {
 		Spec: corev1.PodSpec{
 			Hostname:  member.Name,
 			Subdomain: member.Spec.ClusterName, // headless service name
+			SecurityContext: &corev1.PodSecurityContext{
+				SeccompProfile: &corev1.SeccompProfile{
+					Type: corev1.SeccompProfileTypeRuntimeDefault,
+				},
+			},
 			Containers: []corev1.Container{{
 				Name:  "etcd",
 				Image: fmt.Sprintf("%s:v%s", EtcdImage, member.Spec.Version),
+				SecurityContext: &corev1.SecurityContext{
+					AllowPrivilegeEscalation: ptrBool(false),
+					Capabilities: &corev1.Capabilities{
+						Drop: []corev1.Capability{"ALL"},
+					},
+				},
 				Command: []string{
 					"etcd",
 					"--name=" + member.Name,
@@ -334,6 +350,14 @@ func (r *EtcdMemberReconciler) updateStatus(ctx context.Context, member *lll.Etc
 			Reason:  "PodReady",
 			Message: "etcd member is ready",
 		})
+		// Once the pod is ready, learn this member's etcd ID and record
+		// it on status. The finalizer needs it to call MemberRemove.
+		if member.Status.MemberID == "" {
+			if id, err := r.discoverMemberID(ctx, member); err == nil {
+				member.Status.MemberID = fmt.Sprintf("%x", id)
+			}
+			// On error we silently retry on the next reconcile.
+		}
 	} else {
 		setCondition(&member.Status.Conditions, metav1.Condition{
 			Type:    lll.MemberReady,
@@ -348,6 +372,34 @@ func (r *EtcdMemberReconciler) updateStatus(ctx context.Context, member *lll.Etc
 	}
 
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+}
+
+// discoverMemberID asks etcd for this member's ID by calling MemberList against
+// its own client endpoint and matching by name.
+func (r *EtcdMemberReconciler) discoverMemberID(ctx context.Context, member *lll.EtcdMember) (uint64, error) {
+	endpoint := clientURL(member.Name, member.Spec.ClusterName, member.Namespace)
+	c, err := clientv3.New(clientv3.Config{
+		Endpoints:   []string{endpoint},
+		DialTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		return 0, err
+	}
+	defer c.Close()
+
+	listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	resp, err := c.MemberList(listCtx)
+	if err != nil {
+		return 0, err
+	}
+	for _, m := range resp.Members {
+		if m.Name == member.Name {
+			return m.ID, nil
+		}
+	}
+	return 0, fmt.Errorf("member %q not found in etcd member list", member.Name)
 }
 
 // ── Manager wiring ───────────────────────────────────────────────────────

@@ -106,6 +106,8 @@ func memberOrdinal(name string) int {
 	return n
 }
 
+func ptrBool(b bool) *bool { return &b }
+
 // setCondition inserts or updates a condition, preserving LastTransitionTime
 // when the status has not changed.
 func setCondition(conditions *[]metav1.Condition, c metav1.Condition) {

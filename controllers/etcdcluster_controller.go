@@ -84,7 +84,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	current := int32(len(active))
 
 	// ── Bootstrap ──────────────────────────────────────────────────────
-	if cluster.Status.ClusterID == nil {
+	if cluster.Status.ClusterID == "" {
 		if current < desired {
 			log.Info("bootstrapping cluster", "current", current, "desired", desired)
 			return r.bootstrap(ctx, cluster, active, desired)
@@ -195,8 +195,7 @@ func (r *EtcdClusterReconciler) tryDiscoverCluster(
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
-	clusterID := resp.Header.ClusterId
-	cluster.Status.ClusterID = &clusterID
+	cluster.Status.ClusterID = fmt.Sprintf("%x", resp.Header.ClusterId)
 	if err := r.Status().Update(ctx, cluster); err != nil {
 		return ctrl.Result{}, err
 	}

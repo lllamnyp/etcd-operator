@@ -55,9 +55,11 @@ type EtcdClusterStatus struct {
 	// ReadyMembers is the count of members that are healthy and serving.
 	ReadyMembers int32 `json:"readyMembers,omitempty"`
 
-	// ClusterID is the etcd cluster ID, set after initial bootstrap.
+	// ClusterID is the etcd cluster ID in hex (e.g. "769f1c9e0d723d0b"),
+	// set after initial bootstrap. Stored as a string because uint64 values
+	// can exceed JSON's safe integer range.
 	// +optional
-	ClusterID *uint64 `json:"clusterID,omitempty"`
+	ClusterID string `json:"clusterID,omitempty"`
 
 	// Conditions represent the latest available observations of the cluster's state.
 	// +optional

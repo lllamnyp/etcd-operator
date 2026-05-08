@@ -55,9 +55,11 @@ type EtcdMemberSpec struct {
 
 // EtcdMemberStatus defines the observed state of a single etcd member.
 type EtcdMemberStatus struct {
-	// MemberID is the etcd-assigned member ID, set once the member joins the cluster.
+	// MemberID is the etcd-assigned member ID in hex (e.g. "ae36f238164a08ad"),
+	// set once the member joins the cluster. Stored as a string because uint64
+	// values can exceed JSON's safe integer range.
 	// +optional
-	MemberID *uint64 `json:"memberID,omitempty"`
+	MemberID string `json:"memberID,omitempty"`
 
 	// PodName is the name of the Pod running this member.
 	// +optional

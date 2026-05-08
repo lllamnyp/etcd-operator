@@ -75,9 +75,10 @@ spec:
             description: EtcdClusterStatus defines the observed state of an etcd cluster.
             properties:
               clusterID:
-                description: ClusterID is the etcd cluster ID, set after initial bootstrap.
-                format: int64
-                type: integer
+                description: ClusterID is the etcd cluster ID in hex (e.g. "769f1c9e0d723d0b"),
+                  set after initial bootstrap. Stored as a string because uint64 values
+                  can exceed JSON's safe integer range.
+                type: string
               conditions:
                 description: Conditions represent the latest available observations
                   of the cluster's state.

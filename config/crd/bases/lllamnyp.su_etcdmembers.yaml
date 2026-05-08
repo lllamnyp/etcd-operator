@@ -155,10 +155,11 @@ spec:
                   type: object
                 type: array
               memberID:
-                description: MemberID is the etcd-assigned member ID, set once the
-                  member joins the cluster.
-                format: int64
-                type: integer
+                description: MemberID is the etcd-assigned member ID in hex (e.g.
+                  "ae36f238164a08ad"), set once the member joins the cluster. Stored
+                  as a string because uint64 values can exceed JSON's safe integer
+                  range.
+                type: string
               podName:
                 description: PodName is the name of the Pod running this member.
                 type: string
