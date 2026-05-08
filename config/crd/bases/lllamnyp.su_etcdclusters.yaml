@@ -79,6 +79,12 @@ spec:
                   set after initial bootstrap. Stored as a string because uint64 values
                   can exceed JSON's safe integer range.
                 type: string
+              clusterToken:
+                description: ClusterToken is the value passed to etcd's --initial-cluster-token,
+                  recorded at bootstrap. Reused for all subsequent scale-up operations
+                  so existing clusters keep their original token even if the derivation
+                  rule changes in a later release.
+                type: string
               conditions:
                 description: Conditions represent the latest available observations
                   of the cluster's state.

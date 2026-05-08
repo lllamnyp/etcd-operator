@@ -51,6 +51,12 @@ type EtcdMemberSpec struct {
 	// InitialCluster is the value passed to etcd's --initial-cluster flag.
 	// Set by the cluster controller at creation time.
 	InitialCluster string `json:"initialCluster"`
+
+	// ClusterToken is the value passed to etcd's --initial-cluster-token.
+	// Copied from EtcdCluster.status.clusterToken so all members of a cluster
+	// agree, and so changes to the cluster's token derivation rule don't
+	// affect already-running members.
+	ClusterToken string `json:"clusterToken"`
 }
 
 // EtcdMemberStatus defines the observed state of a single etcd member.

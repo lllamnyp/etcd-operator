@@ -61,6 +61,13 @@ type EtcdClusterStatus struct {
 	// +optional
 	ClusterID string `json:"clusterID,omitempty"`
 
+	// ClusterToken is the value passed to etcd's --initial-cluster-token,
+	// recorded at bootstrap. Reused for all subsequent scale-up operations
+	// so existing clusters keep their original token even if the derivation
+	// rule changes in a later release.
+	// +optional
+	ClusterToken string `json:"clusterToken,omitempty"`
+
 	// Conditions represent the latest available observations of the cluster's state.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`

@@ -248,6 +248,10 @@ func (r *EtcdMemberReconciler) buildPod(member *lll.EtcdMember) *corev1.Pod {
 			Hostname:  member.Name,
 			Subdomain: member.Spec.ClusterName, // headless service name
 			SecurityContext: &corev1.PodSecurityContext{
+				RunAsNonRoot: ptrBool(true),
+				RunAsUser:    ptrInt64(60000),
+				RunAsGroup:   ptrInt64(60000),
+				FSGroup:      ptrInt64(60000),
 				SeccompProfile: &corev1.SeccompProfile{
 					Type: corev1.SeccompProfileTypeRuntimeDefault,
 				},
@@ -270,7 +274,7 @@ func (r *EtcdMemberReconciler) buildPod(member *lll.EtcdMember) *corev1.Pod {
 					"--advertise-client-urls=" + cAddr,
 					"--initial-advertise-peer-urls=" + pAddr,
 					"--initial-cluster=" + member.Spec.InitialCluster,
-					"--initial-cluster-token=" + member.Spec.ClusterName,
+					"--initial-cluster-token=" + member.Spec.ClusterToken,
 					"--initial-cluster-state=" + clusterState,
 				},
 				Ports: []corev1.ContainerPort{

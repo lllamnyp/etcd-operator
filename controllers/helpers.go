@@ -106,7 +106,21 @@ func memberOrdinal(name string) int {
 	return n
 }
 
-func ptrBool(b bool) *bool { return &b }
+func ptrBool(b bool) *bool    { return &b }
+func ptrInt64(i int64) *int64 { return &i }
+
+// deriveClusterToken returns the etcd --initial-cluster-token value for a
+// cluster. Recorded in EtcdCluster.status.clusterToken at bootstrap so that
+// future changes to this rule don't break already-running clusters.
+func deriveClusterToken(cluster *lll.EtcdCluster) string {
+	return cluster.Name
+}
+
+// isBroken decides whether a member should be treated as broken (and replaced).
+// Stub: always false. Filled in once auto-replacement policy is decided.
+func (r *EtcdClusterReconciler) isBroken(_ lll.EtcdMember) bool {
+	return false
+}
 
 // setCondition inserts or updates a condition, preserving LastTransitionTime
 // when the status has not changed.

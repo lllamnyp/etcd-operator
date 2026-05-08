@@ -59,6 +59,12 @@ spec:
                 description: ClusterName is the name of the owning EtcdCluster.
                 minLength: 1
                 type: string
+              clusterToken:
+                description: ClusterToken is the value passed to etcd's --initial-cluster-token.
+                  Copied from EtcdCluster.status.clusterToken so all members of a
+                  cluster agree, and so changes to the cluster's token derivation
+                  rule don't affect already-running members.
+                type: string
               initialCluster:
                 description: InitialCluster is the value passed to etcd's --initial-cluster
                   flag. Set by the cluster controller at creation time.
@@ -76,6 +82,7 @@ spec:
                 type: string
             required:
             - clusterName
+            - clusterToken
             - initialCluster
             - storage
             - version

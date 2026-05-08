@@ -83,6 +83,16 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 	current := int32(len(active))
 
+	// ── Lock in the cluster token before any member references it. ────
+	if cluster.Status.ClusterToken == "" {
+		cluster.Status.ClusterToken = deriveClusterToken(cluster)
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			return ctrl.Result{}, err
+		}
+		// Re-queue with the freshly persisted token.
+		return ctrl.Result{Requeue: true}, nil
+	}
+
 	// ── Bootstrap ──────────────────────────────────────────────────────
 	if cluster.Status.ClusterID == "" {
 		if current < desired {
@@ -152,6 +162,7 @@ func (r *EtcdClusterReconciler) bootstrap(
 				Storage:        cluster.Spec.Storage,
 				Bootstrap:      true,
 				InitialCluster: initialCluster,
+				ClusterToken:   cluster.Status.ClusterToken,
 			},
 		}
 		if err := controllerutil.SetControllerReference(cluster, member, r.Scheme); err != nil {
@@ -254,6 +265,7 @@ func (r *EtcdClusterReconciler) scaleUp(
 			Storage:        cluster.Spec.Storage,
 			Bootstrap:      false,
 			InitialCluster: initialCluster,
+			ClusterToken:   cluster.Status.ClusterToken,
 		},
 	}
 	if err := controllerutil.SetControllerReference(cluster, member, r.Scheme); err != nil {
