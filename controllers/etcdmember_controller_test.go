@@ -163,6 +163,74 @@ func TestEnsurePVC_RefusesStaleOwner(t *testing.T) {
 	}
 }
 
+// TestEnsurePVC_RefusesPVCWithNoOwnerRefs: a PVC with no owner refs is no
+// longer "adopted" — the only legitimate adoption flow (operator-managed
+// scale-to-zero hand-off) is tracked separately and will use explicit
+// re-parenting. Until then, ensurePVC accepts only PVCs we created.
+func TestEnsurePVC_RefusesPVCWithNoOwnerRefs(t *testing.T) {
+	ctx := context.Background()
+	prePVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "data-test-0",
+			Namespace: "ns",
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+			},
+		},
+	}
+	member := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", UID: types.UID("uid"), Labels: memberLabels("test", "test-0")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"), InitialCluster: "x", ClusterToken: "test"},
+	}
+
+	c, _ := newTestClient(t, member, prePVC)
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t)}
+
+	if err := r.ensurePVC(ctx, member); err == nil {
+		t.Fatalf("ensurePVC should refuse to adopt a PVC with no owner references")
+	}
+}
+
+// TestEnsurePVC_RefusesPVCOwnedByOther: a PVC owned by some other resource
+// (a leaked owner ref, a Pod, another operator's CR) must not be silently
+// mounted by an etcd member. ensurePVC errors out so the user can untangle
+// the conflict explicitly.
+func TestEnsurePVC_RefusesPVCOwnedByOther(t *testing.T) {
+	ctx := context.Background()
+	otherPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "data-test-0",
+			Namespace: "ns",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "v1",
+				Kind:       "Pod",
+				Name:       "some-other-pod",
+				UID:        types.UID("other-uid"),
+			}},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+			},
+		},
+	}
+	member := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", UID: types.UID("uid"), Labels: memberLabels("test", "test-0")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"), InitialCluster: "x", ClusterToken: "test"},
+	}
+
+	c, _ := newTestClient(t, member, otherPVC)
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t)}
+
+	if err := r.ensurePVC(ctx, member); err == nil {
+		t.Fatalf("ensurePVC should refuse to mount a PVC owned by something other than this EtcdMember")
+	}
+}
+
 // TestEnsurePVC_AcceptsOwnPVC: when the existing PVC's owner ref UID matches
 // the current EtcdMember (a normal restart-after-pod-delete situation), reuse
 // is fine.

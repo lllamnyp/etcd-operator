@@ -255,19 +255,19 @@ func (r *EtcdMemberReconciler) ensurePVC(ctx context.Context, member *lll.EtcdMe
 	return nil
 }
 
-// pvcOwnedBy returns true if the PVC has an owner reference whose UID matches
-// this EtcdMember. A PVC with no owner references at all is also accepted
-// (e.g. a user pre-provisioned it).
+// pvcOwnedBy returns true only if the PVC carries an EtcdMember owner
+// reference whose UID matches this member — i.e. we created it. PVCs with
+// no owner refs, or with owner refs pointing at anything else, are refused.
+// Adoption of pre-existing PVCs (e.g. for a future scale-to-zero feature)
+// will need an explicit re-parenting step rather than implicit acceptance;
+// see https://github.com/lllamnyp/etcd-operator/issues/3.
 func pvcOwnedBy(pvc *corev1.PersistentVolumeClaim, member *lll.EtcdMember) bool {
-	if len(pvc.OwnerReferences) == 0 {
-		return true
-	}
 	for _, o := range pvc.OwnerReferences {
-		if o.Kind == "EtcdMember" {
-			return o.UID == member.UID
+		if o.Kind == "EtcdMember" && o.UID == member.UID {
+			return true
 		}
 	}
-	return true
+	return false
 }
 
 // ── Pod ──────────────────────────────────────────────────────────────────
