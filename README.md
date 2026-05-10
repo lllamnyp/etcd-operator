@@ -1,94 +1,139 @@
 # etcd-operator
-// TODO(user): Add simple overview of use/purpose
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+A Kubernetes operator for running [etcd](https://etcd.io/) clusters. Status: **early alpha** — API is `lllamnyp.su/v1alpha2` and will likely change.
 
-## Getting Started
-You’ll need a Kubernetes cluster to run against. You can use [KIND](https://sigs.k8s.io/kind) to get a local cluster for testing, or run against a remote cluster.
-**Note:** Your controller will automatically use the current context in your kubeconfig file (i.e. whatever cluster `kubectl cluster-info` shows).
+## Overview
 
-### Running on the cluster
-1. Install Instances of Custom Resources:
+The operator manages etcd clusters via two custom resources:
+
+- **`EtcdCluster`** — what the user creates. Captures cluster-wide intent: replica count, etcd version, per-member storage size, and a progress deadline. This is the only resource users normally touch.
+- **`EtcdMember`** — what the operator creates. One per etcd member. Owns its own Pod and PVC. Users should not create or edit these directly; the cluster controller manages them.
+
+There is **no StatefulSet**. Each member's Pod and PVC are reconciled independently by the member controller, which lets us model protocol-aware lifecycle (joining, member-id assignment, graceful removal) without fighting StatefulSet's "all replicas are one workload" assumption.
+
+The cluster controller decides *which* members exist and orchestrates `MemberAdd`/`MemberRemove` against the running etcd cluster. The member controller decides *how* a member becomes real — Pod, PVC, etcd flags — and reports observed facts (memberID, readiness) up to its CR's status.
+
+## What's supported today
+
+- Bootstrap of new clusters (1, 3, 5, … members).
+- Scale up: cluster controller calls `MemberAdd`, then creates an `EtcdMember` whose pod joins the existing cluster with `--initial-cluster-state=existing`.
+- Scale down: cluster controller deletes the highest-ordinal `EtcdMember`. A finalizer on the deleted member calls `MemberRemove` against remaining peers before the Pod and PVC go away.
+- Pod restart / node failure: data PVC is preserved, the new Pod reads the existing WAL and rejoins with the same member ID.
+- Cluster deletion: cascading owner refs clean up everything; finalizers detect "the whole cluster is going away" and skip etcd-side removal to avoid deadlock.
+
+## What's **not** supported (yet)
+
+No TLS. No auth/RBAC inside etcd. No version upgrades — changing `spec.version` does not roll the new image through running pods (only new pods get the new version). No automatic broken-member replacement (the predicate is stubbed; `status.brokenMembers` always reads 0). No backups, no defragmentation scheduling, no PodAntiAffinity by default. See `tmp/todo.md` (locally) and the issue tracker for the running list.
+
+## API at a glance
+
+### EtcdCluster spec
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `replicas` | `*int32` | `3` | Should be odd. Locked in via `status.observed.replicas` once a reconcile starts. |
+| `version` | `string` | required | etcd version like `"3.5.17"`. Image becomes `quay.io/coreos/etcd:v<version>`. |
+| `storage` | `Quantity` | `"1Gi"` | PVC size per member. Uses the namespace's default StorageClass. |
+| `progressDeadlineSeconds` | `*int32` | `600` | How long the operator will spend reaching a target before abandoning it for the latest spec. |
+
+### EtcdCluster status
+| Field | Notes |
+|---|---|
+| `readyMembers` | Count of members that report `Ready=True`. |
+| `brokenMembers` | Reserved for auto-replacement; currently always 0. |
+| `clusterID` | Hex etcd cluster ID, set after bootstrap. |
+| `clusterToken` | The `--initial-cluster-token` value the operator chose at bootstrap. Reused for all subsequent scale-up. |
+| `observed.{replicas,version,storage}` | The locked-in target the controller is currently reconciling toward. See "Locking pattern" below. |
+| `progressDeadline` | Time at which the in-flight target will be abandoned. Patch this to a past time to abort a stuck reconcile. |
+| `conditions[]` | `Available`, `Progressing`, `Degraded`. |
+
+### EtcdMember spec (operator-managed)
+`clusterName`, `version`, `storage`, `bootstrap` (bool), `initialCluster` (the `--initial-cluster` flag value), `clusterToken`. All copied from the cluster at creation time so the member controller is self-contained.
+
+### EtcdMember status
+`memberID` (hex), `podName`, `pvcName`, `conditions[]` (`Ready`).
+
+## Locking pattern: how spec changes are absorbed
+
+A naive operator would re-read `spec` every reconcile and start acting on every change. That breaks etcd in two well-known ways:
+
+1. **Mid-bootstrap replica change** — etcd requires every bootstrapping member to start with an identical `--initial-cluster` flag. If the user edits `spec.replicas` between member-0 and member-2 being created, etcd refuses to form.
+2. **Scale-up + immediate scale-down** — `MemberAdd` registers the new peer with etcd before its pod becomes Ready. If the user reverts `spec.replicas` in that window, a naive operator deletes a member it can't yet identify.
+
+Both are the same underlying problem: the user's "desired state" is mutable on a faster cadence than the operator can converge.
+
+**The fix:** the operator commits to a target. The first time a reconcile sees an EtcdCluster, it copies the spec into `status.observed` and sets `status.progressDeadline = now + spec.progressDeadlineSeconds`. From then on, **the controller reconciles against `status.observed`, not against `spec`**. Spec changes are noticed but not acted on — they only get adopted into `observed` when:
+
+- The cluster has reached `observed` (i.e. the in-flight reconcile finished cleanly), or
+- The deadline has passed (the in-flight reconcile gave up).
+
+This is the same pattern Deployments use with `progressDeadlineSeconds`, applied at a coarser granularity.
+
+### How to abort a stuck reconcile
+
+You set a broken spec (typo'd version tag, replica count that breaks quorum, etc.) and don't want to wait `progressDeadlineSeconds`. Patch the deadline to a past time:
 
 ```sh
-kubectl apply -f config/samples/
+kubectl patch etcdcluster.lllamnyp.su my-cluster --subresource=status --type=merge \
+  -p "{\"status\":{\"progressDeadline\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ -d '1 minute ago')\"}}"
 ```
 
-2. Build and push your image to the location specified by `IMG`:
+The next reconcile sees the deadline has elapsed, copies the current spec into `status.observed`, and starts working toward whatever the latest spec says.
 
-```sh
-make docker-build docker-push IMG=<some-registry>/etcd-operator:tag
-```
+If you want to undo the spec change instead (forget the bad spec, keep the old target), edit `spec` back to what it was before — the controller is still working toward the *old* `status.observed`, so the change to spec is harmless until the deadline expires.
 
-3. Deploy the controller to the cluster with the image specified by `IMG`:
+> The locking is enforced by the controller, not by an admission webhook. A user can `kubectl edit` `spec` mid-flight and the API server will accept the change; the controller simply won't act on it until the in-flight target is met or the deadline expires.
 
-```sh
-make deploy IMG=<some-registry>/etcd-operator:tag
-```
+## Quick start
 
-### Uninstall CRDs
-To delete the CRDs from the cluster:
-
-```sh
-make uninstall
-```
-
-### Undeploy controller
-UnDeploy the controller from the cluster:
-
-```sh
-make undeploy
-```
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-### How it works
-This project aims to follow the Kubernetes [Operator pattern](https://kubernetes.io/docs/concepts/extend-kubernetes/operator/).
-
-It uses [Controllers](https://kubernetes.io/docs/concepts/architecture/controller/),
-which provide a reconcile function responsible for synchronizing resources until the desired state is reached on the cluster.
-
-### Test It Out
-1. Install the CRDs into the cluster:
+### Install CRDs
 
 ```sh
 make install
 ```
 
-2. Run your controller (this will run in the foreground, so switch to a new terminal if you want to leave it running):
+(or `kubectl apply -f config/crd/bases/`)
+
+### Run the operator (out-of-cluster)
 
 ```sh
 make run
 ```
 
-**NOTE:** You can also run this in one step by running: `make install run`
+Out-of-cluster runs work for development against the K8s API but **cannot dial etcd via in-cluster DNS** — `MemberList` / `MemberAdd` / `MemberRemove` will fail. For end-to-end testing, deploy the operator inside the cluster.
 
-### Modifying the API definitions
-If you are editing the API definitions, generate the manifests such as CRs or CRDs using:
+### Build and deploy in-cluster
 
 ```sh
-make manifests
+make docker-build docker-push IMG=<registry>/etcd-operator:tag
+make deploy IMG=<registry>/etcd-operator:tag
 ```
 
-**NOTE:** Run `make --help` for more information on all potential `make` targets
+### Create a cluster
 
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
+```sh
+kubectl apply -f config/samples/_v1alpha2_etcdcluster.yaml
+```
+
+(or use `kubectl apply -k config/samples/`)
+
+You should see three pods come up under default namespace, headless and client Services, and three PVCs. `kubectl get etcdcluster.lllamnyp.su` will eventually show `Ready=3` and a populated `clusterID`.
+
+```sh
+kubectl exec etcdcluster-sample-0 -- etcdctl --endpoints=http://localhost:2379 endpoint health --cluster
+```
+
+should report all members healthy.
+
+## Testing
+
+Unit tests use a controller-runtime fake client and a fake etcd client (`controllers/testing_helpers_test.go`). Run:
+
+```sh
+go test ./controllers/...
+```
+
+These cover bootstrap locking, scale-down with empty `memberID`, PVC stale-owner refusal, ready gating on memberID populated, and etcd-unreachable surfacing.
 
 ## License
 
-Copyright 2023 Timofey Larkin.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+Apache 2.0. See `LICENSE`.

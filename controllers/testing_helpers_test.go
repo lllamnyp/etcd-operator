@@ -1,0 +1,165 @@
+/*
+Copyright 2023 Timofey Larkin.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+*/
+
+package controllers
+
+import (
+	"context"
+	"testing"
+
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	lll "github.com/lllamnyp/etcd-operator/api/v1alpha2"
+)
+
+// fakeEtcd is a deterministic in-memory stand-in for clientv3.Client used to
+// drive cluster-level operations in unit tests. Each method records the calls
+// it received and a presetable error; tests assert on the recorded calls and
+// on the resulting state.
+type fakeEtcd struct {
+	clusterID uint64
+	members   []*etcdserverpb.Member
+
+	listErr   error
+	addErr    error
+	removeErr error
+
+	addCalls    []string
+	removeCalls []uint64
+	closed      bool
+}
+
+func newFakeEtcd(clusterID uint64, members ...*etcdserverpb.Member) *fakeEtcd {
+	return &fakeEtcd{clusterID: clusterID, members: members}
+}
+
+func (f *fakeEtcd) MemberList(_ context.Context) (*clientv3.MemberListResponse, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	return &clientv3.MemberListResponse{
+		Header:  &etcdserverpb.ResponseHeader{ClusterId: f.clusterID},
+		Members: f.members,
+	}, nil
+}
+
+func (f *fakeEtcd) MemberAdd(_ context.Context, peerAddrs []string) (*clientv3.MemberAddResponse, error) {
+	if f.addErr != nil {
+		return nil, f.addErr
+	}
+	f.addCalls = append(f.addCalls, peerAddrs...)
+	id := uint64(0xaa00) + uint64(len(f.members)+1)
+	m := &etcdserverpb.Member{ID: id, PeerURLs: peerAddrs}
+	f.members = append(f.members, m)
+	return &clientv3.MemberAddResponse{
+		Header:  &etcdserverpb.ResponseHeader{ClusterId: f.clusterID},
+		Member:  m,
+		Members: f.members,
+	}, nil
+}
+
+func (f *fakeEtcd) MemberRemove(_ context.Context, id uint64) (*clientv3.MemberRemoveResponse, error) {
+	if f.removeErr != nil {
+		return nil, f.removeErr
+	}
+	f.removeCalls = append(f.removeCalls, id)
+	var kept []*etcdserverpb.Member
+	for _, m := range f.members {
+		if m.ID != id {
+			kept = append(kept, m)
+		}
+	}
+	f.members = kept
+	return &clientv3.MemberRemoveResponse{
+		Header:  &etcdserverpb.ResponseHeader{ClusterId: f.clusterID},
+		Members: f.members,
+	}, nil
+}
+
+func (f *fakeEtcd) Close() error { f.closed = true; return nil }
+
+func factoryReturning(c EtcdClusterClient) EtcdClientFactory {
+	return func(_ context.Context, _ []string) (EtcdClusterClient, error) { return c, nil }
+}
+
+// failingFactory returns an error from every Build call, simulating an
+// unreachable etcd cluster.
+func failingFactory(err error) EtcdClientFactory {
+	return func(_ context.Context, _ []string) (EtcdClusterClient, error) { return nil, err }
+}
+
+// testScheme returns a runtime scheme registered with corev1 and v1alpha2.
+func testScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+	s := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(s); err != nil {
+		t.Fatalf("AddToScheme(client-go): %v", err)
+	}
+	if err := lll.AddToScheme(s); err != nil {
+		t.Fatalf("AddToScheme(v1alpha2): %v", err)
+	}
+	return s
+}
+
+// newTestClient builds a controller-runtime fake client with the v1alpha2
+// types pre-registered with status subresources.
+func newTestClient(t *testing.T, objs ...client.Object) (client.Client, *runtime.Scheme) {
+	t.Helper()
+	s := testScheme(t)
+	// controller-runtime v0.14 has no WithStatusSubresource; Status().Update()
+	// is just Update() under the fake client. Production-side this is fine
+	// because reconcilers always go through Status().Update().
+	c := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(objs...).
+		Build()
+	return c, s
+}
+
+func mustGet[T client.Object](t *testing.T, c client.Client, name, ns string, into T) T {
+	t.Helper()
+	if err := c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: ns}, into); err != nil {
+		t.Fatalf("Get(%s/%s): %v", ns, name, err)
+	}
+	return into
+}
+
+func ptrInt32(i int32) *int32 { return &i }
+
+// quickQty parses a small Kubernetes quantity literal ("1Gi", "100m") and
+// fatals on error — fine for fixtures.
+func quickQty(t *testing.T, s string) resource.Quantity {
+	t.Helper()
+	q, err := resource.ParseQuantity(s)
+	if err != nil {
+		t.Fatalf("ParseQuantity(%q): %v", s, err)
+	}
+	return q
+}
+
+// readyPodCondition returns a fake Pod set to Ready=True. Tests use it to
+// drive the EtcdMember reconciler past its podReady gate.
+func readyPodCondition() corev1.PodCondition {
+	return corev1.PodCondition{
+		Type:   corev1.PodReady,
+		Status: corev1.ConditionTrue,
+		LastTransitionTime: metav1.Now(),
+	}
+}

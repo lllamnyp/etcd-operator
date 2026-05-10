@@ -34,8 +34,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	clientv3 "go.etcd.io/etcd/client/v3"
-
 	lll "github.com/lllamnyp/etcd-operator/api/v1alpha2"
 )
 
@@ -43,6 +41,8 @@ import (
 type EtcdMemberReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	EtcdClientFactory EtcdClientFactory
 }
 
 //+kubebuilder:rbac:groups=lllamnyp.su,resources=etcdmembers,verbs=get;list;watch;update;patch
@@ -63,12 +63,10 @@ func (r *EtcdMemberReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 
-	// ── Deletion ───────────────────────────────────────────────────────
 	if !member.DeletionTimestamp.IsZero() {
 		return r.handleDeletion(ctx, member)
 	}
 
-	// ── Ensure finalizer ───────────────────────────────────────────────
 	if !controllerutil.ContainsFinalizer(member, MemberFinalizer) {
 		controllerutil.AddFinalizer(member, MemberFinalizer)
 		if err := r.Update(ctx, member); err != nil {
@@ -76,19 +74,16 @@ func (r *EtcdMemberReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 	}
 
-	// ── Ensure PVC ─────────────────────────────────────────────────────
 	if err := r.ensurePVC(ctx, member); err != nil {
 		log.Error(err, "failed to ensure PVC")
 		return ctrl.Result{}, err
 	}
 
-	// ── Ensure Pod ─────────────────────────────────────────────────────
 	if err := r.ensurePod(ctx, member); err != nil {
 		log.Error(err, "failed to ensure Pod")
 		return ctrl.Result{}, err
 	}
 
-	// ── Update status ──────────────────────────────────────────────────
 	return r.updateStatus(ctx, member)
 }
 
@@ -101,7 +96,6 @@ func (r *EtcdMemberReconciler) handleDeletion(ctx context.Context, member *lll.E
 
 	log := log.FromContext(ctx)
 
-	// If the owning cluster is gone, skip etcd-level removal.
 	clusterDeleting := false
 	cluster := &lll.EtcdCluster{}
 	err := r.Get(ctx, types.NamespacedName{
@@ -112,7 +106,7 @@ func (r *EtcdMemberReconciler) handleDeletion(ctx context.Context, member *lll.E
 		clusterDeleting = true
 	}
 
-	if !clusterDeleting && member.Status.MemberID != "" {
+	if !clusterDeleting {
 		if err := r.removeMemberFromEtcd(ctx, member); err != nil {
 			log.Error(err, "failed to remove member from etcd, will retry")
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
@@ -126,8 +120,17 @@ func (r *EtcdMemberReconciler) handleDeletion(ctx context.Context, member *lll.E
 	return ctrl.Result{}, nil
 }
 
+// removeMemberFromEtcd handles three cases:
+//
+//  1. status.MemberID is set — call MemberRemove(id) directly.
+//  2. status.MemberID is empty (e.g. the pod never finished bootstrapping
+//     before the user scaled back down) — list the etcd cluster, find a
+//     member matching this name and call MemberRemove on its ID. Etcd may
+//     have an entry from MemberAdd even if the pod never started, so we must
+//     still clean it up.
+//  3. The member is not in etcd's list at all — treat as already gone and
+//     return nil so the finalizer can be removed.
 func (r *EtcdMemberReconciler) removeMemberFromEtcd(ctx context.Context, member *lll.EtcdMember) error {
-	// Build endpoints from other members of the same cluster.
 	memberList := &lll.EtcdMemberList{}
 	if err := r.List(ctx, memberList,
 		client.InNamespace(member.Namespace),
@@ -138,18 +141,17 @@ func (r *EtcdMemberReconciler) removeMemberFromEtcd(ctx context.Context, member 
 
 	var endpoints []string
 	for _, m := range memberList.Items {
-		if m.Name != member.Name {
+		if m.Name != member.Name && m.Status.PodName != "" {
 			endpoints = append(endpoints, clientURL(m.Name, member.Spec.ClusterName, member.Namespace))
 		}
 	}
 	if len(endpoints) == 0 {
-		return nil // last member, nothing to remove from
+		// No other members reachable; nothing we can do, and probably the
+		// last member of a cluster being torn down anyway.
+		return nil
 	}
 
-	etcdClient, err := clientv3.New(clientv3.Config{
-		Endpoints:   endpoints,
-		DialTimeout: 5 * time.Second,
-	})
+	etcdClient, err := r.EtcdClientFactory(ctx, endpoints)
 	if err != nil {
 		return err
 	}
@@ -158,12 +160,53 @@ func (r *EtcdMemberReconciler) removeMemberFromEtcd(ctx context.Context, member 
 	rmCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	id, err := strconv.ParseUint(member.Status.MemberID, 16, 64)
+	id, err := r.resolveMemberID(rmCtx, member, etcdClient)
 	if err != nil {
-		return fmt.Errorf("parse memberID %q: %w", member.Status.MemberID, err)
+		return err
 	}
+	if id == 0 {
+		// Not found in etcd. Already gone.
+		return nil
+	}
+
 	_, err = etcdClient.MemberRemove(rmCtx, id)
 	return err
+}
+
+// resolveMemberID returns the etcd member ID this EtcdMember refers to. If
+// status.MemberID was populated we trust it; otherwise we ask etcd to look up
+// the member by name. Returns 0 if not found in etcd.
+func (r *EtcdMemberReconciler) resolveMemberID(
+	ctx context.Context,
+	member *lll.EtcdMember,
+	c EtcdClusterClient,
+) (uint64, error) {
+	if member.Status.MemberID != "" {
+		id, err := strconv.ParseUint(member.Status.MemberID, 16, 64)
+		if err != nil {
+			return 0, fmt.Errorf("parse memberID %q: %w", member.Status.MemberID, err)
+		}
+		return id, nil
+	}
+
+	resp, err := c.MemberList(ctx)
+	if err != nil {
+		return 0, err
+	}
+	for _, m := range resp.Members {
+		if m.Name == member.Name {
+			return m.ID, nil
+		}
+		// Match by peer URL too — etcd may have a member added via MemberAdd
+		// whose Name is empty until it joins.
+		expected := peerURL(member.Name, member.Spec.ClusterName, member.Namespace)
+		for _, p := range m.PeerURLs {
+			if p == expected {
+				return m.ID, nil
+			}
+		}
+	}
+	return 0, nil
 }
 
 // ── PVC ──────────────────────────────────────────────────────────────────
@@ -173,6 +216,13 @@ func (r *EtcdMemberReconciler) ensurePVC(ctx context.Context, member *lll.EtcdMe
 	pvc := &corev1.PersistentVolumeClaim{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: member.Namespace, Name: pvcName}, pvc)
 	if err == nil {
+		// Refuse to reuse a PVC owned by a different (typically deleted)
+		// EtcdMember. Same-named members across scale-down/up cycles would
+		// otherwise inherit the prior member's data dir and crashloop after
+		// trying to rejoin with a removed memberID.
+		if !pvcOwnedBy(pvc, member) {
+			return fmt.Errorf("PVC %q is owned by a different EtcdMember; awaiting GC before reuse", pvcName)
+		}
 		member.Status.PVCName = pvcName
 		return nil
 	}
@@ -203,6 +253,21 @@ func (r *EtcdMemberReconciler) ensurePVC(ctx context.Context, member *lll.EtcdMe
 	}
 	member.Status.PVCName = pvcName
 	return nil
+}
+
+// pvcOwnedBy returns true if the PVC has an owner reference whose UID matches
+// this EtcdMember. A PVC with no owner references at all is also accepted
+// (e.g. a user pre-provisioned it).
+func pvcOwnedBy(pvc *corev1.PersistentVolumeClaim, member *lll.EtcdMember) bool {
+	if len(pvc.OwnerReferences) == 0 {
+		return true
+	}
+	for _, o := range pvc.OwnerReferences {
+		if o.Kind == "EtcdMember" {
+			return o.UID == member.UID
+		}
+	}
+	return true
 }
 
 // ── Pod ──────────────────────────────────────────────────────────────────
@@ -246,7 +311,7 @@ func (r *EtcdMemberReconciler) buildPod(member *lll.EtcdMember) *corev1.Pod {
 		},
 		Spec: corev1.PodSpec{
 			Hostname:  member.Name,
-			Subdomain: member.Spec.ClusterName, // headless service name
+			Subdomain: member.Spec.ClusterName,
 			SecurityContext: &corev1.PodSecurityContext{
 				RunAsNonRoot: ptrBool(true),
 				RunAsUser:    ptrInt64(60000),
@@ -347,27 +412,40 @@ func (r *EtcdMemberReconciler) updateStatus(ctx context.Context, member *lll.Etc
 		}
 	}
 
-	if podReady {
-		setCondition(&member.Status.Conditions, metav1.Condition{
-			Type:    lll.MemberReady,
-			Status:  metav1.ConditionTrue,
-			Reason:  "PodReady",
-			Message: "etcd member is ready",
-		})
-		// Once the pod is ready, learn this member's etcd ID and record
-		// it on status. The finalizer needs it to call MemberRemove.
-		if member.Status.MemberID == "" {
-			if id, err := r.discoverMemberID(ctx, member); err == nil {
-				member.Status.MemberID = fmt.Sprintf("%x", id)
-			}
-			// On error we silently retry on the next reconcile.
-		}
-	} else {
+	switch {
+	case !podReady:
 		setCondition(&member.Status.Conditions, metav1.Condition{
 			Type:    lll.MemberReady,
 			Status:  metav1.ConditionFalse,
 			Reason:  "PodNotReady",
 			Message: fmt.Sprintf("pod phase: %s", pod.Status.Phase),
+		})
+	case member.Status.MemberID == "":
+		// Pod ready but we haven't matched it to an etcd member yet.
+		// Try once, but don't claim Ready=True until we have the ID — the
+		// finalizer needs it to perform a clean MemberRemove on scale-down.
+		if id, err := r.discoverMemberID(ctx, member); err == nil {
+			member.Status.MemberID = fmt.Sprintf("%x", id)
+			setCondition(&member.Status.Conditions, metav1.Condition{
+				Type:    lll.MemberReady,
+				Status:  metav1.ConditionTrue,
+				Reason:  "PodReady",
+				Message: "etcd member is ready",
+			})
+		} else {
+			setCondition(&member.Status.Conditions, metav1.Condition{
+				Type:    lll.MemberReady,
+				Status:  metav1.ConditionFalse,
+				Reason:  "DiscoveringMemberID",
+				Message: fmt.Sprintf("waiting for memberID: %v", err),
+			})
+		}
+	default:
+		setCondition(&member.Status.Conditions, metav1.Condition{
+			Type:    lll.MemberReady,
+			Status:  metav1.ConditionTrue,
+			Reason:  "PodReady",
+			Message: "etcd member is ready",
 		})
 	}
 
@@ -382,10 +460,7 @@ func (r *EtcdMemberReconciler) updateStatus(ctx context.Context, member *lll.Etc
 // its own client endpoint and matching by name.
 func (r *EtcdMemberReconciler) discoverMemberID(ctx context.Context, member *lll.EtcdMember) (uint64, error) {
 	endpoint := clientURL(member.Name, member.Spec.ClusterName, member.Namespace)
-	c, err := clientv3.New(clientv3.Config{
-		Endpoints:   []string{endpoint},
-		DialTimeout: 5 * time.Second,
-	})
+	c, err := r.EtcdClientFactory(ctx, []string{endpoint})
 	if err != nil {
 		return 0, err
 	}
@@ -409,6 +484,9 @@ func (r *EtcdMemberReconciler) discoverMemberID(ctx context.Context, member *lll
 // ── Manager wiring ───────────────────────────────────────────────────────
 
 func (r *EtcdMemberReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.EtcdClientFactory == nil {
+		r.EtcdClientFactory = DefaultEtcdClientFactory
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&lll.EtcdMember{}).
 		Owns(&corev1.Pod{}).

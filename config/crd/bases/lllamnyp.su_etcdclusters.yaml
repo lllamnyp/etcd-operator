@@ -48,6 +48,16 @@ spec:
           spec:
             description: EtcdClusterSpec defines the desired state of an etcd cluster.
             properties:
+              progressDeadlineSeconds:
+                default: 600
+                description: ProgressDeadlineSeconds bounds the time the operator
+                  spends trying to reach a desired state before abandoning the in-flight
+                  target and adopting whatever the user has set as the new spec. Defaults
+                  to 600 (10 minutes). A patch to status.progressDeadline can shorten
+                  this for a stuck reconcile (set it to "now" to abort immediately).
+                format: int32
+                minimum: 1
+                type: integer
               replicas:
                 default: 3
                 description: Replicas is the desired number of cluster members. Should
@@ -74,6 +84,13 @@ spec:
           status:
             description: EtcdClusterStatus defines the observed state of an etcd cluster.
             properties:
+              brokenMembers:
+                description: BrokenMembers is the count of members the operator considers
+                  broken. While the auto-replacement predicate is a stub it is always
+                  0; surfaced here so the predicate has a tested call site and the
+                  field already exists when the policy lands.
+                format: int32
+                type: integer
               clusterID:
                 description: ClusterID is the etcd cluster ID in hex (e.g. "769f1c9e0d723d0b"),
                   set after initial bootstrap. Stored as a string because uint64 values
@@ -155,6 +172,39 @@ spec:
                   - type
                   type: object
                 type: array
+              observed:
+                description: Observed is the locked-in desired state the operator
+                  is currently reconciling toward. The reconciler ignores spec changes
+                  while a target is in flight; Observed is only updated from spec
+                  when the current target is met or its deadline has expired. nil
+                  before the first reconcile.
+                properties:
+                  replicas:
+                    description: Replicas is the locked target replica count.
+                    format: int32
+                    type: integer
+                  storage:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: Storage is the locked target PVC size.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  version:
+                    description: Version is the locked target etcd version.
+                    type: string
+                required:
+                - replicas
+                - storage
+                - version
+                type: object
+              progressDeadline:
+                description: ProgressDeadline is the time at which the in-flight reconciliation
+                  will be abandoned in favor of the latest spec. Cleared when the
+                  cluster reaches Observed. Patch this to a time in the past to abort
+                  a stuck reconcile.
+                format: date-time
+                type: string
               readyMembers:
                 description: ReadyMembers is the count of members that are healthy
                   and serving.

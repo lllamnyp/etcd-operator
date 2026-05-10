@@ -32,18 +32,23 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	clientv3 "go.etcd.io/etcd/client/v3"
-
 	lll "github.com/lllamnyp/etcd-operator/api/v1alpha2"
 )
+
+// DefaultProgressDeadlineSeconds is used when the user doesn't set one.
+const DefaultProgressDeadlineSeconds = int32(600)
 
 // EtcdClusterReconciler reconciles an EtcdCluster object.
 type EtcdClusterReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// EtcdClientFactory builds an etcd client. Tests inject a fake;
+	// production wiring uses DefaultEtcdClientFactory.
+	EtcdClientFactory EtcdClientFactory
 }
 
-//+kubebuilder:rbac:groups=lllamnyp.su,resources=etcdclusters,verbs=get;list;watch;update;patch
+//+kubebuilder:rbac:groups=lllamnyp.su,resources=etcdclusters,verbs=get;list;watch
 //+kubebuilder:rbac:groups=lllamnyp.su,resources=etcdclusters/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=lllamnyp.su,resources=etcdclusters/finalizers,verbs=update
 //+kubebuilder:rbac:groups=lllamnyp.su,resources=etcdmembers,verbs=get;list;watch;create;delete
@@ -52,7 +57,6 @@ type EtcdClusterReconciler struct {
 func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
-	// ── Fetch cluster ──────────────────────────────────────────────────
 	cluster := &lll.EtcdCluster{}
 	if err := r.Get(ctx, req.NamespacedName, cluster); err != nil {
 		if errors.IsNotFound(err) {
@@ -61,13 +65,11 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
-	// ── Ensure Services ────────────────────────────────────────────────
 	if err := r.ensureServices(ctx, cluster); err != nil {
 		log.Error(err, "failed to ensure services")
 		return ctrl.Result{}, err
 	}
 
-	// ── List active members ────────────────────────────────────────────
 	memberList := &lll.EtcdMemberList{}
 	if err := r.List(ctx, memberList,
 		client.InNamespace(cluster.Namespace),
@@ -77,21 +79,66 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 	active := filterActiveMembers(memberList.Items)
 
-	desired := int32(3)
-	if cluster.Spec.Replicas != nil {
-		desired = *cluster.Spec.Replicas
-	}
-	current := int32(len(active))
-
-	// ── Lock in the cluster token before any member references it. ────
+	// ── Lock in the cluster token before any member references it ─────
 	if cluster.Status.ClusterToken == "" {
 		cluster.Status.ClusterToken = deriveClusterToken(cluster)
 		if err := r.Status().Update(ctx, cluster); err != nil {
 			return ctrl.Result{}, err
 		}
-		// Re-queue with the freshly persisted token.
 		return ctrl.Result{Requeue: true}, nil
 	}
+
+	// ── Snapshot spec → Observed and (re)set the deadline as needed ───
+	// Three triggers cause us to copy spec into Observed:
+	//   1. First reconcile (Observed is nil).
+	//   2. Reconciliation against current Observed has just completed and
+	//      spec has since changed.
+	//   3. The deadline has elapsed without convergence — we abandon the
+	//      in-flight target and pick up the latest spec.
+	current := int32(len(active))
+	now := metav1.Now()
+
+	if cluster.Status.Observed == nil {
+		log.Info("snapshotting initial spec into observed")
+		snapshotSpecIntoObserved(cluster)
+		setProgressDeadline(cluster, now)
+		setClusterCondition(cluster, lll.ClusterProgressing, metav1.ConditionTrue, "InitialSnapshot",
+			"snapshotted initial spec into status.observed")
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	complete := reconciliationComplete(cluster, active)
+
+	if !complete && deadlineExpired(cluster, now) {
+		log.Info("progress deadline exceeded; abandoning in-flight target",
+			"observed", cluster.Status.Observed, "spec", cluster.Spec)
+		snapshotSpecIntoObserved(cluster)
+		setProgressDeadline(cluster, now)
+		setClusterCondition(cluster, lll.ClusterProgressing, metav1.ConditionTrue, "DeadlineExceeded",
+			"abandoned previous target and adopted current spec")
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	if complete && !specEqualsObserved(cluster) {
+		log.Info("previous target reached; adopting new spec",
+			"observed", cluster.Status.Observed, "spec", cluster.Spec)
+		snapshotSpecIntoObserved(cluster)
+		setProgressDeadline(cluster, now)
+		setClusterCondition(cluster, lll.ClusterProgressing, metav1.ConditionTrue, "SpecChanged",
+			"adopting new spec after previous target reached")
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	desired := cluster.Status.Observed.Replicas
 
 	// ── Bootstrap ──────────────────────────────────────────────────────
 	if cluster.Status.ClusterID == "" {
@@ -99,7 +146,6 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			log.Info("bootstrapping cluster", "current", current, "desired", desired)
 			return r.bootstrap(ctx, cluster, active, desired)
 		}
-		// All bootstrap members exist; wait for the cluster to form.
 		log.Info("waiting for cluster to form", "members", current)
 		return r.tryDiscoverCluster(ctx, cluster, active)
 	}
@@ -131,7 +177,6 @@ func (r *EtcdClusterReconciler) bootstrap(
 		existingNames[m.Name] = true
 	}
 
-	// Build the complete list of member names for the initial cluster.
 	allNames := make([]string, 0, desired)
 	for _, m := range existing {
 		allNames = append(allNames, m.Name)
@@ -158,8 +203,8 @@ func (r *EtcdClusterReconciler) bootstrap(
 			},
 			Spec: lll.EtcdMemberSpec{
 				ClusterName:    cluster.Name,
-				Version:        cluster.Spec.Version,
-				Storage:        cluster.Spec.Storage,
+				Version:        cluster.Status.Observed.Version,
+				Storage:        cluster.Status.Observed.Storage,
 				Bootstrap:      true,
 				InitialCluster: initialCluster,
 				ClusterToken:   cluster.Status.ClusterToken,
@@ -183,17 +228,19 @@ func (r *EtcdClusterReconciler) tryDiscoverCluster(
 	cluster *lll.EtcdCluster,
 	members []lll.EtcdMember,
 ) (ctrl.Result, error) {
+	log := log.FromContext(ctx)
+
 	endpoints := memberEndpoints(members, cluster.Name, cluster.Namespace)
 	if len(endpoints) == 0 {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	etcdClient, err := clientv3.New(clientv3.Config{
-		Endpoints:   endpoints,
-		DialTimeout: 5 * time.Second,
-	})
+	etcdClient, err := r.EtcdClientFactory(ctx, endpoints)
 	if err != nil {
-		// Cluster not reachable yet; retry.
+		log.Error(err, "etcd client construction failed", "endpoints", endpoints)
+		setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionFalse, "ClusterUnreachable",
+			fmt.Sprintf("etcd client construction failed: %v", err))
+		_ = r.Status().Update(ctx, cluster)
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 	defer etcdClient.Close()
@@ -203,6 +250,10 @@ func (r *EtcdClusterReconciler) tryDiscoverCluster(
 
 	resp, err := etcdClient.MemberList(listCtx)
 	if err != nil {
+		log.Error(err, "MemberList failed during cluster discovery", "endpoints", endpoints)
+		setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionFalse, "ClusterUnreachable",
+			fmt.Sprintf("MemberList failed: %v", err))
+		_ = r.Status().Update(ctx, cluster)
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
@@ -211,7 +262,7 @@ func (r *EtcdClusterReconciler) tryDiscoverCluster(
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{}, nil // requeue via watch
+	return ctrl.Result{}, nil
 }
 
 // ── Scale up ─────────────────────────────────────────────────────────────
@@ -224,12 +275,9 @@ func (r *EtcdClusterReconciler) scaleUp(
 	log := log.FromContext(ctx)
 
 	endpoints := memberEndpoints(members, cluster.Name, cluster.Namespace)
-	etcdClient, err := clientv3.New(clientv3.Config{
-		Endpoints:   endpoints,
-		DialTimeout: 5 * time.Second,
-	})
+	etcdClient, err := r.EtcdClientFactory(ctx, endpoints)
 	if err != nil {
-		log.Error(err, "cannot connect to etcd for scale-up")
+		log.Error(err, "cannot connect to etcd for scale-up", "endpoints", endpoints)
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 	defer etcdClient.Close()
@@ -241,11 +289,10 @@ func (r *EtcdClusterReconciler) scaleUp(
 	defer cancel()
 
 	if _, err = etcdClient.MemberAdd(addCtx, []string{newPeerURL}); err != nil {
-		log.Error(err, "MemberAdd failed")
+		log.Error(err, "MemberAdd failed", "endpoints", endpoints)
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
-	// Build initial-cluster including the new member.
 	allNames := make([]string, 0, len(members)+1)
 	for _, m := range members {
 		allNames = append(allNames, m.Name)
@@ -261,8 +308,8 @@ func (r *EtcdClusterReconciler) scaleUp(
 		},
 		Spec: lll.EtcdMemberSpec{
 			ClusterName:    cluster.Name,
-			Version:        cluster.Spec.Version,
-			Storage:        cluster.Spec.Storage,
+			Version:        cluster.Status.Observed.Version,
+			Storage:        cluster.Status.Observed.Storage,
 			Bootstrap:      false,
 			InitialCluster: initialCluster,
 			ClusterToken:   cluster.Status.ClusterToken,
@@ -275,7 +322,6 @@ func (r *EtcdClusterReconciler) scaleUp(
 		return ctrl.Result{}, err
 	}
 
-	// Wait for the new member to become ready before adding more.
 	return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 }
 
@@ -286,7 +332,6 @@ func (r *EtcdClusterReconciler) scaleDown(
 	cluster *lll.EtcdCluster,
 	members []lll.EtcdMember,
 ) (ctrl.Result, error) {
-	// Remove the member with the highest ordinal.
 	sort.Slice(members, func(i, j int) bool {
 		return memberOrdinal(members[i].Name) > memberOrdinal(members[j].Name)
 	})
@@ -306,10 +351,7 @@ func (r *EtcdClusterReconciler) updateStatus(
 	cluster *lll.EtcdCluster,
 	members []lll.EtcdMember,
 ) (ctrl.Result, error) {
-	desired := int32(3)
-	if cluster.Spec.Replicas != nil {
-		desired = *cluster.Spec.Replicas
-	}
+	desired := cluster.Status.Observed.Replicas
 
 	ready := int32(0)
 	for _, m := range members {
@@ -325,43 +367,31 @@ func (r *EtcdClusterReconciler) updateStatus(
 
 	switch {
 	case ready == desired:
-		setCondition(&cluster.Status.Conditions, metav1.Condition{
-			Type:    lll.ClusterAvailable,
-			Status:  metav1.ConditionTrue,
-			Reason:  "QuorumHealthy",
-			Message: "All members are ready",
-		})
-		setCondition(&cluster.Status.Conditions, metav1.Condition{
-			Type:   lll.ClusterDegraded,
-			Status: metav1.ConditionFalse,
-			Reason: "QuorumHealthy",
-		})
+		setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionTrue, "QuorumHealthy", "All members are ready")
+		setClusterCondition(cluster, lll.ClusterDegraded, metav1.ConditionFalse, "QuorumHealthy", "")
 	case ready > desired/2:
-		setCondition(&cluster.Status.Conditions, metav1.Condition{
-			Type:    lll.ClusterAvailable,
-			Status:  metav1.ConditionTrue,
-			Reason:  "QuorumAvailable",
-			Message: fmt.Sprintf("%d/%d members ready", ready, desired),
-		})
-		setCondition(&cluster.Status.Conditions, metav1.Condition{
-			Type:    lll.ClusterDegraded,
-			Status:  metav1.ConditionTrue,
-			Reason:  "MembersUnhealthy",
-			Message: fmt.Sprintf("%d/%d members ready", ready, desired),
-		})
+		setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionTrue, "QuorumAvailable", fmt.Sprintf("%d/%d members ready", ready, desired))
+		setClusterCondition(cluster, lll.ClusterDegraded, metav1.ConditionTrue, "MembersUnhealthy", fmt.Sprintf("%d/%d members ready", ready, desired))
 	default:
-		setCondition(&cluster.Status.Conditions, metav1.Condition{
-			Type:    lll.ClusterAvailable,
-			Status:  metav1.ConditionFalse,
-			Reason:  "QuorumLost",
-			Message: fmt.Sprintf("%d/%d members ready, quorum lost", ready, desired),
-		})
-		setCondition(&cluster.Status.Conditions, metav1.Condition{
-			Type:   lll.ClusterDegraded,
-			Status: metav1.ConditionTrue,
-			Reason: "QuorumLost",
-		})
+		setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionFalse, "QuorumLost", fmt.Sprintf("%d/%d members ready, quorum lost", ready, desired))
+		setClusterCondition(cluster, lll.ClusterDegraded, metav1.ConditionTrue, "QuorumLost", "")
 	}
+
+	// Steady state: clear progressing flags.
+	if reconciliationComplete(cluster, members) {
+		setClusterCondition(cluster, lll.ClusterProgressing, metav1.ConditionFalse, "Reconciled",
+			"actual state matches status.observed")
+		cluster.Status.ProgressDeadline = nil
+	}
+
+	// Surface broken members so future auto-replacement has a tested call site.
+	brokenCount := 0
+	for _, m := range members {
+		if r.isBroken(m) {
+			brokenCount++
+		}
+	}
+	cluster.Status.BrokenMembers = int32(brokenCount)
 
 	if err := r.Status().Update(ctx, cluster); err != nil {
 		return ctrl.Result{}, err
@@ -395,6 +425,10 @@ func (r *EtcdClusterReconciler) ensureServices(ctx context.Context, cluster *lll
 	})
 }
 
+// ensureService creates the Service if absent. It does not reconcile drift on
+// existing Services — selectors and ports are immutable from the operator's
+// perspective. A user editing them manually is going off-script and the
+// breakage will be visible (members lose connectivity); we don't paper over it.
 func (r *EtcdClusterReconciler) ensureService(
 	ctx context.Context,
 	cluster *lll.EtcdCluster,
@@ -404,7 +438,7 @@ func (r *EtcdClusterReconciler) ensureService(
 	svc := &corev1.Service{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: name}, svc)
 	if err == nil {
-		return nil // already exists
+		return nil
 	}
 	if !errors.IsNotFound(err) {
 		return err
@@ -427,9 +461,90 @@ func (r *EtcdClusterReconciler) ensureService(
 // ── Manager wiring ───────────────────────────────────────────────────────
 
 func (r *EtcdClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.EtcdClientFactory == nil {
+		r.EtcdClientFactory = DefaultEtcdClientFactory
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&lll.EtcdCluster{}).
 		Owns(&lll.EtcdMember{}).
 		Owns(&corev1.Service{}).
 		Complete(r)
+}
+
+// ── Locking-pattern helpers ──────────────────────────────────────────────
+
+func snapshotSpecIntoObserved(cluster *lll.EtcdCluster) {
+	replicas := int32(3)
+	if cluster.Spec.Replicas != nil {
+		replicas = *cluster.Spec.Replicas
+	}
+	cluster.Status.Observed = &lll.ObservedClusterSpec{
+		Replicas: replicas,
+		Version:  cluster.Spec.Version,
+		Storage:  cluster.Spec.Storage,
+	}
+}
+
+func specEqualsObserved(cluster *lll.EtcdCluster) bool {
+	if cluster.Status.Observed == nil {
+		return false
+	}
+	specReplicas := int32(3)
+	if cluster.Spec.Replicas != nil {
+		specReplicas = *cluster.Spec.Replicas
+	}
+	o := cluster.Status.Observed
+	return o.Replicas == specReplicas &&
+		o.Version == cluster.Spec.Version &&
+		o.Storage.Cmp(cluster.Spec.Storage) == 0
+}
+
+func reconciliationComplete(cluster *lll.EtcdCluster, members []lll.EtcdMember) bool {
+	if cluster.Status.Observed == nil {
+		return false
+	}
+	if int32(len(members)) != cluster.Status.Observed.Replicas {
+		return false
+	}
+	if cluster.Status.ClusterID == "" {
+		return false
+	}
+	for _, m := range members {
+		ready := false
+		for _, c := range m.Status.Conditions {
+			if c.Type == lll.MemberReady && c.Status == metav1.ConditionTrue {
+				ready = true
+				break
+			}
+		}
+		if !ready {
+			return false
+		}
+	}
+	return true
+}
+
+func setProgressDeadline(cluster *lll.EtcdCluster, now metav1.Time) {
+	secs := DefaultProgressDeadlineSeconds
+	if cluster.Spec.ProgressDeadlineSeconds != nil {
+		secs = *cluster.Spec.ProgressDeadlineSeconds
+	}
+	deadline := metav1.NewTime(now.Add(time.Duration(secs) * time.Second))
+	cluster.Status.ProgressDeadline = &deadline
+}
+
+func deadlineExpired(cluster *lll.EtcdCluster, now metav1.Time) bool {
+	if cluster.Status.ProgressDeadline == nil {
+		return false
+	}
+	return !now.Before(cluster.Status.ProgressDeadline)
+}
+
+func setClusterCondition(cluster *lll.EtcdCluster, condType string, status metav1.ConditionStatus, reason, msg string) {
+	setCondition(&cluster.Status.Conditions, metav1.Condition{
+		Type:    condType,
+		Status:  status,
+		Reason:  reason,
+		Message: msg,
+	})
 }
