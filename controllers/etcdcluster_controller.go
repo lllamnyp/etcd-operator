@@ -113,16 +113,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	complete := reconciliationComplete(cluster, active)
 
 	if !complete && deadlineExpired(cluster, now) {
-		log.Info("progress deadline exceeded; abandoning in-flight target",
-			"observed", cluster.Status.Observed, "spec", cluster.Spec)
-		snapshotSpecIntoObserved(cluster)
-		setProgressDeadline(cluster, now)
-		setClusterCondition(cluster, lll.ClusterProgressing, metav1.ConditionTrue, "DeadlineExceeded",
-			"abandoned previous target and adopted current spec")
-		if err := r.Status().Update(ctx, cluster); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{Requeue: true}, nil
+		return r.handleDeadlineExceeded(ctx, cluster, now)
 	}
 
 	if complete && !specEqualsObserved(cluster) {
@@ -469,6 +460,73 @@ func (r *EtcdClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&lll.EtcdMember{}).
 		Owns(&corev1.Service{}).
 		Complete(r)
+}
+
+// ── Deadline handling ────────────────────────────────────────────────────
+
+// handleDeadlineExceeded is the terminal-error path. The operator stops acting
+// and waits for user intervention. The shape of "intervention" depends on
+// whether the cluster ever bootstrapped:
+//
+//  1. Before the cluster has formed (clusterID==""): the existing
+//     EtcdMembers' pods have an --initial-cluster flag baked into them, and
+//     etcd refuses to form unless every bootstrapping member shares an
+//     identical value. There's no safe in-place recovery — the only way out
+//     is to delete the EtcdCluster and recreate it. This branch surfaces a
+//     BootstrapFailed condition and stops.
+//
+//  2. After bootstrap: the cluster is healthy, the failed reconcile only
+//     left some half-done state (e.g. a scale-up that couldn't schedule).
+//     The user's spec edit is treated as the intervention — when spec
+//     stops matching observed, we snapshot the new spec and resume. Until
+//     that happens we sit in DeadlineExceeded.
+//
+// We never auto-pivot during bootstrap, and never silently in steady state.
+func (r *EtcdClusterReconciler) handleDeadlineExceeded(
+	ctx context.Context,
+	cluster *lll.EtcdCluster,
+	now metav1.Time,
+) (ctrl.Result, error) {
+	log := log.FromContext(ctx)
+
+	if cluster.Status.ClusterID == "" {
+		log.Error(nil, "bootstrap deadline exceeded; delete and recreate to recover",
+			"observed", cluster.Status.Observed)
+		setClusterCondition(cluster, lll.ClusterProgressing, metav1.ConditionFalse, "BootstrapFailed",
+			"bootstrap deadline exceeded; delete the cluster and recreate to recover")
+		setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionFalse, "BootstrapFailed",
+			fmt.Sprintf("could not bootstrap %d-member cluster within deadline", cluster.Status.Observed.Replicas))
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: time.Minute}, nil
+	}
+
+	if specEqualsObserved(cluster) {
+		log.Error(nil, "deadline exceeded; awaiting spec update",
+			"observed", cluster.Status.Observed)
+		setClusterCondition(cluster, lll.ClusterProgressing, metav1.ConditionFalse, "DeadlineExceeded",
+			"deadline exceeded; edit spec to retry, or delete the cluster")
+		setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionFalse, "DeadlineExceeded",
+			fmt.Sprintf("could not reach target %+v within deadline", cluster.Status.Observed))
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: time.Minute}, nil
+	}
+
+	// Spec has been edited since the deadline expired — treat that as the
+	// user's intervention and resume.
+	log.Info("deadline exceeded but spec was updated; retrying with new target",
+		"observed", cluster.Status.Observed, "spec", cluster.Spec)
+	snapshotSpecIntoObserved(cluster)
+	setProgressDeadline(cluster, now)
+	setClusterCondition(cluster, lll.ClusterProgressing, metav1.ConditionTrue, "RetryAfterDeadline",
+		"adopting updated spec after previous deadline")
+	if err := r.Status().Update(ctx, cluster); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{Requeue: true}, nil
 }
 
 // ── Locking-pattern helpers ──────────────────────────────────────────────

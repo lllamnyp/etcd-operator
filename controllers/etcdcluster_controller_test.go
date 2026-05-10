@@ -112,45 +112,156 @@ func TestObservedSpec_LocksReplicasMidBootstrap(t *testing.T) {
 	}
 }
 
-// TestProgressDeadline_AbandonsStuckTarget verifies the escape hatch: if the
-// deadline is in the past and reconciliation is not complete, the controller
-// adopts the latest spec. This is the user-facing remedy for a "I set a
-// broken spec, get me out" situation described in the README.
-func TestProgressDeadline_AbandonsStuckTarget(t *testing.T) {
+// TestDeadlineExceeded_BootstrapTerminal: an expired deadline before the
+// cluster has formed (ClusterID is empty) is a hard terminal error. The
+// operator must not adopt a new target — pods of the partially-bootstrapped
+// members carry an --initial-cluster value that can't be changed in place,
+// so creating new members with a different --initial-cluster would prevent
+// the cluster from ever forming. Recovery is delete-and-recreate.
+func TestDeadlineExceeded_BootstrapTerminal(t *testing.T) {
 	ctx := context.Background()
 	cluster := &lll.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
 		Spec: lll.EtcdClusterSpec{
-			Replicas: ptrInt32(5),
+			Replicas: ptrInt32(5), // user already tried to "fix"
 			Version:  "3.5.17",
 			Storage:  quickQty(t, "1Gi"),
 		},
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "test",
+			// ClusterID intentionally empty — bootstrap hasn't completed.
 			Observed: &lll.ObservedClusterSpec{
-				Replicas: 7, // stuck target
+				Replicas: 3,
 				Version:  "3.5.17",
 				Storage:  quickQty(t, "1Gi"),
 			},
-			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(-1)}, // already past
+			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(-1)}, // expired
 		},
 	}
 	c, _ := newTestClient(t, cluster)
-	fe := newFakeEtcd(0xdeadbeef)
 	r := &EtcdClusterReconciler{
 		Client:            c,
 		Scheme:            testScheme(t),
-		EtcdClientFactory: factoryReturning(fe),
+		EtcdClientFactory: factoryReturning(newFakeEtcd(0xdeadbeef)),
 	}
 
-	// One reconcile is enough to detect the expired deadline and adopt spec.
 	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test", Namespace: "ns"}}); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
 
 	mustGet(t, c, "test", "ns", cluster)
-	if cluster.Status.Observed == nil || cluster.Status.Observed.Replicas != 5 {
-		t.Fatalf("observed.Replicas should have been reset to spec.Replicas (5) after deadline; got %+v", cluster.Status.Observed)
+	if cluster.Status.Observed == nil || cluster.Status.Observed.Replicas != 3 {
+		t.Fatalf("observed must NOT change during bootstrap deadline-exceeded; got %+v", cluster.Status.Observed)
+	}
+	var avail *metav1.Condition
+	for i := range cluster.Status.Conditions {
+		if cluster.Status.Conditions[i].Type == lll.ClusterAvailable {
+			avail = &cluster.Status.Conditions[i]
+		}
+	}
+	if avail == nil || avail.Status != metav1.ConditionFalse || avail.Reason != "BootstrapFailed" {
+		t.Fatalf("Available condition = %+v; want False/BootstrapFailed", avail)
+	}
+}
+
+// TestDeadlineExceeded_SteadyStateWaitsForSpecUpdate: after bootstrap, an
+// expired deadline with spec == observed parks the operator in a terminal
+// state until the user updates spec. observed must not auto-pivot.
+func TestDeadlineExceeded_SteadyStateWaitsForSpecUpdate(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(7),
+			Version:  "3.5.17",
+			Storage:  quickQty(t, "1Gi"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "test",
+			ClusterID:    "deadbeef", // bootstrapped
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 7, // spec == observed, deadline still expired
+				Version:  "3.5.17",
+				Storage:  quickQty(t, "1Gi"),
+			},
+			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(-1)},
+		},
+	}
+	c, _ := newTestClient(t, cluster)
+	r := &EtcdClusterReconciler{
+		Client:            c,
+		Scheme:            testScheme(t),
+		EtcdClientFactory: factoryReturning(newFakeEtcd(0xdeadbeef)),
+	}
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test", Namespace: "ns"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	mustGet(t, c, "test", "ns", cluster)
+	if cluster.Status.Observed.Replicas != 7 {
+		t.Fatalf("observed must not change while spec == observed; got %+v", cluster.Status.Observed)
+	}
+	var avail *metav1.Condition
+	for i := range cluster.Status.Conditions {
+		if cluster.Status.Conditions[i].Type == lll.ClusterAvailable {
+			avail = &cluster.Status.Conditions[i]
+		}
+	}
+	if avail == nil || avail.Status != metav1.ConditionFalse || avail.Reason != "DeadlineExceeded" {
+		t.Fatalf("Available condition = %+v; want False/DeadlineExceeded", avail)
+	}
+}
+
+// TestDeadlineExceeded_SteadyStateRetriesOnSpecUpdate: after bootstrap, an
+// expired deadline with spec != observed is read as user intervention. The
+// operator snapshots the new spec into observed and resumes.
+func TestDeadlineExceeded_SteadyStateRetriesOnSpecUpdate(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(5), // user just edited spec down
+			Version:  "3.5.17",
+			Storage:  quickQty(t, "1Gi"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "test",
+			ClusterID:    "deadbeef",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 100, // failed scale-up target
+				Version:  "3.5.17",
+				Storage:  quickQty(t, "1Gi"),
+			},
+			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(-1)},
+		},
+	}
+	c, _ := newTestClient(t, cluster)
+	r := &EtcdClusterReconciler{
+		Client:            c,
+		Scheme:            testScheme(t),
+		EtcdClientFactory: factoryReturning(newFakeEtcd(0xdeadbeef)),
+	}
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test", Namespace: "ns"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	mustGet(t, c, "test", "ns", cluster)
+	if cluster.Status.Observed.Replicas != 5 {
+		t.Fatalf("observed should adopt new spec (5) after spec edit; got %+v", cluster.Status.Observed)
+	}
+	if cluster.Status.ProgressDeadline == nil {
+		t.Fatalf("new deadline should have been set on retry")
+	}
+	var prog *metav1.Condition
+	for i := range cluster.Status.Conditions {
+		if cluster.Status.Conditions[i].Type == lll.ClusterProgressing {
+			prog = &cluster.Status.Conditions[i]
+		}
+	}
+	if prog == nil || prog.Status != metav1.ConditionTrue || prog.Reason != "RetryAfterDeadline" {
+		t.Fatalf("Progressing condition = %+v; want True/RetryAfterDeadline", prog)
 	}
 }
 

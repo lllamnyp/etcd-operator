@@ -68,20 +68,43 @@ Both are the same underlying problem: the user's "desired state" is mutable on a
 
 This is the same pattern Deployments use with `progressDeadlineSeconds`, applied at a coarser granularity.
 
-### How to abort a stuck reconcile
+### What happens when the deadline expires
 
-You set a broken spec (typo'd version tag, replica count that breaks quorum, etc.) and don't want to wait `progressDeadlineSeconds`. Patch the deadline to a past time:
+An expired deadline is a **terminal error condition**. The operator stops acting on its own and waits for the user. There is no automatic pivot to the latest spec — silently moving on can corrupt a half-bootstrapped cluster, and in steady state it tends to widen the blast radius of stuck reconciles.
 
-```sh
-kubectl patch etcdcluster.lllamnyp.su my-cluster --subresource=status --type=merge \
-  -p "{\"status\":{\"progressDeadline\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ -d '1 minute ago')\"}}"
+Recovery depends on whether the cluster ever finished bootstrapping.
+
+**Before bootstrap finished** (`status.clusterID` is empty): the partially-created `EtcdMember` pods carry an `--initial-cluster` flag listing the original member set, and etcd will refuse to form once any subsequent member is started with a different value. There is no in-place fix. The condition will read:
+
+```
+Available: False, Reason=BootstrapFailed
 ```
 
-The next reconcile sees the deadline has elapsed, copies the current spec into `status.observed`, and starts working toward whatever the latest spec says.
+The recovery is to delete the cluster and recreate:
 
-If you want to undo the spec change instead (forget the bad spec, keep the old target), edit `spec` back to what it was before — the controller is still working toward the *old* `status.observed`, so the change to spec is harmless until the deadline expires.
+```sh
+kubectl delete etcdcluster.lllamnyp.su my-cluster
+kubectl apply -f my-cluster.yaml   # with the correct spec
+```
 
-> The locking is enforced by the controller, not by an admission webhook. A user can `kubectl edit` `spec` mid-flight and the API server will accept the change; the controller simply won't act on it until the in-flight target is met or the deadline expires.
+**After bootstrap finished** (`status.clusterID` is set): the cluster itself is healthy; only the most recent operation got stuck (e.g. a scale-up to a replica count the cluster can't schedule). The operator parks with:
+
+```
+Available: False, Reason=DeadlineExceeded
+Progressing: False, Reason=DeadlineExceeded
+```
+
+To recover, just edit `spec` to a sane value:
+
+```sh
+kubectl edit etcdcluster.lllamnyp.su my-cluster
+```
+
+The next reconcile notices `spec != status.observed`, treats the edit as your "I'm fixing this" signal, snapshots the new spec into `status.observed`, sets a fresh deadline, and resumes. (Until you edit spec, the operator just sits there with the terminal conditions.)
+
+You can also force the deadline to expire early — patch `status.progressDeadline` to a past time — to escalate a slow reconcile to terminal state without waiting out the full window. Then follow whichever recovery path applies above.
+
+> The locking is enforced by the controller, not by an admission webhook. A user can `kubectl edit` `spec` mid-flight and the API server will accept the change; the controller simply won't act on it until either the in-flight target is met, or the deadline expires and (in steady state) you've edited spec to something new.
 
 ## Quick start
 
