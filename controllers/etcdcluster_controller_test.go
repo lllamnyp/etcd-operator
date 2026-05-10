@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 
@@ -400,6 +401,271 @@ func TestUpdateStatus_SurfacesBrokenCount(t *testing.T) {
 	}
 	if cluster.Status.ReadyMembers != 3 {
 		t.Fatalf("ReadyMembers = %d, want 3", cluster.Status.ReadyMembers)
+	}
+}
+
+// TestScaleUp_IdempotentAfterCrash covers reviewer issue #1: if a previous
+// reconcile crashed between MemberAdd succeeding and the EtcdMember CR being
+// created, the next reconcile must NOT call MemberAdd again (etcd would
+// reject the duplicate peerURL); it should detect the existing entry and
+// proceed straight to creating the CR.
+func TestScaleUp_IdempotentAfterCrash(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(4),
+			Version:  "3.5.17",
+			Storage:  quickQty(t, "1Gi"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "test",
+			ClusterID:    "deadbeef",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 4,
+				Version:  "3.5.17",
+				Storage:  quickQty(t, "1Gi"),
+			},
+			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
+		},
+	}
+	objs := []client.Object{cluster}
+	for i := 0; i < 3; i++ {
+		objs = append(objs, &lll.EtcdMember{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fmt.Sprintf("test-%d", i),
+				Namespace: "ns",
+				Labels:    memberLabels("test", fmt.Sprintf("test-%d", i)),
+			},
+			Spec:   lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"), InitialCluster: "x", ClusterToken: "test"},
+			Status: lll.EtcdMemberStatus{PodName: fmt.Sprintf("test-%d", i)},
+		})
+	}
+	c, _ := newTestClient(t, objs...)
+
+	// Etcd already has 4 members — including test-3 from a partial scale-up.
+	fe := newFakeEtcd(0xdeadbeef,
+		&etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa02, Name: "test-1", PeerURLs: []string{peerURL("test-1", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa03, Name: "test-2", PeerURLs: []string{peerURL("test-2", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa04, Name: "", PeerURLs: []string{peerURL("test-3", "test", "ns")}},
+	)
+
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
+
+	// Drive the scale-up branch directly — Reconcile would handle services
+	// + membership snapshots; we want to assert MemberAdd isn't re-called.
+	memberList := &lll.EtcdMemberList{}
+	if err := c.List(ctx, memberList); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if _, err := r.scaleUp(ctx, cluster, memberList.Items); err != nil {
+		t.Fatalf("scaleUp: %v", err)
+	}
+
+	if len(fe.addCalls) != 0 {
+		t.Fatalf("MemberAdd should not be called when peerURL already in etcd; got %v", fe.addCalls)
+	}
+	got := &lll.EtcdMember{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "test-3"}, got); err != nil {
+		t.Fatalf("EtcdMember test-3 should have been created: %v", err)
+	}
+}
+
+// TestBootstrap_PartialPriorRunIsConsistent covers reviewer issue #2: a
+// crash mid-bootstrap leaves some EtcdMembers with InitialCluster set; the
+// resumed bootstrap must produce the same InitialCluster value for the
+// remaining members so etcd can still form.
+func TestBootstrap_PartialPriorRunIsConsistent(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "test",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 3,
+				Version:  "3.5.17",
+				Storage:  quickQty(t, "1Gi"),
+			},
+		},
+	}
+	// Pre-create members 0 and 1 from a hypothetical prior run, exactly as
+	// bootstrap() would have written them.
+	wantIC := buildInitialCluster([]string{"test-0", "test-1", "test-2"}, "test", "ns")
+	existing := []client.Object{cluster}
+	for i := 0; i < 2; i++ {
+		existing = append(existing, &lll.EtcdMember{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fmt.Sprintf("test-%d", i),
+				Namespace: "ns",
+				Labels:    memberLabels("test", fmt.Sprintf("test-%d", i)),
+			},
+			Spec: lll.EtcdMemberSpec{
+				ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+				Bootstrap: true, InitialCluster: wantIC, ClusterToken: "test",
+			},
+		})
+	}
+	c, _ := newTestClient(t, existing...)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdeadbeef))}
+
+	memberList := &lll.EtcdMemberList{}
+	if err := c.List(ctx, memberList); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if _, err := r.bootstrap(ctx, cluster, memberList.Items, 3); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+
+	created := &lll.EtcdMember{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "test-2"}, created); err != nil {
+		t.Fatalf("test-2 should have been created: %v", err)
+	}
+	if created.Spec.InitialCluster != wantIC {
+		t.Fatalf("test-2.InitialCluster mismatch: got %q want %q", created.Spec.InitialCluster, wantIC)
+	}
+}
+
+// TestScaleDown_WaitsForInFlightDeletion covers reviewer issue #3: while one
+// EtcdMember is being deleted (DeletionTimestamp set, finalizer pending), no
+// further deletion may be issued. Concurrent finalizers running MemberRemove
+// against stale snapshots of the etcd cluster can race past quorum.
+func TestScaleDown_WaitsForInFlightDeletion(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(1),
+			Version:  "3.5.17",
+			Storage:  quickQty(t, "1Gi"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "test",
+			ClusterID:    "deadbeef",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 1,
+				Version:  "3.5.17",
+				Storage:  quickQty(t, "1Gi"),
+			},
+			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
+		},
+	}
+	objs := []client.Object{cluster}
+	now := metav1.Now()
+	// 5 EtcdMembers: test-0 through test-4. test-4 is being deleted.
+	for i := 0; i < 5; i++ {
+		m := &lll.EtcdMember{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fmt.Sprintf("test-%d", i),
+				Namespace: "ns",
+				Labels:    memberLabels("test", fmt.Sprintf("test-%d", i)),
+			},
+			Spec:   lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"), InitialCluster: "x", ClusterToken: "test"},
+			Status: lll.EtcdMemberStatus{PodName: fmt.Sprintf("test-%d", i), MemberID: "abc", Conditions: []metav1.Condition{{Type: lll.MemberReady, Status: metav1.ConditionTrue, Reason: "PodReady", LastTransitionTime: now}}},
+		}
+		if i == 4 {
+			m.DeletionTimestamp = &now
+			m.Finalizers = []string{MemberFinalizer}
+		}
+		objs = append(objs, m)
+	}
+	c, _ := newTestClient(t, objs...)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdeadbeef))}
+
+	res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test", Namespace: "ns"}})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if res.RequeueAfter == 0 {
+		t.Fatalf("expected RequeueAfter while waiting for in-flight deletion; got %+v", res)
+	}
+
+	// Assert no other member got a DeletionTimestamp.
+	memberList := &lll.EtcdMemberList{}
+	_ = c.List(ctx, memberList)
+	for _, m := range memberList.Items {
+		if m.Name == "test-4" {
+			continue
+		}
+		if !m.DeletionTimestamp.IsZero() {
+			t.Fatalf("member %s was unexpectedly deleted while test-4 deletion in flight", m.Name)
+		}
+	}
+}
+
+// TestSetClusterCondition_PopulatesObservedGeneration covers reviewer issue
+// #8: conditions must carry the cluster's current Generation so consumers
+// can tell whether the condition reflects the latest spec.
+func TestSetClusterCondition_PopulatesObservedGeneration(t *testing.T) {
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns", Generation: 7},
+	}
+	setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionTrue, "TestReason", "test")
+	if len(cluster.Status.Conditions) != 1 {
+		t.Fatalf("expected 1 condition, got %d", len(cluster.Status.Conditions))
+	}
+	if cluster.Status.Conditions[0].ObservedGeneration != 7 {
+		t.Fatalf("ObservedGeneration = %d, want 7", cluster.Status.Conditions[0].ObservedGeneration)
+	}
+}
+
+// TestSetClusterCondition_ReturnsFalseIfNoChange covers reviewer issue #5:
+// the helper signals when nothing actually changed so callers can skip the
+// Status().Update and avoid a write-storm in terminal state.
+func TestSetClusterCondition_ReturnsFalseIfNoChange(t *testing.T) {
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns", Generation: 1},
+	}
+	if !setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionTrue, "Reason", "msg") {
+		t.Fatalf("first call should report changed=true")
+	}
+	if setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionTrue, "Reason", "msg") {
+		t.Fatalf("second identical call should report changed=false")
+	}
+	if !setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionTrue, "Reason", "different message") {
+		t.Fatalf("call with different message should report changed=true")
+	}
+}
+
+// TestDeadlineExceeded_NoChurnWhenSteady covers reviewer issue #5: while
+// parked in a terminal state the controller must not write status on every
+// reconcile.
+func TestDeadlineExceeded_NoChurnWhenSteady(t *testing.T) {
+	now := metav1.Now()
+	past := metav1.NewTime(now.Add(-time.Hour))
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(3),
+			Version:  "3.5.17",
+			Storage:  quickQty(t, "1Gi"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "test",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+			ProgressDeadline: &past,
+			Conditions: []metav1.Condition{
+				{Type: lll.ClusterProgressing, Status: metav1.ConditionFalse, Reason: "BootstrapFailed", Message: "bootstrap deadline exceeded; delete the cluster and recreate to recover", LastTransitionTime: now},
+				{Type: lll.ClusterAvailable, Status: metav1.ConditionFalse, Reason: "BootstrapFailed", Message: "could not bootstrap 3-member cluster within deadline", LastTransitionTime: now},
+			},
+		},
+	}
+	c, _ := newTestClient(t, cluster)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdeadbeef))}
+
+	rvBefore := mustGet(t, c, "test", "ns", &lll.EtcdCluster{}).ResourceVersion
+	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "test", Namespace: "ns"}})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if res.RequeueAfter != 0 || res.Requeue {
+		t.Fatalf("terminal state must return no requeue; got %+v", res)
+	}
+	rvAfter := mustGet(t, c, "test", "ns", &lll.EtcdCluster{}).ResourceVersion
+	if rvBefore != rvAfter {
+		t.Fatalf("ResourceVersion changed (%q -> %q) on no-op terminal reconcile", rvBefore, rvAfter)
 	}
 }
 

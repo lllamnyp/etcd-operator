@@ -122,6 +122,18 @@ func (r *EtcdClusterReconciler) isBroken(_ lll.EtcdMember) bool {
 	return false
 }
 
+// setMemberCondition stamps an EtcdMember condition with the resource's
+// current Generation as ObservedGeneration. Mirrors setClusterCondition.
+func setMemberCondition(member *lll.EtcdMember, condType string, status metav1.ConditionStatus, reason, msg string) {
+	setCondition(&member.Status.Conditions, metav1.Condition{
+		Type:               condType,
+		Status:             status,
+		Reason:             reason,
+		Message:            msg,
+		ObservedGeneration: member.Generation,
+	})
+}
+
 // setCondition inserts or updates a condition, preserving LastTransitionTime
 // when the status has not changed.
 func setCondition(conditions *[]metav1.Condition, c metav1.Condition) {

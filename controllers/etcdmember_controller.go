@@ -314,9 +314,9 @@ func (r *EtcdMemberReconciler) buildPod(member *lll.EtcdMember) *corev1.Pod {
 			Subdomain: member.Spec.ClusterName,
 			SecurityContext: &corev1.PodSecurityContext{
 				RunAsNonRoot: ptrBool(true),
-				RunAsUser:    ptrInt64(60000),
-				RunAsGroup:   ptrInt64(60000),
-				FSGroup:      ptrInt64(60000),
+				RunAsUser:    ptrInt64(65532),
+				RunAsGroup:   ptrInt64(65532),
+				FSGroup:      ptrInt64(65532),
 				SeccompProfile: &corev1.SeccompProfile{
 					Type: corev1.SeccompProfileTypeRuntimeDefault,
 				},
@@ -414,39 +414,23 @@ func (r *EtcdMemberReconciler) updateStatus(ctx context.Context, member *lll.Etc
 
 	switch {
 	case !podReady:
-		setCondition(&member.Status.Conditions, metav1.Condition{
-			Type:    lll.MemberReady,
-			Status:  metav1.ConditionFalse,
-			Reason:  "PodNotReady",
-			Message: fmt.Sprintf("pod phase: %s", pod.Status.Phase),
-		})
+		setMemberCondition(member, lll.MemberReady, metav1.ConditionFalse, "PodNotReady",
+			fmt.Sprintf("pod phase: %s", pod.Status.Phase))
 	case member.Status.MemberID == "":
 		// Pod ready but we haven't matched it to an etcd member yet.
 		// Try once, but don't claim Ready=True until we have the ID — the
 		// finalizer needs it to perform a clean MemberRemove on scale-down.
 		if id, err := r.discoverMemberID(ctx, member); err == nil {
 			member.Status.MemberID = fmt.Sprintf("%x", id)
-			setCondition(&member.Status.Conditions, metav1.Condition{
-				Type:    lll.MemberReady,
-				Status:  metav1.ConditionTrue,
-				Reason:  "PodReady",
-				Message: "etcd member is ready",
-			})
+			setMemberCondition(member, lll.MemberReady, metav1.ConditionTrue, "PodReady",
+				"etcd member is ready")
 		} else {
-			setCondition(&member.Status.Conditions, metav1.Condition{
-				Type:    lll.MemberReady,
-				Status:  metav1.ConditionFalse,
-				Reason:  "DiscoveringMemberID",
-				Message: fmt.Sprintf("waiting for memberID: %v", err),
-			})
+			setMemberCondition(member, lll.MemberReady, metav1.ConditionFalse, "DiscoveringMemberID",
+				fmt.Sprintf("waiting for memberID: %v", err))
 		}
 	default:
-		setCondition(&member.Status.Conditions, metav1.Condition{
-			Type:    lll.MemberReady,
-			Status:  metav1.ConditionTrue,
-			Reason:  "PodReady",
-			Message: "etcd member is ready",
-		})
+		setMemberCondition(member, lll.MemberReady, metav1.ConditionTrue, "PodReady",
+			"etcd member is ready")
 	}
 
 	if err := r.Status().Update(ctx, member); err != nil {

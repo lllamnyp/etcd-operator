@@ -23,7 +23,7 @@ The cluster controller decides *which* members exist and orchestrates `MemberAdd
 
 ## What's **not** supported (yet)
 
-No TLS. No auth/RBAC inside etcd. No version upgrades — changing `spec.version` does not roll the new image through running pods (only new pods get the new version). No automatic broken-member replacement (the predicate is stubbed; `status.brokenMembers` always reads 0). No backups, no defragmentation scheduling, no PodAntiAffinity by default. See `tmp/todo.md` (locally) and the issue tracker for the running list.
+No TLS. No auth/RBAC inside etcd. No version upgrades — changing `spec.version` does not roll the new image through running pods (only new pods get the new version). No PVC resizing — changing `spec.storage` does not resize existing members' PVCs (only newly-created members on scale-up pick up the new size); see [#2](https://github.com/lllamnyp/etcd-operator/issues/2). No automatic broken-member replacement (the predicate is stubbed; `status.brokenMembers` always reads 0). No backups, no defragmentation scheduling, no PodAntiAffinity by default. See `tmp/todo.md` (locally) and the issue tracker for the running list.
 
 ## API at a glance
 

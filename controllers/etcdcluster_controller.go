@@ -147,6 +147,18 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return r.scaleUp(ctx, cluster, active)
 	}
 	if current > desired {
+		// Don't fire another deletion while one is already in flight. The
+		// EtcdMember finalizer needs to call MemberRemove against the etcd
+		// cluster before its pod goes away; concurrent finalizers can race
+		// past quorum because each works from its own snapshot of the etcd
+		// member list. Wait for the deleting member to be GC'd before
+		// picking the next victim.
+		for _, m := range memberList.Items {
+			if !m.DeletionTimestamp.IsZero() {
+				log.Info("waiting for in-flight member deletion before further scale-down", "deleting", m.Name)
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+		}
 		log.Info("scaling down", "current", current, "desired", desired)
 		return r.scaleDown(ctx, cluster, active)
 	}
@@ -231,7 +243,12 @@ func (r *EtcdClusterReconciler) tryDiscoverCluster(
 		log.Error(err, "etcd client construction failed", "endpoints", endpoints)
 		setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionFalse, "ClusterUnreachable",
 			fmt.Sprintf("etcd client construction failed: %v", err))
-		_ = r.Status().Update(ctx, cluster)
+		if upErr := r.Status().Update(ctx, cluster); upErr != nil {
+			if errors.IsConflict(upErr) {
+				return ctrl.Result{Requeue: true}, nil
+			}
+			return ctrl.Result{}, upErr
+		}
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 	defer etcdClient.Close()
@@ -244,7 +261,12 @@ func (r *EtcdClusterReconciler) tryDiscoverCluster(
 		log.Error(err, "MemberList failed during cluster discovery", "endpoints", endpoints)
 		setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionFalse, "ClusterUnreachable",
 			fmt.Sprintf("MemberList failed: %v", err))
-		_ = r.Status().Update(ctx, cluster)
+		if upErr := r.Status().Update(ctx, cluster); upErr != nil {
+			if errors.IsConflict(upErr) {
+				return ctrl.Result{Requeue: true}, nil
+			}
+			return ctrl.Result{}, upErr
+		}
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
@@ -276,12 +298,39 @@ func (r *EtcdClusterReconciler) scaleUp(
 	newName := nextMemberName(cluster.Name, members)
 	newPeerURL := peerURL(newName, cluster.Name, cluster.Namespace)
 
-	addCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	// Crash-safety: a previous reconcile may have called MemberAdd
+	// successfully and then failed before creating the EtcdMember CR. Check
+	// etcd's current members; if our peerURL is already registered, skip
+	// MemberAdd and proceed to CR creation. This lets us recover from a
+	// partial scale-up without orphaning an etcd member or wedging the
+	// reconcile on a duplicate-peerURL error.
+	listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-
-	if _, err = etcdClient.MemberAdd(addCtx, []string{newPeerURL}); err != nil {
-		log.Error(err, "MemberAdd failed", "endpoints", endpoints)
+	listResp, err := etcdClient.MemberList(listCtx)
+	if err != nil {
+		log.Error(err, "MemberList failed during scale-up", "endpoints", endpoints)
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+	alreadyAdded := false
+	for _, m := range listResp.Members {
+		for _, p := range m.PeerURLs {
+			if p == newPeerURL {
+				alreadyAdded = true
+				break
+			}
+		}
+		if alreadyAdded {
+			break
+		}
+	}
+
+	if !alreadyAdded {
+		addCtx, addCancel := context.WithTimeout(ctx, 10*time.Second)
+		defer addCancel()
+		if _, err = etcdClient.MemberAdd(addCtx, []string{newPeerURL}); err != nil {
+			log.Error(err, "MemberAdd failed", "endpoints", endpoints)
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
 	}
 
 	allNames := make([]string, 0, len(members)+1)
@@ -490,29 +539,45 @@ func (r *EtcdClusterReconciler) handleDeadlineExceeded(
 	log := log.FromContext(ctx)
 
 	if cluster.Status.ClusterID == "" {
-		log.Error(nil, "bootstrap deadline exceeded; delete and recreate to recover",
-			"observed", cluster.Status.Observed)
-		setClusterCondition(cluster, lll.ClusterProgressing, metav1.ConditionFalse, "BootstrapFailed",
+		// Bootstrap terminal state. Idempotent: only persist if conditions
+		// actually changed; once parked, return ctrl.Result{} and let the
+		// watch wake us up if the user deletes (or edits, which won't
+		// recover but will at least re-trigger reconcile).
+		changed := setClusterCondition(cluster, lll.ClusterProgressing, metav1.ConditionFalse, "BootstrapFailed",
 			"bootstrap deadline exceeded; delete the cluster and recreate to recover")
-		setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionFalse, "BootstrapFailed",
-			fmt.Sprintf("could not bootstrap %d-member cluster within deadline", cluster.Status.Observed.Replicas))
-		if err := r.Status().Update(ctx, cluster); err != nil {
-			return ctrl.Result{}, err
+		changed = setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionFalse, "BootstrapFailed",
+			fmt.Sprintf("could not bootstrap %d-member cluster within deadline", cluster.Status.Observed.Replicas)) || changed
+		if changed {
+			log.Error(nil, "bootstrap deadline exceeded; delete and recreate to recover",
+				"observed", cluster.Status.Observed)
+			if err := r.Status().Update(ctx, cluster); err != nil {
+				if errors.IsConflict(err) {
+					return ctrl.Result{Requeue: true}, nil
+				}
+				return ctrl.Result{}, err
+			}
 		}
-		return ctrl.Result{RequeueAfter: time.Minute}, nil
+		return ctrl.Result{}, nil
 	}
 
 	if specEqualsObserved(cluster) {
-		log.Error(nil, "deadline exceeded; awaiting spec update",
-			"observed", cluster.Status.Observed)
-		setClusterCondition(cluster, lll.ClusterProgressing, metav1.ConditionFalse, "DeadlineExceeded",
+		// Steady-state terminal state. Same idempotency: write only if
+		// changed, no requeue.
+		changed := setClusterCondition(cluster, lll.ClusterProgressing, metav1.ConditionFalse, "DeadlineExceeded",
 			"deadline exceeded; edit spec to retry, or delete the cluster")
-		setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionFalse, "DeadlineExceeded",
-			fmt.Sprintf("could not reach target %+v within deadline", cluster.Status.Observed))
-		if err := r.Status().Update(ctx, cluster); err != nil {
-			return ctrl.Result{}, err
+		changed = setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionFalse, "DeadlineExceeded",
+			fmt.Sprintf("could not reach target %+v within deadline", cluster.Status.Observed)) || changed
+		if changed {
+			log.Error(nil, "deadline exceeded; awaiting spec update",
+				"observed", cluster.Status.Observed)
+			if err := r.Status().Update(ctx, cluster); err != nil {
+				if errors.IsConflict(err) {
+					return ctrl.Result{Requeue: true}, nil
+				}
+				return ctrl.Result{}, err
+			}
 		}
-		return ctrl.Result{RequeueAfter: time.Minute}, nil
+		return ctrl.Result{}, nil
 	}
 
 	// Spec has been edited since the deadline expired — treat that as the
@@ -598,11 +663,28 @@ func deadlineExpired(cluster *lll.EtcdCluster, now metav1.Time) bool {
 	return !now.Before(cluster.Status.ProgressDeadline)
 }
 
-func setClusterCondition(cluster *lll.EtcdCluster, condType string, status metav1.ConditionStatus, reason, msg string) {
-	setCondition(&cluster.Status.Conditions, metav1.Condition{
-		Type:    condType,
-		Status:  status,
-		Reason:  reason,
-		Message: msg,
-	})
+// setClusterCondition writes a condition stamped with the cluster's current
+// Generation as ObservedGeneration. Returns true if anything actually
+// changed; callers can skip the Status().Update when nothing did.
+func setClusterCondition(cluster *lll.EtcdCluster, condType string, status metav1.ConditionStatus, reason, msg string) bool {
+	want := metav1.Condition{
+		Type:               condType,
+		Status:             status,
+		Reason:             reason,
+		Message:            msg,
+		ObservedGeneration: cluster.Generation,
+	}
+	for _, existing := range cluster.Status.Conditions {
+		if existing.Type == want.Type {
+			if existing.Status == want.Status &&
+				existing.Reason == want.Reason &&
+				existing.Message == want.Message &&
+				existing.ObservedGeneration == want.ObservedGeneration {
+				return false
+			}
+			break
+		}
+	}
+	setCondition(&cluster.Status.Conditions, want)
+	return true
 }
