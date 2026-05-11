@@ -14,8 +14,8 @@ import (
 	"context"
 	"testing"
 
-	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -37,13 +37,16 @@ type fakeEtcd struct {
 	clusterID uint64
 	members   []*etcdserverpb.Member
 
-	listErr   error
-	addErr    error
-	removeErr error
+	listErr    error
+	addErr     error
+	removeErr  error
+	promoteErr error
 
-	addCalls    []string
-	removeCalls []uint64
-	closed      bool
+	addCalls        []string
+	addLearnerCalls []string
+	promoteCalls    []uint64
+	removeCalls     []uint64
+	closed          bool
 }
 
 func newFakeEtcd(clusterID uint64, members ...*etcdserverpb.Member) *fakeEtcd {
@@ -71,6 +74,37 @@ func (f *fakeEtcd) MemberAdd(_ context.Context, peerAddrs []string) (*clientv3.M
 	return &clientv3.MemberAddResponse{
 		Header:  &etcdserverpb.ResponseHeader{ClusterId: f.clusterID},
 		Member:  m,
+		Members: f.members,
+	}, nil
+}
+
+func (f *fakeEtcd) MemberAddAsLearner(_ context.Context, peerAddrs []string) (*clientv3.MemberAddResponse, error) {
+	if f.addErr != nil {
+		return nil, f.addErr
+	}
+	f.addLearnerCalls = append(f.addLearnerCalls, peerAddrs...)
+	id := uint64(0xbb00) + uint64(len(f.members)+1)
+	m := &etcdserverpb.Member{ID: id, PeerURLs: peerAddrs, IsLearner: true}
+	f.members = append(f.members, m)
+	return &clientv3.MemberAddResponse{
+		Header:  &etcdserverpb.ResponseHeader{ClusterId: f.clusterID},
+		Member:  m,
+		Members: f.members,
+	}, nil
+}
+
+func (f *fakeEtcd) MemberPromote(_ context.Context, id uint64) (*clientv3.MemberPromoteResponse, error) {
+	if f.promoteErr != nil {
+		return nil, f.promoteErr
+	}
+	f.promoteCalls = append(f.promoteCalls, id)
+	for _, m := range f.members {
+		if m.ID == id {
+			m.IsLearner = false
+		}
+	}
+	return &clientv3.MemberPromoteResponse{
+		Header:  &etcdserverpb.ResponseHeader{ClusterId: f.clusterID},
 		Members: f.members,
 	}, nil
 }
@@ -179,8 +213,8 @@ func quickQty(t *testing.T, s string) resource.Quantity {
 // drive the EtcdMember reconciler past its podReady gate.
 func readyPodCondition() corev1.PodCondition {
 	return corev1.PodCondition{
-		Type:   corev1.PodReady,
-		Status: corev1.ConditionTrue,
+		Type:               corev1.PodReady,
+		Status:             corev1.ConditionTrue,
 		LastTransitionTime: metav1.Now(),
 	}
 }

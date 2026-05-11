@@ -126,15 +126,31 @@ func (r *EtcdClusterReconciler) isBroken(_ lll.EtcdMember) bool {
 }
 
 // setMemberCondition stamps an EtcdMember condition with the resource's
-// current Generation as ObservedGeneration. Mirrors setClusterCondition.
-func setMemberCondition(member *lll.EtcdMember, condType string, status metav1.ConditionStatus, reason, msg string) {
-	setCondition(&member.Status.Conditions, metav1.Condition{
+// current Generation as ObservedGeneration. Returns true when something
+// actually changed; callers skip the Status().Update if nothing did, so the
+// member controller doesn't write the same status back every 30 seconds
+// just because of a periodic reconcile.
+func setMemberCondition(member *lll.EtcdMember, condType string, status metav1.ConditionStatus, reason, msg string) bool {
+	want := metav1.Condition{
 		Type:               condType,
 		Status:             status,
 		Reason:             reason,
 		Message:            msg,
 		ObservedGeneration: member.Generation,
-	})
+	}
+	for _, existing := range member.Status.Conditions {
+		if existing.Type == want.Type {
+			if existing.Status == want.Status &&
+				existing.Reason == want.Reason &&
+				existing.Message == want.Message &&
+				existing.ObservedGeneration == want.ObservedGeneration {
+				return false
+			}
+			break
+		}
+	}
+	setCondition(&member.Status.Conditions, want)
+	return true
 }
 
 // setCondition inserts or updates a condition, preserving LastTransitionTime

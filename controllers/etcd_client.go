@@ -24,6 +24,8 @@ import (
 type EtcdClusterClient interface {
 	MemberList(ctx context.Context) (*clientv3.MemberListResponse, error)
 	MemberAdd(ctx context.Context, peerAddrs []string) (*clientv3.MemberAddResponse, error)
+	MemberAddAsLearner(ctx context.Context, peerAddrs []string) (*clientv3.MemberAddResponse, error)
+	MemberPromote(ctx context.Context, id uint64) (*clientv3.MemberPromoteResponse, error)
 	MemberRemove(ctx context.Context, id uint64) (*clientv3.MemberRemoveResponse, error)
 	Close() error
 }

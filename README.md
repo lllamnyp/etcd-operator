@@ -11,14 +11,14 @@ The operator manages etcd clusters via two custom resources:
 
 There is **no StatefulSet**. Each member's Pod and PVC are reconciled independently by the member controller, which lets us model protocol-aware lifecycle (joining, member-id assignment, graceful removal) without fighting StatefulSet's "all replicas are one workload" assumption.
 
-The cluster controller decides *which* members exist and orchestrates `MemberAdd`/`MemberRemove` against the running etcd cluster. The member controller decides *how* a member becomes real — Pod, PVC, etcd flags — and reports observed facts (memberID, readiness) up to its CR's status.
+The cluster controller decides *which* members exist and orchestrates `MemberAddAsLearner` / `MemberPromote` / `MemberRemove` against the running etcd cluster. The member controller decides *how* a member becomes real — Pod, PVC, etcd flags — and reports observed facts (memberID, readiness) up to its CR's status.
 
-Bootstrap is single-member: the operator creates one seed (`<cluster>-0`) with `--initial-cluster-state=new` and `--initial-cluster` listing only itself. Once etcd reports that member's ID and the cluster ID, additional members join one at a time via `MemberAdd`. This avoids the historical "all bootstrapping members must agree on `--initial-cluster`" coordination hazard.
+Bootstrap is single-member: the operator creates one seed (`<cluster>-0`) with `--initial-cluster-state=new` and `--initial-cluster` listing only itself. Once etcd reports that member's ID and the cluster ID, additional members are added one at a time via `MemberAddAsLearner` and then `MemberPromote` once each has caught up — voting quorum doesn't shift until promotion, so an unreachable joiner can never destabilise the existing cluster.
 
 ## What's supported today
 
-- Bootstrap of new clusters. The operator always creates exactly one seed member (`<cluster>-0`) with `--initial-cluster-state=new`. Additional members are added one at a time via `MemberAdd` after the seed is up and the cluster ID is latched, until `spec.replicas` is reached.
-- Scale up: cluster controller calls `MemberAdd`, then creates an `EtcdMember` whose pod joins the existing cluster with `--initial-cluster-state=existing`.
+- Bootstrap of new clusters. The operator always creates exactly one seed member (`<cluster>-0`) with `--initial-cluster-state=new`. After the seed is up and the cluster ID is latched, additional members are added one at a time as learners (`MemberAddAsLearner`) and promoted (`MemberPromote`) once etcd reports they've caught up, until `spec.replicas` is reached. Scale-up waits for every existing member to report `Ready=True` before starting the next step.
+- Scale up: cluster controller calls `MemberAddAsLearner`, creates an `EtcdMember` whose pod joins as a learner with `--initial-cluster-state=existing`, then promotes the learner once etcd allows it.
 - Scale down: cluster controller deletes the highest-ordinal `EtcdMember`. A finalizer on the deleted member calls `MemberRemove` against remaining peers before the Pod and PVC go away.
 - Pod restart / node failure: data PVC is preserved, the new Pod reads the existing WAL and rejoins with the same member ID.
 - Cluster deletion: cascading owner refs clean up everything; finalizers detect "the whole cluster is going away" and skip etcd-side removal to avoid deadlock.

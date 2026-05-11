@@ -32,6 +32,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	clientv3 "go.etcd.io/etcd/client/v3"
+
 	lll "github.com/lllamnyp/etcd-operator/api/v1alpha2"
 )
 
@@ -63,6 +65,13 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
+	}
+
+	// If the cluster is being deleted, don't keep reconciling it. Owned
+	// resources are cascaded out via owner refs; recreating a Service for a
+	// Terminating cluster races against the GC and pollutes logs.
+	if !cluster.DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, nil
 	}
 
 	if err := r.ensureServices(ctx, cluster); err != nil {
@@ -160,12 +169,47 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	if current < desired {
+		// Don't add another member while existing ones aren't Ready yet.
+		// Even with learner-mode adds (which don't shift voting quorum until
+		// promotion), driving a sequence of MemberAddAsLearner without
+		// waiting for the previous pod to come up makes the cluster
+		// progressively more confused — the new pod has to fetch state from
+		// peers, and stacking joiners against a half-empty cluster is at
+		// best slow, at worst stalls indefinitely. Wait for everyone Ready
+		// before adding the next.
+		if !allMembersReady(active) {
+			log.Info("waiting for existing members to become Ready before next scale-up step")
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
 		log.Info("scaling up", "current", current, "desired", desired)
 		return r.scaleUp(ctx, cluster, active)
 	}
 	if current > desired {
 		log.Info("scaling down", "current", current, "desired", desired)
 		return r.scaleDown(ctx, cluster, active)
+	}
+
+	// ── current == desired ────────────────────────────────────────────
+	// One subtlety: the iteration that added the *last* learner returns
+	// before that learner gets promoted (current is now equal to desired
+	// so scaleUp won't run again on its own). We need a promote attempt
+	// here too. Cheap: list etcd once and try to promote any learner;
+	// no-op if none.
+	if cluster.Status.ClusterID != "" && len(active) > 0 {
+		endpoints := memberEndpoints(active, cluster.Name, cluster.Namespace)
+		etcdClient, err := r.EtcdClientFactory(ctx, endpoints)
+		if err == nil {
+			defer etcdClient.Close()
+			_, res, perr := r.promotePendingLearner(ctx, etcdClient, endpoints)
+			if perr != nil {
+				return ctrl.Result{}, perr
+			}
+			if res != nil {
+				return *res, nil
+			}
+		}
+		// If we couldn't build a client, fall through to updateStatus —
+		// the next reconcile will retry.
 	}
 
 	// ── Steady state ───────────────────────────────────────────────────
@@ -318,22 +362,22 @@ func (r *EtcdClusterReconciler) scaleUp(
 	}
 	defer etcdClient.Close()
 
+	listResp, res, err := r.promotePendingLearner(ctx, etcdClient, endpoints)
+	if err != nil || res != nil {
+		return resultOrZero(res), err
+	}
+
+	// No learner present. Add the next member.
 	newName := nextMemberName(cluster.Name, members)
 	newPeerURL := peerURL(newName, cluster.Name, cluster.Namespace)
 
-	// Crash-safety: a previous reconcile may have called MemberAdd
-	// successfully and then failed before creating the EtcdMember CR. Check
-	// etcd's current members; if our peerURL is already registered, skip
-	// MemberAdd and proceed to CR creation. This lets us recover from a
-	// partial scale-up without orphaning an etcd member or wedging the
-	// reconcile on a duplicate-peerURL error.
-	listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	listResp, err := etcdClient.MemberList(listCtx)
-	if err != nil {
-		log.Error(err, "MemberList failed during scale-up", "endpoints", endpoints)
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-	}
+	// Crash-safety: a previous reconcile may have called
+	// MemberAddAsLearner successfully and then failed before creating the
+	// EtcdMember CR. The promotion branch above won't fire (etcd's learner
+	// is still uncaught-up). Check whether our intended peerURL is already
+	// registered; if so, skip the add and proceed straight to CR
+	// creation. If the peerURL is registered as a voter (legacy state from
+	// a pre-learner build, or a manual mutation), treat that the same way.
 	alreadyAdded := false
 	for _, m := range listResp.Members {
 		for _, p := range m.PeerURLs {
@@ -350,10 +394,11 @@ func (r *EtcdClusterReconciler) scaleUp(
 	if !alreadyAdded {
 		addCtx, addCancel := context.WithTimeout(ctx, 10*time.Second)
 		defer addCancel()
-		if _, err = etcdClient.MemberAdd(addCtx, []string{newPeerURL}); err != nil {
-			log.Error(err, "MemberAdd failed", "endpoints", endpoints)
+		if _, err = etcdClient.MemberAddAsLearner(addCtx, []string{newPeerURL}); err != nil {
+			log.Error(err, "MemberAddAsLearner failed", "endpoints", endpoints)
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
+		log.Info("added member as learner", "name", newName)
 	}
 
 	allNames := make([]string, 0, len(members)+1)
@@ -385,7 +430,73 @@ func (r *EtcdClusterReconciler) scaleUp(
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+}
+
+// promotePendingLearner runs MemberList against the etcd client, and if any
+// member is still a learner, attempts MemberPromote.
+//
+// Returns (listResp, nil, nil) when there's nothing to promote — caller can
+// use listResp for follow-up work (e.g. crash-safety peerURL lookup).
+// Returns (_, &Result, nil) when a promotion happened OR a not-yet-caught-up
+// error means we should wait.
+// Returns (_, nil, err) only on apiserver-style failures of MemberList.
+func (r *EtcdClusterReconciler) promotePendingLearner(
+	ctx context.Context,
+	etcdClient EtcdClusterClient,
+	endpoints []string,
+) (*clientv3.MemberListResponse, *ctrl.Result, error) {
+	log := log.FromContext(ctx)
+
+	listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	listResp, err := etcdClient.MemberList(listCtx)
+	if err != nil {
+		log.Error(err, "MemberList failed", "endpoints", endpoints)
+		return nil, &ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+	for _, m := range listResp.Members {
+		if !m.IsLearner {
+			continue
+		}
+		promoteCtx, pCancel := context.WithTimeout(ctx, 10*time.Second)
+		_, perr := etcdClient.MemberPromote(promoteCtx, m.ID)
+		pCancel()
+		if perr != nil {
+			// ErrLearnerNotReady and friends just mean wait.
+			log.Info("learner not yet promotable; will retry",
+				"learner_id", fmt.Sprintf("%016x", m.ID), "err", perr.Error())
+			return listResp, &ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		log.Info("promoted learner", "learner_id", fmt.Sprintf("%016x", m.ID))
+		return listResp, &ctrl.Result{Requeue: true}, nil
+	}
+	return listResp, nil, nil
+}
+
+func resultOrZero(r *ctrl.Result) ctrl.Result {
+	if r == nil {
+		return ctrl.Result{}
+	}
+	return *r
+}
+
+// allMembersReady reports whether every member's MemberReady condition is
+// True. An empty slice trivially passes — there's nothing to wait on.
+func allMembersReady(members []lll.EtcdMember) bool {
+	for _, m := range members {
+		ready := false
+		for _, c := range m.Status.Conditions {
+			if c.Type == lll.MemberReady && c.Status == metav1.ConditionTrue {
+				ready = true
+				break
+			}
+		}
+		if !ready {
+			return false
+		}
+	}
+	return true
 }
 
 // ── Scale down ───────────────────────────────────────────────────────────

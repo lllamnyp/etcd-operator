@@ -1004,5 +1004,239 @@ func TestReconcile_FirstPassInitsTokenAndObserved(t *testing.T) {
 	}
 }
 
+// TestScaleUp_WaitsForAllMembersReady covers blocker #1: scale-up must not
+// fire MemberAddAsLearner while existing members are still NotReady. Doing
+// so stacks joiners against a half-formed cluster.
+func TestScaleUp_WaitsForAllMembersReady(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(5), Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			ClusterID:    "deadbeef",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 5, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
+		},
+	}
+	objs := []client.Object{cluster}
+	// test-0 Ready, test-1 and test-2 NotReady (still joining).
+	for i := 0; i < 3; i++ {
+		status := metav1.ConditionFalse
+		if i == 0 {
+			status = metav1.ConditionTrue
+		}
+		objs = append(objs, &lll.EtcdMember{
+			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("test-%d", i), Namespace: "ns", Labels: memberLabels("test", fmt.Sprintf("test-%d", i))},
+			Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+			Status: lll.EtcdMemberStatus{
+				PodName:    fmt.Sprintf("test-%d", i),
+				MemberID:   "abc",
+				Conditions: []metav1.Condition{{Type: lll.MemberReady, Status: status, Reason: "x", LastTransitionTime: now}},
+			},
+		})
+	}
+	c, _ := newTestClient(t, objs...)
+	fe := newFakeEtcd(0xdeadbeef)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test", Namespace: "ns"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(fe.addLearnerCalls) > 0 || len(fe.addCalls) > 0 {
+		t.Fatalf("scale-up should not fire MemberAdd*/Promote while existing members are NotReady; got addCalls=%v addLearnerCalls=%v",
+			fe.addCalls, fe.addLearnerCalls)
+	}
+}
+
+// TestScaleUp_AddsAsLearner covers blocker #1 happy path: when current <
+// desired AND existing members are all Ready, scale-up uses
+// MemberAddAsLearner (not voting MemberAdd).
+func TestScaleUp_AddsAsLearner(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			ClusterID:    "deadbeef",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
+		},
+	}
+	objs := []client.Object{cluster}
+	for i := 0; i < 2; i++ {
+		objs = append(objs, &lll.EtcdMember{
+			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("test-%d", i), Namespace: "ns", Labels: memberLabels("test", fmt.Sprintf("test-%d", i))},
+			Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+			Status: lll.EtcdMemberStatus{
+				PodName:    fmt.Sprintf("test-%d", i),
+				MemberID:   "abc",
+				Conditions: []metav1.Condition{{Type: lll.MemberReady, Status: metav1.ConditionTrue, Reason: "PodReady", LastTransitionTime: now}},
+			},
+		})
+	}
+	c, _ := newTestClient(t, objs...)
+	fe := newFakeEtcd(0xdeadbeef,
+		&etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa02, Name: "test-1", PeerURLs: []string{peerURL("test-1", "test", "ns")}},
+	)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
+
+	memberList := &lll.EtcdMemberList{}
+	_ = c.List(ctx, memberList, client.InNamespace("ns"))
+	if _, err := r.scaleUp(ctx, cluster, memberList.Items); err != nil {
+		t.Fatalf("scaleUp: %v", err)
+	}
+	if len(fe.addCalls) > 0 {
+		t.Fatalf("scale-up must use AddAsLearner, not voting MemberAdd; got addCalls=%v", fe.addCalls)
+	}
+	if len(fe.addLearnerCalls) != 1 || fe.addLearnerCalls[0] != peerURL("test-2", "test", "ns") {
+		t.Fatalf("expected one MemberAddAsLearner against test-2 peer URL; got %v", fe.addLearnerCalls)
+	}
+}
+
+// TestScaleUp_PromotesExistingLearner covers the second half of the learner
+// flow: when etcd already has a learner (typical state on the iteration
+// after MemberAddAsLearner + pod start), scale-up calls MemberPromote
+// rather than adding another learner.
+func TestScaleUp_PromotesExistingLearner(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			ClusterID:    "deadbeef",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
+		},
+	}
+	objs := []client.Object{cluster}
+	for i := 0; i < 2; i++ {
+		objs = append(objs, &lll.EtcdMember{
+			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("test-%d", i), Namespace: "ns", Labels: memberLabels("test", fmt.Sprintf("test-%d", i))},
+			Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+			Status: lll.EtcdMemberStatus{
+				PodName:    fmt.Sprintf("test-%d", i),
+				MemberID:   "abc",
+				Conditions: []metav1.Condition{{Type: lll.MemberReady, Status: metav1.ConditionTrue, Reason: "PodReady", LastTransitionTime: now}},
+			},
+		})
+	}
+	c, _ := newTestClient(t, objs...)
+	const learnerID uint64 = 0xbb01
+	fe := newFakeEtcd(0xdeadbeef,
+		&etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa02, Name: "test-1", PeerURLs: []string{peerURL("test-1", "test", "ns")}},
+		&etcdserverpb.Member{ID: learnerID, Name: "test-2", PeerURLs: []string{peerURL("test-2", "test", "ns")}, IsLearner: true},
+	)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
+
+	memberList := &lll.EtcdMemberList{}
+	_ = c.List(ctx, memberList, client.InNamespace("ns"))
+	if _, err := r.scaleUp(ctx, cluster, memberList.Items); err != nil {
+		t.Fatalf("scaleUp: %v", err)
+	}
+	if len(fe.promoteCalls) != 1 || fe.promoteCalls[0] != learnerID {
+		t.Fatalf("expected MemberPromote(%x); got %v", learnerID, fe.promoteCalls)
+	}
+	if len(fe.addLearnerCalls) > 0 {
+		t.Fatalf("must not add another learner while one is pending promotion; got %v", fe.addLearnerCalls)
+	}
+}
+
+// TestReconcile_PromotesLearnerWhenCurrentEqualsDesired covers a subtle
+// fallout of the learner flow: the iteration that adds the *last* learner
+// reaches current==desired before the learner is promoted. If scale-up
+// stops being entered at that point, the final learner stays unpromoted
+// forever. Reconcile's steady-state path must call promotePendingLearner.
+func TestReconcile_PromotesLearnerWhenCurrentEqualsDesired(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(3), Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			ClusterID:    "deadbeef",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
+		},
+	}
+	objs := []client.Object{cluster}
+	for i := 0; i < 3; i++ {
+		objs = append(objs, &lll.EtcdMember{
+			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("test-%d", i), Namespace: "ns", Labels: memberLabels("test", fmt.Sprintf("test-%d", i))},
+			Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+			Status: lll.EtcdMemberStatus{
+				PodName:    fmt.Sprintf("test-%d", i),
+				MemberID:   "abc",
+				Conditions: []metav1.Condition{{Type: lll.MemberReady, Status: metav1.ConditionTrue, Reason: "PodReady", LastTransitionTime: now}},
+			},
+		})
+	}
+	c, _ := newTestClient(t, objs...)
+	const learnerID uint64 = 0xbb01
+	fe := newFakeEtcd(0xdeadbeef,
+		&etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa02, Name: "test-1", PeerURLs: []string{peerURL("test-1", "test", "ns")}},
+		&etcdserverpb.Member{ID: learnerID, Name: "test-2", PeerURLs: []string{peerURL("test-2", "test", "ns")}, IsLearner: true},
+	)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test", Namespace: "ns"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(fe.promoteCalls) != 1 || fe.promoteCalls[0] != learnerID {
+		t.Fatalf("expected MemberPromote(%x) at steady state; got %v", learnerID, fe.promoteCalls)
+	}
+}
+
+// TestReconcile_ShortCircuitsOnDeletion covers blocker #3: when the cluster
+// has a DeletionTimestamp, Reconcile must not run ensureServices.
+func TestReconcile_ShortCircuitsOnDeletion(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test", Namespace: "ns",
+			DeletionTimestamp: &now,
+			Finalizers:        []string{"keep-me-alive"}, // fake client refuses to track delete-with-zero-finalizers
+		},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(3), Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+		},
+	}
+	c, _ := newTestClient(t, cluster)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead))}
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test", Namespace: "ns"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	svcs := &corev1.ServiceList{}
+	_ = c.List(ctx, svcs, client.InNamespace("ns"))
+	if len(svcs.Items) != 0 {
+		var names []string
+		for _, s := range svcs.Items {
+			names = append(names, s.Name)
+		}
+		t.Fatalf("Service should not be created for a Terminating cluster; got %v", names)
+	}
+}
+
 // silence unused imports
 var _ = etcdserverpb.Member{}

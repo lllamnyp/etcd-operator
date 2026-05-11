@@ -51,7 +51,7 @@ func TestRemoveMemberFromEtcd_FallbackByName(t *testing.T) {
 	victim := &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "test-2", Namespace: "ns",
-			Labels: memberLabels("test", "test-2"),
+			Labels:     memberLabels("test", "test-2"),
 			Finalizers: []string{MemberFinalizer},
 		},
 		Spec: lll.EtcdMemberSpec{ClusterName: "test"},
@@ -467,7 +467,7 @@ func TestRemoveMemberFromEtcd_LastMemberIsNoOp(t *testing.T) {
 	victim := &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "test-0", Namespace: "ns",
-			Labels: memberLabels("test", "test-0"),
+			Labels:     memberLabels("test", "test-0"),
 			Finalizers: []string{MemberFinalizer},
 		},
 		Spec:   lll.EtcdMemberSpec{ClusterName: "test"},
@@ -693,6 +693,76 @@ func TestDiscoverMemberID_FallsBackToPeers(t *testing.T) {
 	}
 	if !hasPeer {
 		t.Fatalf("discoverMemberID must include peer endpoints; got %v", capturedEndpoints)
+	}
+}
+
+// TestDiscoverMemberID_FallsBackToPeerURL covers blocker #2: in the window
+// between MemberAddAsLearner and etcd propagating the joiner's Name, the
+// only stable identifier we have is the peer URL. discoverMemberID must
+// match on PeerURLs as well as Name, otherwise scale-up stalls.
+func TestDiscoverMemberID_FallsBackToPeerURL(t *testing.T) {
+	ctx := context.Background()
+
+	cluster := &lll.EtcdCluster{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"}}
+	target := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-1", Namespace: "ns", Labels: memberLabels("test", "test-1")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+	}
+	c, _ := newTestClient(t, cluster, target)
+
+	const wantID uint64 = 0xfeedface
+	// fakeEtcd returns the target with Name="" but matching PeerURLs.
+	fe := newFakeEtcd(0xdead,
+		&etcdserverpb.Member{ID: wantID, Name: "", PeerURLs: []string{peerURL("test-1", "test", "ns")}},
+	)
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
+
+	id, err := r.discoverMemberID(ctx, target)
+	if err != nil {
+		t.Fatalf("discoverMemberID should match by peer URL; got %v", err)
+	}
+	if id != wantID {
+		t.Fatalf("id = %x, want %x", id, wantID)
+	}
+}
+
+// TestUpdateStatus_NoChurnInSteadyState covers blocker #4: when nothing has
+// changed since the previous reconcile, updateStatus must NOT issue a
+// Status update. Otherwise every 30s periodic reconcile bumps
+// resourceVersion and fans out a watch event for no reason.
+func TestUpdateStatus_NoChurnInSteadyState(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+	member := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", Labels: memberLabels("test", "test-0")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+		Status: lll.EtcdMemberStatus{
+			PodName:  "test-0",
+			PVCName:  "data-test-0",
+			MemberID: "0000000000000001",
+			Conditions: []metav1.Condition{{
+				Type: lll.MemberReady, Status: metav1.ConditionTrue, Reason: "PodReady",
+				Message: "etcd member is ready", LastTransitionTime: now,
+			}},
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns"},
+		Status: corev1.PodStatus{
+			Phase:      corev1.PodRunning,
+			Conditions: []corev1.PodCondition{readyPodCondition()},
+		},
+	}
+	c, _ := newTestClient(t, member, pod)
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead))}
+
+	rvBefore := mustGet(t, c, "test-0", "ns", &lll.EtcdMember{}).ResourceVersion
+	if _, err := r.updateStatus(ctx, member); err != nil {
+		t.Fatalf("updateStatus: %v", err)
+	}
+	rvAfter := mustGet(t, c, "test-0", "ns", &lll.EtcdMember{}).ResourceVersion
+	if rvBefore != rvAfter {
+		t.Fatalf("ResourceVersion changed (%q -> %q) on a no-op updateStatus", rvBefore, rvAfter)
 	}
 }
 

@@ -428,8 +428,16 @@ func (r *EtcdMemberReconciler) updateStatus(ctx context.Context, member *lll.Etc
 		return ctrl.Result{}, err
 	}
 
-	member.Status.PodName = pod.Name
-	member.Status.PVCName = "data-" + member.Name
+	changed := false
+	if member.Status.PodName != pod.Name {
+		member.Status.PodName = pod.Name
+		changed = true
+	}
+	wantPVC := "data-" + member.Name
+	if member.Status.PVCName != wantPVC {
+		member.Status.PVCName = wantPVC
+		changed = true
+	}
 
 	podReady := false
 	for _, c := range pod.Status.Conditions {
@@ -441,27 +449,38 @@ func (r *EtcdMemberReconciler) updateStatus(ctx context.Context, member *lll.Etc
 
 	switch {
 	case !podReady:
-		setMemberCondition(member, lll.MemberReady, metav1.ConditionFalse, "PodNotReady",
-			fmt.Sprintf("pod phase: %s", pod.Status.Phase))
+		if setMemberCondition(member, lll.MemberReady, metav1.ConditionFalse, "PodNotReady",
+			fmt.Sprintf("pod phase: %s", pod.Status.Phase)) {
+			changed = true
+		}
 	case member.Status.MemberID == "":
 		// Pod ready but we haven't matched it to an etcd member yet.
 		// Try once, but don't claim Ready=True until we have the ID — the
 		// finalizer needs it to perform a clean MemberRemove on scale-down.
 		if id, err := r.discoverMemberID(ctx, member); err == nil {
 			member.Status.MemberID = fmt.Sprintf("%016x", id)
-			setMemberCondition(member, lll.MemberReady, metav1.ConditionTrue, "PodReady",
-				"etcd member is ready")
+			changed = true
+			if setMemberCondition(member, lll.MemberReady, metav1.ConditionTrue, "PodReady",
+				"etcd member is ready") {
+				changed = true
+			}
 		} else {
-			setMemberCondition(member, lll.MemberReady, metav1.ConditionFalse, "DiscoveringMemberID",
-				fmt.Sprintf("waiting for memberID: %v", err))
+			if setMemberCondition(member, lll.MemberReady, metav1.ConditionFalse, "DiscoveringMemberID",
+				fmt.Sprintf("waiting for memberID: %v", err)) {
+				changed = true
+			}
 		}
 	default:
-		setMemberCondition(member, lll.MemberReady, metav1.ConditionTrue, "PodReady",
-			"etcd member is ready")
+		if setMemberCondition(member, lll.MemberReady, metav1.ConditionTrue, "PodReady",
+			"etcd member is ready") {
+			changed = true
+		}
 	}
 
-	if err := r.Status().Update(ctx, member); err != nil {
-		return ctrl.Result{}, err
+	if changed {
+		if err := r.Status().Update(ctx, member); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
@@ -507,9 +526,17 @@ func (r *EtcdMemberReconciler) discoverMemberID(ctx context.Context, member *lll
 	if err != nil {
 		return 0, err
 	}
+	expectedPeer := peerURL(member.Name, member.Spec.ClusterName, member.Namespace)
 	for _, m := range resp.Members {
 		if m.Name == member.Name {
 			return m.ID, nil
+		}
+		// Window between MemberAddAsLearner and the new etcd reporting its
+		// name: peer URL is the only stable identifier we have.
+		for _, p := range m.PeerURLs {
+			if p == expectedPeer {
+				return m.ID, nil
+			}
 		}
 	}
 	return 0, fmt.Errorf("member %q not found in etcd member list", member.Name)
