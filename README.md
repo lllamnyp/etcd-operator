@@ -43,7 +43,7 @@ No TLS. No auth/RBAC inside etcd. No version upgrades — changing `spec.version
 | `readyMembers` | Count of members that report `Ready=True`. |
 | `brokenMembers` | Reserved for auto-replacement; currently always 0. |
 | `clusterID` | Hex etcd cluster ID, set after bootstrap. |
-| `clusterToken` | The `--initial-cluster-token` value the operator chose at bootstrap. Reused for all subsequent scale-up. |
+| `clusterToken` | The `--initial-cluster-token` value the operator chose at bootstrap. Reused for all subsequent scale-up. Operator-managed; do not edit. The field is locked at first reconcile and persists across the entire cluster lifetime — recovery flows (deadline-exceeded, spec edits) never reset it. |
 | `observed.{replicas,version,storage}` | The locked-in target the controller is currently reconciling toward. See "Locking pattern" below. |
 | `progressDeadline` | Time at which the in-flight target will be abandoned. Patch this to a past time to abort a stuck reconcile. |
 | `conditions[]` | `Available`, `Progressing`, `Degraded`. |
