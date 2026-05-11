@@ -102,7 +102,14 @@ func (r *EtcdMemberReconciler) handleDeletion(ctx context.Context, member *lll.E
 		Namespace: member.Namespace,
 		Name:      member.Spec.ClusterName,
 	}, cluster)
-	if errors.IsNotFound(err) || (err == nil && !cluster.DeletionTimestamp.IsZero()) {
+	switch {
+	case errors.IsNotFound(err):
+		clusterDeleting = true
+	case err != nil:
+		// Don't silently treat a transient apiserver error as "cluster
+		// alive". Propagate so controller-runtime retries with backoff.
+		return ctrl.Result{}, fmt.Errorf("get owner EtcdCluster: %w", err)
+	case !cluster.DeletionTimestamp.IsZero():
 		clusterDeleting = true
 	}
 
@@ -140,14 +147,25 @@ func (r *EtcdMemberReconciler) removeMemberFromEtcd(ctx context.Context, member 
 	}
 
 	var endpoints []string
+	otherMembers := 0
 	for _, m := range memberList.Items {
-		if m.Name != member.Name && m.Status.PodName != "" {
+		if m.Name == member.Name {
+			continue
+		}
+		otherMembers++
+		if m.Status.PodName != "" {
 			endpoints = append(endpoints, clientURL(m.Name, member.Spec.ClusterName, member.Namespace))
 		}
 	}
 	if len(endpoints) == 0 {
-		// No other members reachable; nothing we can do, and probably the
-		// last member of a cluster being torn down anyway.
+		if otherMembers > 0 {
+			// Other members exist on the CR side but none have a PodName —
+			// transient state (controller restart hasn't repopulated status,
+			// or pods haven't been created yet). Don't silently skip
+			// MemberRemove; return an error so the finalizer requeues.
+			return fmt.Errorf("no reachable peers (%d other member(s) have empty PodName); will retry", otherMembers)
+		}
+		// Genuinely the last member — nothing to remove from.
 		return nil
 	}
 
@@ -421,7 +439,7 @@ func (r *EtcdMemberReconciler) updateStatus(ctx context.Context, member *lll.Etc
 		// Try once, but don't claim Ready=True until we have the ID — the
 		// finalizer needs it to perform a clean MemberRemove on scale-down.
 		if id, err := r.discoverMemberID(ctx, member); err == nil {
-			member.Status.MemberID = fmt.Sprintf("%x", id)
+			member.Status.MemberID = fmt.Sprintf("%016x", id)
 			setMemberCondition(member, lll.MemberReady, metav1.ConditionTrue, "PodReady",
 				"etcd member is ready")
 		} else {

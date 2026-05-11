@@ -133,6 +133,27 @@ func newTestClient(t *testing.T, objs ...client.Object) (client.Client, *runtime
 	return c, s
 }
 
+// erroringGetClient wraps a client.Client and returns a preset error for
+// any Get call whose target Kind matches. Used to drive the
+// transient-apiserver-error code paths.
+type erroringGetClient struct {
+	client.Client
+	failOnKind string
+	err        error
+}
+
+func (e *erroringGetClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if e.failOnKind != "" {
+		switch obj.(type) {
+		case *lll.EtcdCluster:
+			if e.failOnKind == "EtcdCluster" {
+				return e.err
+			}
+		}
+	}
+	return e.Client.Get(ctx, key, obj, opts...)
+}
+
 func mustGet[T client.Object](t *testing.T, c client.Client, name, ns string, into T) T {
 	t.Helper()
 	if err := c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: ns}, into); err != nil {

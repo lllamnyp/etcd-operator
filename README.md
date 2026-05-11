@@ -13,6 +13,8 @@ There is **no StatefulSet**. Each member's Pod and PVC are reconciled independen
 
 The cluster controller decides *which* members exist and orchestrates `MemberAdd`/`MemberRemove` against the running etcd cluster. The member controller decides *how* a member becomes real — Pod, PVC, etcd flags — and reports observed facts (memberID, readiness) up to its CR's status.
 
+Bootstrap is single-member: the operator creates one seed (`<cluster>-0`) with `--initial-cluster-state=new` and `--initial-cluster` listing only itself. Once etcd reports that member's ID and the cluster ID, additional members join one at a time via `MemberAdd`. This avoids the historical "all bootstrapping members must agree on `--initial-cluster`" coordination hazard.
+
 ## What's supported today
 
 - Bootstrap of new clusters (1, 3, 5, … members).
@@ -80,10 +82,12 @@ Recovery depends on whether the cluster ever finished bootstrapping.
 Available: False, Reason=BootstrapFailed
 ```
 
-The recovery is to delete the cluster and recreate:
+The recovery is to delete the cluster and recreate. **Wait for the prior cluster's resources to fully GC before re-applying** — the operator refuses to reuse a PVC that's still owned by a now-deleted EtcdMember from the prior incarnation. Watch for these to disappear:
 
 ```sh
 kubectl delete etcdcluster.lllamnyp.su my-cluster
+# Wait until both queries below return nothing:
+kubectl get etcdmember,pvc -l etcd.lllamnyp.su/cluster=my-cluster
 kubectl apply -f my-cluster.yaml   # with the correct spec
 ```
 

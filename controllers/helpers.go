@@ -110,10 +110,13 @@ func ptrBool(b bool) *bool    { return &b }
 func ptrInt64(i int64) *int64 { return &i }
 
 // deriveClusterToken returns the etcd --initial-cluster-token value for a
-// cluster. Recorded in EtcdCluster.status.clusterToken at bootstrap so that
-// future changes to this rule don't break already-running clusters.
+// cluster. Includes namespace + UID so two same-named clusters in different
+// namespaces never share a token (etcd uses the token as a sanity check
+// against accidental cross-cluster peer traffic). Recorded in
+// EtcdCluster.status.clusterToken at bootstrap so future changes to this
+// derivation rule don't break already-running clusters.
 func deriveClusterToken(cluster *lll.EtcdCluster) string {
-	return cluster.Name
+	return fmt.Sprintf("%s-%s-%s", cluster.Namespace, cluster.Name, cluster.UID)
 }
 
 // isBroken decides whether a member should be treated as broken (and replaced).

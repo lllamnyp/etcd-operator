@@ -132,33 +132,40 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	desired := cluster.Status.Observed.Replicas
 
 	// ── Bootstrap ──────────────────────────────────────────────────────
+	// Bootstrap creates a single-member etcd cluster (member -0 only) with
+	// --initial-cluster-state=new. Once ClusterID is latched, scale-up adds
+	// the remaining members via MemberAdd. This avoids the historical bug
+	// where multiple bootstrapping members had to agree on a single
+	// --initial-cluster value and any mid-flight replica change would
+	// corrupt that consensus.
 	if cluster.Status.ClusterID == "" {
-		if current < desired {
-			log.Info("bootstrapping cluster", "current", current, "desired", desired)
-			return r.bootstrap(ctx, cluster, active, desired)
+		if current == 0 {
+			log.Info("bootstrapping single-node cluster")
+			return r.bootstrap(ctx, cluster)
 		}
-		log.Info("waiting for cluster to form", "members", current)
+		log.Info("waiting for bootstrap member to form cluster")
 		return r.tryDiscoverCluster(ctx, cluster, active)
 	}
 
 	// ── Scale ──────────────────────────────────────────────────────────
+	// Before deciding to scale either direction, wait for any in-flight
+	// EtcdMember deletion to finish. The EtcdMember finalizer calls
+	// MemberRemove against the etcd cluster; running that concurrently
+	// with a MemberAdd from scale-up, or with another MemberRemove from
+	// scale-down, races past quorum because each goroutine works from its
+	// own snapshot of the etcd member list. One mutation at a time.
+	for _, m := range memberList.Items {
+		if !m.DeletionTimestamp.IsZero() {
+			log.Info("waiting for in-flight member deletion before further scaling", "deleting", m.Name)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+	}
+
 	if current < desired {
 		log.Info("scaling up", "current", current, "desired", desired)
 		return r.scaleUp(ctx, cluster, active)
 	}
 	if current > desired {
-		// Don't fire another deletion while one is already in flight. The
-		// EtcdMember finalizer needs to call MemberRemove against the etcd
-		// cluster before its pod goes away; concurrent finalizers can race
-		// past quorum because each works from its own snapshot of the etcd
-		// member list. Wait for the deleting member to be GC'd before
-		// picking the next victim.
-		for _, m := range memberList.Items {
-			if !m.DeletionTimestamp.IsZero() {
-				log.Info("waiting for in-flight member deletion before further scale-down", "deleting", m.Name)
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-			}
-		}
 		log.Info("scaling down", "current", current, "desired", desired)
 		return r.scaleDown(ctx, cluster, active)
 	}
@@ -169,56 +176,37 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 // ── Bootstrap ────────────────────────────────────────────────────────────
 
+// bootstrap creates the single seed member (member-0) for a fresh cluster.
+// Its --initial-cluster lists only itself, so the etcd protocol cannot get
+// confused by partial agreement. Subsequent members join via MemberAdd once
+// ClusterID is latched.
 func (r *EtcdClusterReconciler) bootstrap(
 	ctx context.Context,
 	cluster *lll.EtcdCluster,
-	existing []lll.EtcdMember,
-	desired int32,
 ) (ctrl.Result, error) {
-	existingNames := make(map[string]bool, len(existing))
-	for _, m := range existing {
-		existingNames[m.Name] = true
-	}
+	name := fmt.Sprintf("%s-0", cluster.Name)
+	initialCluster := buildInitialCluster([]string{name}, cluster.Name, cluster.Namespace)
 
-	allNames := make([]string, 0, desired)
-	for _, m := range existing {
-		allNames = append(allNames, m.Name)
+	member := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: cluster.Namespace,
+			Labels:    memberLabels(cluster.Name, name),
+		},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName:    cluster.Name,
+			Version:        cluster.Status.Observed.Version,
+			Storage:        cluster.Status.Observed.Storage,
+			Bootstrap:      true,
+			InitialCluster: initialCluster,
+			ClusterToken:   cluster.Status.ClusterToken,
+		},
 	}
-	for i := int32(0); int32(len(allNames)) < desired; i++ {
-		name := fmt.Sprintf("%s-%d", cluster.Name, i)
-		if !existingNames[name] {
-			allNames = append(allNames, name)
-		}
+	if err := controllerutil.SetControllerReference(cluster, member, r.Scheme); err != nil {
+		return ctrl.Result{}, err
 	}
-	sort.Strings(allNames)
-
-	initialCluster := buildInitialCluster(allNames, cluster.Name, cluster.Namespace)
-
-	for _, name := range allNames {
-		if existingNames[name] {
-			continue
-		}
-		member := &lll.EtcdMember{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      name,
-				Namespace: cluster.Namespace,
-				Labels:    memberLabels(cluster.Name, name),
-			},
-			Spec: lll.EtcdMemberSpec{
-				ClusterName:    cluster.Name,
-				Version:        cluster.Status.Observed.Version,
-				Storage:        cluster.Status.Observed.Storage,
-				Bootstrap:      true,
-				InitialCluster: initialCluster,
-				ClusterToken:   cluster.Status.ClusterToken,
-			},
-		}
-		if err := controllerutil.SetControllerReference(cluster, member, r.Scheme); err != nil {
-			return ctrl.Result{}, err
-		}
-		if err := r.Create(ctx, member); err != nil && !errors.IsAlreadyExists(err) {
-			return ctrl.Result{}, err
-		}
+	if err := r.Create(ctx, member); err != nil && !errors.IsAlreadyExists(err) {
+		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
@@ -270,7 +258,32 @@ func (r *EtcdClusterReconciler) tryDiscoverCluster(
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
-	cluster.Status.ClusterID = fmt.Sprintf("%x", resp.Header.ClusterId)
+	// Only latch ClusterID when the response unambiguously describes the
+	// bootstrap state. With single-member bootstrap, that means: exactly
+	// one member, and its name matches the seed member we created (or its
+	// peer URL does, if etcd hasn't yet propagated the name). Anything
+	// else is a stale or partial response we shouldn't anchor to.
+	expectedPeer := peerURL(members[0].Name, cluster.Name, cluster.Namespace)
+	if len(resp.Members) != 1 {
+		log.Info("waiting for definitive single-member response", "members", len(resp.Members))
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	matched := resp.Members[0].Name == members[0].Name
+	if !matched {
+		for _, p := range resp.Members[0].PeerURLs {
+			if p == expectedPeer {
+				matched = true
+				break
+			}
+		}
+	}
+	if !matched {
+		log.Info("MemberList returned an unexpected member; retrying",
+			"got_name", resp.Members[0].Name, "got_urls", resp.Members[0].PeerURLs)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	cluster.Status.ClusterID = fmt.Sprintf("%016x", resp.Header.ClusterId)
 	if err := r.Status().Update(ctx, cluster); err != nil {
 		return ctrl.Result{}, err
 	}

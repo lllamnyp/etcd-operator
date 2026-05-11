@@ -83,6 +83,87 @@ func TestRemoveMemberFromEtcd_FallbackByName(t *testing.T) {
 	}
 }
 
+// TestRemoveMemberFromEtcd_PeerWithEmptyPodNameRetries covers reviewer
+// issue #3: if other members exist on the CR side but none have a PodName
+// recorded yet (transient state, controller restart), removeMemberFromEtcd
+// must NOT silently return nil — that would let the finalizer clear and
+// orphan the etcd-side member. Return an error so we retry.
+func TestRemoveMemberFromEtcd_PeerWithEmptyPodNameRetries(t *testing.T) {
+	ctx := context.Background()
+
+	cluster := &lll.EtcdCluster{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"}}
+	// test-0 has no PodName recorded — simulating mid-bootstrap or
+	// controller-restart staleness.
+	other := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", Labels: memberLabels("test", "test-0")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+		// Status.PodName intentionally empty.
+	}
+	victim := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-1", Namespace: "ns", Labels: memberLabels("test", "test-1"), Finalizers: []string{MemberFinalizer}},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+		Status:     lll.EtcdMemberStatus{MemberID: "abc"},
+	}
+
+	c, _ := newTestClient(t, cluster, other, victim)
+	fe := newFakeEtcd(0xdeadbeef)
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
+
+	err := r.removeMemberFromEtcd(ctx, victim)
+	if err == nil {
+		t.Fatalf("expected error when peers exist on CR side but none have PodName set")
+	}
+	if len(fe.removeCalls) != 0 {
+		t.Fatalf("MemberRemove should not be called when endpoints are empty; got %v", fe.removeCalls)
+	}
+}
+
+// TestHandleDeletion_TransientGetErrorReturnsError covers reviewer issue
+// #4: a non-NotFound error from getting the owner EtcdCluster must NOT be
+// silently treated as "cluster alive" — that risks repeatedly firing
+// MemberRemove against a cluster we can't actually introspect. Propagate
+// the error so controller-runtime applies backoff.
+func TestHandleDeletion_TransientGetErrorReturnsError(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+	cluster := &lll.EtcdCluster{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"}}
+	victim := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-0", Namespace: "ns",
+			Labels:            memberLabels("test", "test-0"),
+			Finalizers:        []string{MemberFinalizer},
+			DeletionTimestamp: &now,
+		},
+		Spec:   lll.EtcdMemberSpec{ClusterName: "test"},
+		Status: lll.EtcdMemberStatus{MemberID: "abc"},
+	}
+	base, _ := newTestClient(t, cluster, victim)
+	c := &erroringGetClient{
+		Client:     base,
+		failOnKind: "EtcdCluster",
+		err:        errors.New("apiserver flaked"),
+	}
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdeadbeef))}
+
+	if _, err := r.handleDeletion(ctx, victim); err == nil {
+		t.Fatalf("expected error from handleDeletion on transient cluster Get error")
+	}
+	// Finalizer should still be in place — we didn't get a clean shutdown.
+	mustGet(t, base, "test-0", "ns", victim)
+	if !containsFinalizer(victim, MemberFinalizer) {
+		t.Fatalf("finalizer was removed despite Get error")
+	}
+}
+
+func containsFinalizer(m *lll.EtcdMember, name string) bool {
+	for _, f := range m.Finalizers {
+		if f == name {
+			return true
+		}
+	}
+	return false
+}
+
 // TestRemoveMemberFromEtcd_NotFoundIsClean: if the member doesn't appear in
 // etcd's list at all, treat it as already gone — no error. Otherwise, the
 // finalizer would block forever waiting for an etcd-side state that never

@@ -47,11 +47,61 @@ func reconcileUntilStable(t *testing.T, r *EtcdClusterReconciler, c client.Clien
 	return last
 }
 
-// TestObservedSpec_LocksReplicasMidBootstrap covers reviewer issue #5:
-// changing spec.replicas while bootstrap is in progress must not change the
-// --initial-cluster set the controller is rolling out, because etcd requires
-// every bootstrapping member to share an identical --initial-cluster value.
-func TestObservedSpec_LocksReplicasMidBootstrap(t *testing.T) {
+// TestBootstrap_CreatesSingleSeedMember covers the simplified bootstrap
+// model: regardless of spec.replicas, bootstrap creates exactly one seed
+// member (member-0) whose --initial-cluster lists only itself. Subsequent
+// members join via MemberAdd once ClusterID is latched.
+func TestBootstrap_CreatesSingleSeedMember(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(5),
+			Version:  "3.5.17",
+			Storage:  quickQty(t, "1Gi"),
+		},
+	}
+	c, _ := newTestClient(t, cluster)
+	fe := newFakeEtcd(0xdeadbeef)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
+
+	// Run enough reconciles to land past token + observed snapshots, then
+	// trigger bootstrap. Bootstrap requeues 5s; we stop iterating then.
+	reconcileUntilStable(t, r, c, "test", "ns", 8)
+
+	members := &lll.EtcdMemberList{}
+	if err := c.List(ctx, members, client.InNamespace("ns")); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(members.Items) != 1 {
+		t.Fatalf("bootstrap must create exactly one member; got %d (%v)", len(members.Items),
+			func() []string {
+				ns := make([]string, 0, len(members.Items))
+				for _, m := range members.Items {
+					ns = append(ns, m.Name)
+				}
+				return ns
+			}())
+	}
+	seed := members.Items[0]
+	if seed.Name != "test-0" {
+		t.Fatalf("seed member should be test-0; got %q", seed.Name)
+	}
+	wantIC := buildInitialCluster([]string{"test-0"}, "test", "ns")
+	if seed.Spec.InitialCluster != wantIC {
+		t.Fatalf("seed initial-cluster mismatch: got %q want %q", seed.Spec.InitialCluster, wantIC)
+	}
+	if !seed.Spec.Bootstrap {
+		t.Fatalf("seed member must be marked Bootstrap=true")
+	}
+}
+
+// TestObservedSpec_LocksMidFlight pins the locking pattern's correctness
+// outside the bootstrap flow specifically. With single-member bootstrap the
+// initial-cluster-coordination race is gone, but the locking pattern still
+// matters: observed.Replicas must not change while a reconcile is in
+// progress (e.g. mid scale-up).
+func TestObservedSpec_LocksMidFlight(t *testing.T) {
 	ctx := context.Background()
 	cluster := &lll.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
@@ -60,56 +110,40 @@ func TestObservedSpec_LocksReplicasMidBootstrap(t *testing.T) {
 			Version:  "3.5.17",
 			Storage:  quickQty(t, "1Gi"),
 		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			ClusterID:    "deadbeef",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 3,
+				Version:  "3.5.17",
+				Storage:  quickQty(t, "1Gi"),
+			},
+			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
+		},
 	}
-	c, _ := newTestClient(t, cluster)
-	fe := newFakeEtcd(0xdeadbeef)
-	r := &EtcdClusterReconciler{
-		Client:            c,
-		Scheme:            testScheme(t),
-		EtcdClientFactory: factoryReturning(fe),
-	}
+	// One member exists, two more pending — clearly mid scale-up.
+	c, _ := newTestClient(t, cluster, &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", Labels: memberLabels("test", "test-0")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17"},
+		Status:     lll.EtcdMemberStatus{PodName: "test-0", MemberID: "abc", Conditions: []metav1.Condition{{Type: lll.MemberReady, Status: metav1.ConditionTrue, Reason: "PodReady", LastTransitionTime: metav1.Now()}}},
+	})
 
-	// Drive a few reconciles to get past token init, observed snapshot, and
-	// member creation. Cluster has no etcd reachable yet (fakeEtcd will return
-	// MemberList but ClusterID is set on first call), so bootstrap should
-	// land 3 members with the same initial-cluster, then discovery records
-	// the cluster ID.
-	reconcileUntilStable(t, r, c, "test", "ns", 8)
-
-	members := &lll.EtcdMemberList{}
-	if err := c.List(ctx, members, client.InNamespace("ns")); err != nil {
-		t.Fatalf("List members: %v", err)
-	}
-	if len(members.Items) != 3 {
-		t.Fatalf("expected 3 members after bootstrap, got %d", len(members.Items))
-	}
-	want := members.Items[0].Spec.InitialCluster
-	for _, m := range members.Items[1:] {
-		if m.Spec.InitialCluster != want {
-			t.Fatalf("inconsistent initial-cluster across members: %q vs %q", want, m.Spec.InitialCluster)
-		}
-	}
-
-	// Now flip replicas mid-bootstrap. Cluster has not yet reported all
-	// members Ready (their pods don't exist in the fake client), so
-	// reconciliationComplete is false and the locking pattern must hold the
-	// observed.Replicas at 3.
+	// User flips spec.replicas to 7 mid-flight.
 	mustGet(t, c, "test", "ns", cluster)
-	cluster.Spec.Replicas = ptrInt32(5)
+	cluster.Spec.Replicas = ptrInt32(7)
 	if err := c.Update(ctx, cluster); err != nil {
-		t.Fatalf("Update cluster: %v", err)
+		t.Fatalf("Update: %v", err)
 	}
 
-	reconcileUntilStable(t, r, c, "test", "ns", 8)
+	fe := newFakeEtcd(0xdeadbeef, &etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")}})
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
 
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test", Namespace: "ns"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
 	mustGet(t, c, "test", "ns", cluster)
-	if cluster.Status.Observed == nil || cluster.Status.Observed.Replicas != 3 {
-		t.Fatalf("observed.Replicas changed during bootstrap (locking broken): observed=%+v", cluster.Status.Observed)
-	}
-	members = &lll.EtcdMemberList{}
-	_ = c.List(ctx, members, client.InNamespace("ns"))
-	if len(members.Items) != 3 {
-		t.Fatalf("members count drifted from 3 to %d during bootstrap", len(members.Items))
+	if cluster.Status.Observed.Replicas != 3 {
+		t.Fatalf("observed.Replicas changed mid-flight (locking broken): %d", cluster.Status.Observed.Replicas)
 	}
 }
 
@@ -472,57 +506,95 @@ func TestScaleUp_IdempotentAfterCrash(t *testing.T) {
 	}
 }
 
-// TestBootstrap_PartialPriorRunIsConsistent covers reviewer issue #2: a
-// crash mid-bootstrap leaves some EtcdMembers with InitialCluster set; the
-// resumed bootstrap must produce the same InitialCluster value for the
-// remaining members so etcd can still form.
-func TestBootstrap_PartialPriorRunIsConsistent(t *testing.T) {
+// TestBootstrap_Idempotent: if bootstrap re-runs (controller restart between
+// Create and the next reconcile), it must not error or duplicate the seed
+// member. The Create returns AlreadyExists which is swallowed.
+func TestBootstrap_Idempotent(t *testing.T) {
 	ctx := context.Background()
 	cluster := &lll.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
 		Status: lll.EtcdClusterStatus{
-			ClusterToken: "test",
+			ClusterToken: "ns-test-x",
 			Observed: &lll.ObservedClusterSpec{
-				Replicas: 3,
-				Version:  "3.5.17",
-				Storage:  quickQty(t, "1Gi"),
+				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
 			},
 		},
 	}
-	// Pre-create members 0 and 1 from a hypothetical prior run, exactly as
-	// bootstrap() would have written them.
-	wantIC := buildInitialCluster([]string{"test-0", "test-1", "test-2"}, "test", "ns")
-	existing := []client.Object{cluster}
-	for i := 0; i < 2; i++ {
-		existing = append(existing, &lll.EtcdMember{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      fmt.Sprintf("test-%d", i),
-				Namespace: "ns",
-				Labels:    memberLabels("test", fmt.Sprintf("test-%d", i)),
-			},
-			Spec: lll.EtcdMemberSpec{
-				ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
-				Bootstrap: true, InitialCluster: wantIC, ClusterToken: "test",
-			},
-		})
+	seedName := "test-0"
+	pre := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: seedName, Namespace: "ns", Labels: memberLabels("test", seedName)},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			Bootstrap: true, InitialCluster: buildInitialCluster([]string{seedName}, "test", "ns"),
+			ClusterToken: "ns-test-x",
+		},
 	}
-	c, _ := newTestClient(t, existing...)
+	c, _ := newTestClient(t, cluster, pre)
 	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdeadbeef))}
 
-	memberList := &lll.EtcdMemberList{}
-	if err := c.List(ctx, memberList); err != nil {
-		t.Fatalf("List: %v", err)
+	if _, err := r.bootstrap(ctx, cluster); err != nil {
+		t.Fatalf("bootstrap should be idempotent across restart: %v", err)
 	}
-	if _, err := r.bootstrap(ctx, cluster, memberList.Items, 3); err != nil {
-		t.Fatalf("bootstrap: %v", err)
+	members := &lll.EtcdMemberList{}
+	_ = c.List(ctx, members)
+	if len(members.Items) != 1 {
+		t.Fatalf("expected exactly one member, got %d", len(members.Items))
 	}
+}
 
-	created := &lll.EtcdMember{}
-	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "test-2"}, created); err != nil {
-		t.Fatalf("test-2 should have been created: %v", err)
+// TestScaleUp_WaitsForInFlightDeletion is the symmetric case of #3: while
+// one EtcdMember is being deleted (e.g. a stale member from external
+// `kubectl delete`), scale-up must not interleave a MemberAdd against the
+// same etcd cluster the finalizer is running MemberRemove against.
+func TestScaleUp_WaitsForInFlightDeletion(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(5),
+			Version:  "3.5.17",
+			Storage:  quickQty(t, "1Gi"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			ClusterID:    "deadbeef",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 5, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
+		},
 	}
-	if created.Spec.InitialCluster != wantIC {
-		t.Fatalf("test-2.InitialCluster mismatch: got %q want %q", created.Spec.InitialCluster, wantIC)
+	objs := []client.Object{cluster}
+	now := metav1.Now()
+	// 4 healthy, 1 deleting.
+	for i := 0; i < 5; i++ {
+		m := &lll.EtcdMember{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: fmt.Sprintf("test-%d", i), Namespace: "ns",
+				Labels: memberLabels("test", fmt.Sprintf("test-%d", i)),
+			},
+			Spec:   lll.EtcdMemberSpec{ClusterName: "test"},
+			Status: lll.EtcdMemberStatus{PodName: fmt.Sprintf("test-%d", i), MemberID: "abc", Conditions: []metav1.Condition{{Type: lll.MemberReady, Status: metav1.ConditionTrue, Reason: "PodReady", LastTransitionTime: now}}},
+		}
+		if i == 4 {
+			m.DeletionTimestamp = &now
+			m.Finalizers = []string{MemberFinalizer}
+		}
+		objs = append(objs, m)
+	}
+	c, _ := newTestClient(t, objs...)
+	fe := newFakeEtcd(0xdeadbeef)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
+
+	res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test", Namespace: "ns"}})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if res.RequeueAfter == 0 {
+		t.Fatalf("expected RequeueAfter while waiting for in-flight deletion; got %+v", res)
+	}
+	if len(fe.addCalls) > 0 {
+		t.Fatalf("MemberAdd should not be called while a deletion is in flight; got %v", fe.addCalls)
 	}
 }
 
@@ -624,6 +696,87 @@ func TestSetClusterCondition_ReturnsFalseIfNoChange(t *testing.T) {
 	}
 	if !setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionTrue, "Reason", "different message") {
 		t.Fatalf("call with different message should report changed=true")
+	}
+}
+
+// TestTryDiscoverCluster_RejectsPartialMembership covers reviewer issue #2:
+// the cluster ID must only latch when MemberList returns exactly one member
+// matching the seed. A response with a different name (a spurious peer,
+// stale cache, etc.) must not be anchored.
+func TestTryDiscoverCluster_RejectsPartialMembership(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(3), Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
+		},
+	}
+	seed := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", Labels: memberLabels("test", "test-0")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+		Status:     lll.EtcdMemberStatus{PodName: "test-0"},
+	}
+	c, _ := newTestClient(t, cluster, seed)
+	// fakeEtcd returns a member with the wrong name.
+	fe := newFakeEtcd(0xdeadbeef, &etcdserverpb.Member{
+		ID: 0xff, Name: "wrong-name", PeerURLs: []string{peerURL("wrong-name", "test", "ns")},
+	})
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
+
+	memberList := &lll.EtcdMemberList{}
+	_ = c.List(ctx, memberList, client.InNamespace("ns"))
+	if _, err := r.tryDiscoverCluster(ctx, cluster, memberList.Items); err != nil {
+		t.Fatalf("tryDiscoverCluster: %v", err)
+	}
+	mustGet(t, c, "test", "ns", cluster)
+	if cluster.Status.ClusterID != "" {
+		t.Fatalf("ClusterID should NOT be latched when MemberList returns an unexpected member; got %q", cluster.Status.ClusterID)
+	}
+}
+
+// TestTryDiscoverCluster_LatchesOnValidResponse: with the right seed name
+// and exactly one member returned, ClusterID is recorded in %016x form.
+func TestTryDiscoverCluster_LatchesOnValidResponse(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(3), Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
+		},
+	}
+	seed := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", Labels: memberLabels("test", "test-0")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+		Status:     lll.EtcdMemberStatus{PodName: "test-0"},
+	}
+	c, _ := newTestClient(t, cluster, seed)
+	fe := newFakeEtcd(0xabc, &etcdserverpb.Member{
+		ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")},
+	})
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
+
+	memberList := &lll.EtcdMemberList{}
+	_ = c.List(ctx, memberList, client.InNamespace("ns"))
+	if _, err := r.tryDiscoverCluster(ctx, cluster, memberList.Items); err != nil {
+		t.Fatalf("tryDiscoverCluster: %v", err)
+	}
+	mustGet(t, c, "test", "ns", cluster)
+	if cluster.Status.ClusterID != "0000000000000abc" {
+		t.Fatalf("ClusterID should be zero-padded hex; got %q", cluster.Status.ClusterID)
 	}
 }
 
