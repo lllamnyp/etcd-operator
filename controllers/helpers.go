@@ -106,6 +106,23 @@ func memberOrdinal(name string) int {
 	return n
 }
 
+// memberNameFromPeerURL recovers the EtcdMember name from a peer URL of the
+// shape http://<member>.<cluster>.<namespace>.svc:2380. Used during scale-up
+// when etcd's MemberList may report a member with Name=="" — the window
+// between MemberAddAsLearner and the new pod reporting its identity. Returns
+// "" if the URL doesn't match the expected shape.
+func memberNameFromPeerURL(u string) string {
+	s := strings.TrimPrefix(u, "http://")
+	s = strings.TrimPrefix(s, "https://")
+	if i := strings.LastIndex(s, ":"); i > 0 {
+		s = s[:i]
+	}
+	if i := strings.Index(s, "."); i > 0 {
+		return s[:i]
+	}
+	return ""
+}
+
 func ptrBool(b bool) *bool    { return &b }
 func ptrInt64(i int64) *int64 { return &i }
 

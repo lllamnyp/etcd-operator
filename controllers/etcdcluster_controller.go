@@ -247,7 +247,28 @@ func (r *EtcdClusterReconciler) bootstrap(
 	if err := controllerutil.SetControllerReference(cluster, member, r.Scheme); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.Create(ctx, member); err != nil && !errors.IsAlreadyExists(err) {
+	err := r.Create(ctx, member)
+	if errors.IsAlreadyExists(err) {
+		// A same-named seed already exists — could be (a) ours from a
+		// prior reconcile, (b) leftover from a previous EtcdCluster with
+		// the same name still being GC'd. Refuse to silently adopt (b):
+		// the stale seed will itself be GC'd and the new cluster will
+		// end up with no seed.
+		existing := &lll.EtcdMember{}
+		if gerr := r.Get(ctx, types.NamespacedName{
+			Namespace: cluster.Namespace,
+			Name:      name,
+		}, existing); gerr != nil {
+			return ctrl.Result{}, gerr
+		}
+		if !metav1.IsControlledBy(existing, cluster) {
+			return ctrl.Result{}, fmt.Errorf(
+				"seed member %q exists but is not controlled by this EtcdCluster (uid=%s); "+
+					"waiting for stale resources to GC", name, cluster.UID)
+		}
+		// It's ours — Create idempotency from a previous reconcile that
+		// got interrupted before returning.
+	} else if err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -391,21 +412,38 @@ func (r *EtcdClusterReconciler) scaleUp(
 		}
 	}
 
+	// `etcdMembers` is the authoritative list of cluster members we'll use
+	// to compute the new pod's --initial-cluster flag. If MemberAddAsLearner
+	// has just succeeded, its response carries the updated membership; if
+	// the learner was already there (crash recovery), listResp already does.
+	etcdMembers := listResp.Members
 	if !alreadyAdded {
 		addCtx, addCancel := context.WithTimeout(ctx, 10*time.Second)
 		defer addCancel()
-		if _, err = etcdClient.MemberAddAsLearner(addCtx, []string{newPeerURL}); err != nil {
+		addResp, err := etcdClient.MemberAddAsLearner(addCtx, []string{newPeerURL})
+		if err != nil {
 			log.Error(err, "MemberAddAsLearner failed", "endpoints", endpoints)
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
 		log.Info("added member as learner", "name", newName)
+		etcdMembers = addResp.Members
 	}
 
-	allNames := make([]string, 0, len(members)+1)
-	for _, m := range members {
-		allNames = append(allNames, m.Name)
+	// Build --initial-cluster from etcd's view, not the CR list. The two
+	// can diverge during crash recovery (etcd has a learner whose CR we
+	// haven't yet created) and the new pod's flags MUST match what etcd
+	// will report when the pod tries to join.
+	allNames := make([]string, 0, len(etcdMembers))
+	for _, m := range etcdMembers {
+		name := m.Name
+		if name == "" && len(m.PeerURLs) > 0 {
+			name = memberNameFromPeerURL(m.PeerURLs[0])
+		}
+		if name != "" {
+			allNames = append(allNames, name)
+		}
 	}
-	allNames = append(allNames, newName)
+	sort.Strings(allNames)
 	initialCluster := buildInitialCluster(allNames, cluster.Name, cluster.Namespace)
 
 	member := &lll.EtcdMember{
