@@ -19,6 +19,7 @@ import (
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -819,6 +820,187 @@ func TestDeadlineExceeded_NoChurnWhenSteady(t *testing.T) {
 	rvAfter := mustGet(t, c, "test", "ns", &lll.EtcdCluster{}).ResourceVersion
 	if rvBefore != rvAfter {
 		t.Fatalf("ResourceVersion changed (%q -> %q) on no-op terminal reconcile", rvBefore, rvAfter)
+	}
+}
+
+// TestTryDiscoverCluster_FindsSeedByName covers B2: even if the list order
+// puts a non-seed member first, discovery must anchor to the seed (the
+// member with name <cluster>-0). Otherwise a same-name slice from any
+// future caller (or a user-created EtcdMember CR) would silently break
+// discovery.
+func TestTryDiscoverCluster_FindsSeedByName(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(3), Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
+		},
+	}
+	// Pass members in an order where the seed is NOT first.
+	test3 := lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-3", Namespace: "ns", Labels: memberLabels("test", "test-3")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+		Status:     lll.EtcdMemberStatus{PodName: "test-3"},
+	}
+	test0 := lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", Labels: memberLabels("test", "test-0")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+		Status:     lll.EtcdMemberStatus{PodName: "test-0"},
+	}
+	c, _ := newTestClient(t, cluster, &test3, &test0)
+	fe := newFakeEtcd(0xabc, &etcdserverpb.Member{
+		ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")},
+	})
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
+
+	if _, err := r.tryDiscoverCluster(ctx, cluster, []lll.EtcdMember{test3, test0}); err != nil {
+		t.Fatalf("tryDiscoverCluster: %v", err)
+	}
+	mustGet(t, c, "test", "ns", cluster)
+	if cluster.Status.ClusterID != "0000000000000abc" {
+		t.Fatalf("ClusterID should be latched via seed lookup; got %q", cluster.Status.ClusterID)
+	}
+}
+
+// TestTryDiscoverCluster_EmptySliceDoesNotPanic covers B3: a future caller
+// passing an empty slice must not panic the controller.
+func TestTryDiscoverCluster_EmptySliceDoesNotPanic(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
+		},
+	}
+	c, _ := newTestClient(t, cluster)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead))}
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("tryDiscoverCluster panicked on empty slice: %v", r)
+		}
+	}()
+	res, err := r.tryDiscoverCluster(ctx, cluster, nil)
+	if err != nil {
+		t.Fatalf("tryDiscoverCluster: %v", err)
+	}
+	if res.RequeueAfter == 0 {
+		t.Fatalf("expected requeue when no seed available; got %+v", res)
+	}
+}
+
+// TestEnsureService_ReconcilesOwnedFields covers B7: drift on the fields
+// the operator owns (selector, our ports, publishNotReadyAddresses) is
+// reconciled, but user-added labels/annotations and extra ports survive.
+func TestEnsureService_ReconcilesOwnedFields(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+	}
+	// Pre-create the headless Service with a broken selector and an extra
+	// label/port that should survive reconciliation.
+	preexisting := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "test",
+			Namespace:   "ns",
+			Labels:      map[string]string{"injected-by-webhook": "yes"},
+			Annotations: map[string]string{"some-webhook.io/managed": "true"},
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP:                corev1.ClusterIPNone,
+			PublishNotReadyAddresses: false, // wrong — drift to fix
+			Selector:                 map[string]string{"unrelated": "wrong"},
+			Ports: []corev1.ServicePort{
+				// Extra user-added port — must survive.
+				{Name: "metrics", Port: 9100, Protocol: corev1.ProtocolTCP},
+			},
+		},
+	}
+	c, _ := newTestClient(t, cluster, preexisting)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead))}
+
+	if err := r.ensureService(ctx, cluster, "test", corev1.ServiceSpec{
+		ClusterIP:                corev1.ClusterIPNone,
+		PublishNotReadyAddresses: true,
+		Selector:                 map[string]string{LabelCluster: "test"},
+		Ports: []corev1.ServicePort{
+			{Name: "client", Port: 2379},
+			{Name: "peer", Port: 2380},
+		},
+	}); err != nil {
+		t.Fatalf("ensureService: %v", err)
+	}
+
+	got := &corev1.Service{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "test"}, got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Spec.Selector[LabelCluster] != "test" {
+		t.Fatalf("Selector not restored: %+v", got.Spec.Selector)
+	}
+	if !got.Spec.PublishNotReadyAddresses {
+		t.Fatalf("PublishNotReadyAddresses not restored")
+	}
+	// User additions must survive.
+	if got.Labels["injected-by-webhook"] != "yes" {
+		t.Fatalf("user label was stripped: %+v", got.Labels)
+	}
+	if got.Annotations["some-webhook.io/managed"] != "true" {
+		t.Fatalf("user annotation was stripped: %+v", got.Annotations)
+	}
+	foundMetrics, foundClient, foundPeer := false, false, false
+	for _, p := range got.Spec.Ports {
+		switch p.Name {
+		case "metrics":
+			foundMetrics = true
+		case "client":
+			foundClient = p.Port == 2379
+		case "peer":
+			foundPeer = p.Port == 2380
+		}
+	}
+	if !foundMetrics {
+		t.Fatalf("user-added metrics port was stripped: %+v", got.Spec.Ports)
+	}
+	if !foundClient || !foundPeer {
+		t.Fatalf("required ports not present: %+v", got.Spec.Ports)
+	}
+}
+
+// TestReconcile_FirstPassInitsTokenAndObserved covers B8: a brand-new
+// cluster should have BOTH clusterToken AND observed populated after one
+// Reconcile pass, not two.
+func TestReconcile_FirstPassInitsTokenAndObserved(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns", UID: types.UID("uid-1")},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(3), Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+		},
+	}
+	c, _ := newTestClient(t, cluster)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead))}
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test", Namespace: "ns"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	mustGet(t, c, "test", "ns", cluster)
+	if cluster.Status.ClusterToken == "" {
+		t.Fatalf("ClusterToken should be set after one reconcile pass")
+	}
+	if cluster.Status.Observed == nil {
+		t.Fatalf("Observed should be set after one reconcile pass (combined with token init)")
 	}
 }
 

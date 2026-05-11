@@ -17,7 +17,7 @@ Bootstrap is single-member: the operator creates one seed (`<cluster>-0`) with `
 
 ## What's supported today
 
-- Bootstrap of new clusters (1, 3, 5, … members).
+- Bootstrap of new clusters. The operator always creates exactly one seed member (`<cluster>-0`) with `--initial-cluster-state=new`. Additional members are added one at a time via `MemberAdd` after the seed is up and the cluster ID is latched, until `spec.replicas` is reached.
 - Scale up: cluster controller calls `MemberAdd`, then creates an `EtcdMember` whose pod joins the existing cluster with `--initial-cluster-state=existing`.
 - Scale down: cluster controller deletes the highest-ordinal `EtcdMember`. A finalizer on the deleted member calls `MemberRemove` against remaining peers before the Pod and PVC go away.
 - Pod restart / node failure: data PVC is preserved, the new Pod reads the existing WAL and rejoins with the same member ID.

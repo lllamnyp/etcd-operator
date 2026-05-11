@@ -146,9 +146,12 @@ func (r *EtcdMemberReconciler) removeMemberFromEtcd(ctx context.Context, member 
 		return err
 	}
 
+	// Only dial peers that aren't themselves being deleted. Endpoints of
+	// a Terminating pod can hang the client until our 10s deadline and
+	// don't help us anyway.
 	var endpoints []string
 	otherMembers := 0
-	for _, m := range memberList.Items {
+	for _, m := range filterActiveMembers(memberList.Items) {
 		if m.Name == member.Name {
 			continue
 		}
@@ -373,11 +376,17 @@ func (r *EtcdMemberReconciler) buildPod(member *lll.EtcdMember) *corev1.Pod {
 						corev1.ResourceMemory: resource.MustParse("128Mi"),
 					},
 				},
+				// Liveness MUST NOT require quorum. /health returns non-200
+				// on a member that can't reach peers — if we put HTTPGet on
+				// /health here, a transient partition cascade-kills every
+				// pod and turns a 30s blip into a permanent outage that
+				// needs a snapshot restore. TCP on the peer port (2380) is
+				// the canonical "etcd process alive" check; quorum-aware
+				// signalling stays in the readiness probe.
 				LivenessProbe: &corev1.Probe{
 					ProbeHandler: corev1.ProbeHandler{
-						HTTPGet: &corev1.HTTPGetAction{
-							Path: "/health",
-							Port: intstr.FromInt(2379),
+						TCPSocket: &corev1.TCPSocketAction{
+							Port: intstr.FromInt(2380),
 						},
 					},
 					InitialDelaySeconds: 15,
@@ -458,11 +467,34 @@ func (r *EtcdMemberReconciler) updateStatus(ctx context.Context, member *lll.Etc
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 }
 
-// discoverMemberID asks etcd for this member's ID by calling MemberList against
-// its own client endpoint and matching by name.
+// discoverMemberID asks etcd for this member's ID. It prefers asking peers
+// rather than the member's own pod: if this member is crashlooping (PVC
+// corruption, OOM, etc.) its own etcd never responds, but the rest of the
+// cluster knows perfectly well what its ID is. Falling back to self last
+// keeps single-node bootstrap working.
 func (r *EtcdMemberReconciler) discoverMemberID(ctx context.Context, member *lll.EtcdMember) (uint64, error) {
-	endpoint := clientURL(member.Name, member.Spec.ClusterName, member.Namespace)
-	c, err := r.EtcdClientFactory(ctx, []string{endpoint})
+	memberList := &lll.EtcdMemberList{}
+	if err := r.List(ctx, memberList,
+		client.InNamespace(member.Namespace),
+		client.MatchingLabels{LabelCluster: member.Spec.ClusterName},
+	); err != nil {
+		return 0, err
+	}
+
+	var endpoints []string
+	for _, m := range filterActiveMembers(memberList.Items) {
+		if m.Name == member.Name {
+			continue
+		}
+		if m.Status.PodName != "" {
+			endpoints = append(endpoints, clientURL(m.Name, member.Spec.ClusterName, member.Namespace))
+		}
+	}
+	// Self last — used during single-node bootstrap when there are no
+	// other peers.
+	endpoints = append(endpoints, clientURL(member.Name, member.Spec.ClusterName, member.Namespace))
+
+	c, err := r.EtcdClientFactory(ctx, endpoints)
 	if err != nil {
 		return 0, err
 	}

@@ -563,5 +563,138 @@ func TestUpdateStatus_PodNotReadyKeepsReadyFalse(t *testing.T) {
 	}
 }
 
+// TestBuildPod_LivenessIsNotQuorumAware covers B1: the liveness probe must
+// not require quorum. A liveness HTTPGet on /health kills every member
+// during a transient partition. The check is a TCP socket on the peer
+// port — process-alive only.
+func TestBuildPod_LivenessIsNotQuorumAware(t *testing.T) {
+	r := &EtcdMemberReconciler{}
+	pod := r.buildPod(&lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns"},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17"},
+	})
+	lp := pod.Spec.Containers[0].LivenessProbe
+	if lp == nil {
+		t.Fatalf("missing liveness probe entirely")
+	}
+	if lp.HTTPGet != nil {
+		t.Fatalf("liveness probe must not use HTTPGet (would require quorum on /health); got HTTPGet=%+v", lp.HTTPGet)
+	}
+	if lp.TCPSocket == nil {
+		t.Fatalf("liveness probe should use TCPSocket")
+	}
+	if lp.TCPSocket.Port.IntValue() != 2380 {
+		t.Fatalf("liveness TCP port = %d, want 2380 (peer)", lp.TCPSocket.Port.IntValue())
+	}
+}
+
+// TestRemoveMemberFromEtcd_SkipsDeletingPeers covers B4: when other members
+// are themselves Terminating, removeMemberFromEtcd must not dial their
+// (about-to-vanish) endpoints. Filter active members first.
+func TestRemoveMemberFromEtcd_SkipsDeletingPeers(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+
+	cluster := &lll.EtcdCluster{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"}}
+	healthy := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", Labels: memberLabels("test", "test-0")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+		Status:     lll.EtcdMemberStatus{PodName: "test-0"},
+	}
+	dying := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-2", Namespace: "ns", Labels: memberLabels("test", "test-2"),
+			DeletionTimestamp: &now, Finalizers: []string{MemberFinalizer}},
+		Spec:   lll.EtcdMemberSpec{ClusterName: "test"},
+		Status: lll.EtcdMemberStatus{PodName: "test-2"},
+	}
+	victim := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-1", Namespace: "ns", Labels: memberLabels("test", "test-1"),
+			Finalizers: []string{MemberFinalizer}},
+		Spec:   lll.EtcdMemberSpec{ClusterName: "test"},
+		Status: lll.EtcdMemberStatus{MemberID: "0000000000000002", PodName: "test-1"},
+	}
+
+	c, _ := newTestClient(t, cluster, healthy, dying, victim)
+
+	// Record the endpoints the factory was called with.
+	var seenEndpoints []string
+	fe := newFakeEtcd(0xdeadbeef,
+		&etcdserverpb.Member{ID: 0x1, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0x2, Name: "test-1", PeerURLs: []string{peerURL("test-1", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0x3, Name: "test-2", PeerURLs: []string{peerURL("test-2", "test", "ns")}},
+	)
+	factory := func(_ context.Context, eps []string) (EtcdClusterClient, error) {
+		seenEndpoints = append([]string(nil), eps...)
+		return fe, nil
+	}
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factory}
+
+	if err := r.removeMemberFromEtcd(ctx, victim); err != nil {
+		t.Fatalf("removeMemberFromEtcd: %v", err)
+	}
+	for _, ep := range seenEndpoints {
+		if ep == clientURL("test-2", "test", "ns") {
+			t.Fatalf("dialed a Terminating peer (test-2); endpoints were %v", seenEndpoints)
+		}
+	}
+	if len(seenEndpoints) != 1 || seenEndpoints[0] != clientURL("test-0", "test", "ns") {
+		t.Fatalf("expected dial only against test-0; got %v", seenEndpoints)
+	}
+}
+
+// TestDiscoverMemberID_FallsBackToPeers covers B5: if the member's own pod
+// is crashlooping, peer members still know its ID. discoverMemberID must
+// dial peers, not just self.
+func TestDiscoverMemberID_FallsBackToPeers(t *testing.T) {
+	ctx := context.Background()
+
+	cluster := &lll.EtcdCluster{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"}}
+	peer := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", Labels: memberLabels("test", "test-0")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+		Status:     lll.EtcdMemberStatus{PodName: "test-0", MemberID: "0000000000000001"},
+	}
+	target := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-1", Namespace: "ns", Labels: memberLabels("test", "test-1")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+	}
+
+	c, _ := newTestClient(t, cluster, peer, target)
+
+	// Factory inspects endpoints; if the first is self URL, error; if peer
+	// URL is present, succeed with a fake that knows about target.
+	const wantID uint64 = 0xfeedface
+	fe := newFakeEtcd(0xdead,
+		&etcdserverpb.Member{ID: 0x1, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")}},
+		&etcdserverpb.Member{ID: wantID, Name: "test-1", PeerURLs: []string{peerURL("test-1", "test", "ns")}},
+	)
+	var capturedEndpoints []string
+	factory := func(_ context.Context, eps []string) (EtcdClusterClient, error) {
+		capturedEndpoints = append([]string(nil), eps...)
+		return fe, nil
+	}
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factory}
+
+	id, err := r.discoverMemberID(ctx, target)
+	if err != nil {
+		t.Fatalf("discoverMemberID: %v", err)
+	}
+	if id != wantID {
+		t.Fatalf("id = %x, want %x", id, wantID)
+	}
+	// Assert at least one peer URL is in the endpoint list (and not just self).
+	wantPeer := clientURL("test-0", "test", "ns")
+	hasPeer := false
+	for _, ep := range capturedEndpoints {
+		if ep == wantPeer {
+			hasPeer = true
+			break
+		}
+	}
+	if !hasPeer {
+		t.Fatalf("discoverMemberID must include peer endpoints; got %v", capturedEndpoints)
+	}
+}
+
 // silence unused imports
 var _ = ctrl.Result{}

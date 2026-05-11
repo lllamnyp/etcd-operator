@@ -79,36 +79,34 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 	active := filterActiveMembers(memberList.Items)
 
-	// ── Lock in the cluster token before any member references it ─────
-	if cluster.Status.ClusterToken == "" {
-		cluster.Status.ClusterToken = deriveClusterToken(cluster)
-		if err := r.Status().Update(ctx, cluster); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{Requeue: true}, nil
-	}
-
-	// ── Snapshot spec → Observed and (re)set the deadline as needed ───
-	// Three triggers cause us to copy spec into Observed:
-	//   1. First reconcile (Observed is nil).
-	//   2. Reconciliation against current Observed has just completed and
-	//      spec has since changed.
-	//   3. The deadline has elapsed without convergence — we abandon the
-	//      in-flight target and pick up the latest spec.
+	// ── First-reconcile init ──────────────────────────────────────────
+	// Combine the ClusterToken latch, initial Observed snapshot, and
+	// progress deadline into a single Status write so a brand-new cluster
+	// settles into a reconcile-ready shape in one pass.
 	current := int32(len(active))
 	now := metav1.Now()
 
-	if cluster.Status.Observed == nil {
-		log.Info("snapshotting initial spec into observed")
-		snapshotSpecIntoObserved(cluster)
-		setProgressDeadline(cluster, now)
-		setClusterCondition(cluster, lll.ClusterProgressing, metav1.ConditionTrue, "InitialSnapshot",
-			"snapshotted initial spec into status.observed")
+	if cluster.Status.ClusterToken == "" || cluster.Status.Observed == nil {
+		log.Info("initialising cluster status (token + observed snapshot)")
+		if cluster.Status.ClusterToken == "" {
+			cluster.Status.ClusterToken = deriveClusterToken(cluster)
+		}
+		if cluster.Status.Observed == nil {
+			snapshotSpecIntoObserved(cluster)
+			setProgressDeadline(cluster, now)
+			setClusterCondition(cluster, lll.ClusterProgressing, metav1.ConditionTrue, "InitialSnapshot",
+				"snapshotted initial spec into status.observed")
+		}
 		if err := r.Status().Update(ctx, cluster); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{Requeue: true}, nil
 	}
+
+	// ── Subsequent spec-change handling ───────────────────────────────
+	// Triggers that update Observed from the latest spec:
+	//   - the previous Observed target is complete and spec has changed
+	//   - the deadline has elapsed (handled separately)
 
 	complete := reconciliationComplete(cluster, active)
 
@@ -221,10 +219,23 @@ func (r *EtcdClusterReconciler) tryDiscoverCluster(
 ) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
-	endpoints := memberEndpoints(members, cluster.Name, cluster.Namespace)
-	if len(endpoints) == 0 {
+	// Find the seed explicitly by name rather than trusting list order.
+	// apiserver does not guarantee any ordering on List responses; relying
+	// on `members[0]` would silently anchor discovery to the wrong member
+	// (or panic on an empty slice from a future caller).
+	seedName := fmt.Sprintf("%s-0", cluster.Name)
+	var seed *lll.EtcdMember
+	for i := range members {
+		if members[i].Name == seedName {
+			seed = &members[i]
+			break
+		}
+	}
+	if seed == nil {
+		log.Info("waiting for seed member to appear before discovery", "seed", seedName)
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
+	endpoints := []string{clientURL(seed.Name, cluster.Name, cluster.Namespace)}
 
 	etcdClient, err := r.EtcdClientFactory(ctx, endpoints)
 	if err != nil {
@@ -259,16 +270,15 @@ func (r *EtcdClusterReconciler) tryDiscoverCluster(
 	}
 
 	// Only latch ClusterID when the response unambiguously describes the
-	// bootstrap state. With single-member bootstrap, that means: exactly
-	// one member, and its name matches the seed member we created (or its
-	// peer URL does, if etcd hasn't yet propagated the name). Anything
-	// else is a stale or partial response we shouldn't anchor to.
-	expectedPeer := peerURL(members[0].Name, cluster.Name, cluster.Namespace)
+	// bootstrap state. With single-member bootstrap that means: exactly
+	// one member, and its name matches the seed (or its peer URL does, if
+	// etcd hasn't yet propagated the name).
 	if len(resp.Members) != 1 {
 		log.Info("waiting for definitive single-member response", "members", len(resp.Members))
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
-	matched := resp.Members[0].Name == members[0].Name
+	expectedPeer := peerURL(seed.Name, cluster.Name, cluster.Namespace)
+	matched := resp.Members[0].Name == seed.Name
 	if !matched {
 		for _, p := range resp.Members[0].PeerURLs {
 			if p == expectedPeer {
@@ -478,37 +488,90 @@ func (r *EtcdClusterReconciler) ensureServices(ctx context.Context, cluster *lll
 	})
 }
 
-// ensureService creates the Service if absent. It does not reconcile drift on
-// existing Services — selectors and ports are immutable from the operator's
-// perspective. A user editing them manually is going off-script and the
-// breakage will be visible (members lose connectivity); we don't paper over it.
+// ensureService creates the Service if absent and reconciles drift on the
+// fields the operator actually owns: Selector, PublishNotReadyAddresses,
+// and the named Ports it requires. Everything else (labels, annotations,
+// user-added ports, type) is preserved — admission webhooks routinely
+// inject these and we don't want to fight them.
 func (r *EtcdClusterReconciler) ensureService(
 	ctx context.Context,
 	cluster *lll.EtcdCluster,
 	name string,
-	spec corev1.ServiceSpec,
+	desired corev1.ServiceSpec,
 ) error {
 	svc := &corev1.Service{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: name}, svc)
-	if err == nil {
-		return nil
+	if errors.IsNotFound(err) {
+		svc = &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: cluster.Namespace,
+				Labels:    clusterLabels(cluster.Name),
+			},
+			Spec: desired,
+		}
+		if err := controllerutil.SetControllerReference(cluster, svc, r.Scheme); err != nil {
+			return err
+		}
+		return r.Create(ctx, svc)
 	}
-	if !errors.IsNotFound(err) {
+	if err != nil {
 		return err
 	}
 
-	svc = &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: cluster.Namespace,
-			Labels:    clusterLabels(cluster.Name),
-		},
-		Spec: spec,
+	// Drift reconcile on owned fields only.
+	original := svc.DeepCopy()
+	changed := false
+
+	if !equalSelectors(svc.Spec.Selector, desired.Selector) {
+		svc.Spec.Selector = desired.Selector
+		changed = true
 	}
-	if err := controllerutil.SetControllerReference(cluster, svc, r.Scheme); err != nil {
-		return err
+	if svc.Spec.PublishNotReadyAddresses != desired.PublishNotReadyAddresses {
+		svc.Spec.PublishNotReadyAddresses = desired.PublishNotReadyAddresses
+		changed = true
 	}
-	return r.Create(ctx, svc)
+	// Required ports must be present with correct values. Extra ports the
+	// user has added stay.
+	for _, want := range desired.Ports {
+		if upsertPortByName(&svc.Spec.Ports, want) {
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	return r.Patch(ctx, svc, client.MergeFrom(original))
+}
+
+func equalSelectors(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+// upsertPortByName ensures `want` is present in `ports`, identified by Name.
+// Existing entries with the same Name are replaced if any of Port, Protocol,
+// or TargetPort differ. Returns true when the slice was modified.
+func upsertPortByName(ports *[]corev1.ServicePort, want corev1.ServicePort) bool {
+	for i, p := range *ports {
+		if p.Name != want.Name {
+			continue
+		}
+		if p.Port == want.Port && p.Protocol == want.Protocol && p.TargetPort == want.TargetPort {
+			return false
+		}
+		(*ports)[i] = want
+		return true
+	}
+	*ports = append(*ports, want)
+	return true
 }
 
 // ── Manager wiring ───────────────────────────────────────────────────────
