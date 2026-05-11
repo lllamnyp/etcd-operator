@@ -25,7 +25,7 @@ Bootstrap is single-member: the operator creates one seed (`<cluster>-0`) with `
 
 ## What's **not** supported (yet)
 
-No TLS. No auth/RBAC inside etcd. No version upgrades — changing `spec.version` does not roll the new image through running pods (only new pods get the new version). No PVC resizing — changing `spec.storage` does not resize existing members' PVCs (only newly-created members on scale-up pick up the new size); see [#2](https://github.com/lllamnyp/etcd-operator/issues/2). No automatic broken-member replacement (the predicate is stubbed; `status.brokenMembers` always reads 0). No backups, no defragmentation scheduling, no PodAntiAffinity by default. See `tmp/todo.md` (locally) and the issue tracker for the running list.
+No TLS. No auth/RBAC inside etcd. No version upgrades — changing `spec.version` does not roll the new image through running pods (only new pods get the new version). No PVC resizing — changing `spec.storage` does not resize existing members' PVCs (only newly-created members on scale-up pick up the new size); see [#2](https://github.com/lllamnyp/etcd-operator/issues/2). No automatic broken-member replacement (the predicate is stubbed; `status.brokenMembers` always reads 0). No backups, no defragmentation scheduling, no PodAntiAffinity by default. See the [GitHub issue tracker](https://github.com/lllamnyp/etcd-operator/issues) for the running follow-up list.
 
 ## API at a glance
 
@@ -159,7 +159,16 @@ Unit tests use a controller-runtime fake client and a fake etcd client (`control
 go test ./controllers/...
 ```
 
-These cover bootstrap locking, scale-down with empty `memberID`, PVC stale-owner refusal, ready gating on memberID populated, and etcd-unreachable surfacing.
+The suite covers, roughly:
+
+- **Bootstrap**: single-seed creation, idempotent recovery, refusal to adopt a same-named seed from a deleted prior cluster.
+- **Locking pattern**: `Observed`/`ProgressDeadline` mid-flight locking, bootstrap-deadline as terminal, steady-state-deadline waits for a spec edit before resuming.
+- **Scale-up**: learner-mode (`MemberAddAsLearner`), readiness gate before the next step, crash-recovery when a learner is already in etcd but the CR is missing, `--initial-cluster` flag sourced from etcd's view, in-flight-deletion gate, post-final-add promotion.
+- **Scale-down**: graceful `MemberRemove` via finalizer, in-flight-deletion gate, peer-list fallback when `MemberID` was never populated.
+- **Discovery**: rejection of partial / unexpected responses, separate `WaitingForSeed` vs `ClusterUnreachable` signalling, no-churn on repeated errors.
+- **Status**: no-churn at steady state on both CRs, `ObservedGeneration` populated, `BrokenMembers` count (stub predicate).
+- **Member controller**: ready-gating on `MemberID` populated, peer-URL fallback during the post-add propagation window, transient-apiserver-error propagation, PVC stale-owner refusal, Pod liveness shape (TCP-only, no quorum dependency).
+- **Service drift**: reconciles owned fields (selector, ports, `publishNotReadyAddresses`) while preserving user-added labels, annotations, and extra ports.
 
 ## License
 

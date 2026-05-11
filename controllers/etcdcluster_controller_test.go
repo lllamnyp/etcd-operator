@@ -345,6 +345,9 @@ func TestTryDiscoverCluster_SurfacesUnreachableEtcd(t *testing.T) {
 				Labels:    memberLabels("test", fmt.Sprintf("test-%d", i)),
 			},
 			Spec: lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"), InitialCluster: "x", ClusterToken: "test"},
+			// PodName set: we want to exercise the "etcd unreachable" branch,
+			// not the new "waiting for seed pod" gate.
+			Status: lll.EtcdMemberStatus{PodName: fmt.Sprintf("test-%d", i)},
 		})
 	}
 	c, _ := newTestClient(t, objs...)
@@ -1372,6 +1375,208 @@ func TestReconcile_ShortCircuitsOnDeletion(t *testing.T) {
 			names = append(names, s.Name)
 		}
 		t.Fatalf("Service should not be created for a Terminating cluster; got %v", names)
+	}
+}
+
+// TestClusterUpdateStatus_NoChurnInSteadyState covers the review blocker:
+// at steady state the cluster controller's updateStatus must not rewrite
+// status every 30s. ResourceVersion stays stable across a no-op reconcile.
+func TestClusterUpdateStatus_NoChurnInSteadyState(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(3), Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			ClusterID:    "0000000000000abc",
+			ReadyMembers: 3,
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+			Conditions: []metav1.Condition{
+				{Type: lll.ClusterAvailable, Status: metav1.ConditionTrue, Reason: "QuorumHealthy", Message: "All members are ready", LastTransitionTime: now},
+				{Type: lll.ClusterDegraded, Status: metav1.ConditionFalse, Reason: "QuorumHealthy", Message: "", LastTransitionTime: now},
+				{Type: lll.ClusterProgressing, Status: metav1.ConditionFalse, Reason: "Reconciled", Message: "actual state matches status.observed", LastTransitionTime: now},
+			},
+		},
+	}
+	objs := []client.Object{cluster}
+	for i := 0; i < 3; i++ {
+		objs = append(objs, &lll.EtcdMember{
+			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("test-%d", i), Namespace: "ns", Labels: memberLabels("test", fmt.Sprintf("test-%d", i))},
+			Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+			Status: lll.EtcdMemberStatus{
+				PodName: fmt.Sprintf("test-%d", i), MemberID: "abc",
+				Conditions: []metav1.Condition{{Type: lll.MemberReady, Status: metav1.ConditionTrue, Reason: "PodReady", LastTransitionTime: now}},
+			},
+		})
+	}
+	c, _ := newTestClient(t, objs...)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xabc,
+		&etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa02, Name: "test-1", PeerURLs: []string{peerURL("test-1", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa03, Name: "test-2", PeerURLs: []string{peerURL("test-2", "test", "ns")}},
+	))}
+
+	rvBefore := mustGet(t, c, "test", "ns", &lll.EtcdCluster{}).ResourceVersion
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test", Namespace: "ns"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	rvAfter := mustGet(t, c, "test", "ns", &lll.EtcdCluster{}).ResourceVersion
+	if rvBefore != rvAfter {
+		t.Fatalf("ResourceVersion changed (%q -> %q) on a no-op steady-state reconcile", rvBefore, rvAfter)
+	}
+}
+
+// TestTryDiscoverCluster_NoChurnOnSameError covers recommended item A:
+// repeated retries against the same etcd-client error must not bump
+// resourceVersion every time. The setClusterCondition return value gates
+// the Status().Update.
+func TestTryDiscoverCluster_NoChurnOnSameError(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
+		},
+	}
+	seed := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", Labels: memberLabels("test", "test-0")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+		Status:     lll.EtcdMemberStatus{PodName: "test-0"},
+	}
+	c, _ := newTestClient(t, cluster, seed)
+	r := &EtcdClusterReconciler{
+		Client: c, Scheme: testScheme(t),
+		EtcdClientFactory: failingFactory(errors.New("dial timeout")),
+	}
+
+	memberList := &lll.EtcdMemberList{}
+	_ = c.List(ctx, memberList, client.InNamespace("ns"))
+
+	// First call writes the condition.
+	if _, err := r.tryDiscoverCluster(ctx, cluster, memberList.Items); err != nil {
+		t.Fatalf("tryDiscoverCluster: %v", err)
+	}
+	rvAfterFirst := mustGet(t, c, "test", "ns", &lll.EtcdCluster{}).ResourceVersion
+
+	// Second call with the same error must NOT bump RV.
+	mustGet(t, c, "test", "ns", cluster)
+	if _, err := r.tryDiscoverCluster(ctx, cluster, memberList.Items); err != nil {
+		t.Fatalf("tryDiscoverCluster (second): %v", err)
+	}
+	rvAfterSecond := mustGet(t, c, "test", "ns", &lll.EtcdCluster{}).ResourceVersion
+	if rvAfterFirst != rvAfterSecond {
+		t.Fatalf("resourceVersion changed on identical retry (%q -> %q)", rvAfterFirst, rvAfterSecond)
+	}
+}
+
+// TestTryDiscoverCluster_WaitingForSeed covers recommended items B+F: when
+// the seed's Pod hasn't been created yet, discovery must not dial etcd
+// (would just time out) and must surface Progressing=True/WaitingForSeed —
+// distinct from Available=False/ClusterUnreachable, which is for "pod is
+// up but etcd isn't answering".
+func TestTryDiscoverCluster_WaitingForSeed(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
+		},
+	}
+	// Seed exists as a CR but its pod hasn't been created yet (PodName empty).
+	seed := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", Labels: memberLabels("test", "test-0")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+		// Status.PodName intentionally empty.
+	}
+	c, _ := newTestClient(t, cluster, seed)
+	// Factory MUST NOT be invoked.
+	r := &EtcdClusterReconciler{
+		Client: c, Scheme: testScheme(t),
+		EtcdClientFactory: failingFactory(errors.New("must not be called")),
+	}
+
+	memberList := &lll.EtcdMemberList{}
+	_ = c.List(ctx, memberList, client.InNamespace("ns"))
+	res, err := r.tryDiscoverCluster(ctx, cluster, memberList.Items)
+	if err != nil {
+		t.Fatalf("tryDiscoverCluster: %v", err)
+	}
+	if res.RequeueAfter == 0 {
+		t.Fatalf("expected RequeueAfter; got %+v", res)
+	}
+	mustGet(t, c, "test", "ns", cluster)
+	var prog *metav1.Condition
+	for i := range cluster.Status.Conditions {
+		if cluster.Status.Conditions[i].Type == lll.ClusterProgressing {
+			prog = &cluster.Status.Conditions[i]
+		}
+	}
+	if prog == nil || prog.Status != metav1.ConditionTrue || prog.Reason != "WaitingForSeed" {
+		t.Fatalf("Progressing condition = %+v, want True/WaitingForSeed", prog)
+	}
+}
+
+// TestTryDiscoverCluster_LatchesAvailableTrueOnSuccess covers recommended
+// item C: when discovery succeeds, the controller clears any stale
+// Available=False condition that earlier retries wrote, so the cluster
+// doesn't sit Available=False until the next reconcile cycle.
+func TestTryDiscoverCluster_LatchesAvailableTrueOnSuccess(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
+			Conditions: []metav1.Condition{{
+				// Stale from a prior retry.
+				Type: lll.ClusterAvailable, Status: metav1.ConditionFalse,
+				Reason: "ClusterUnreachable", Message: "MemberList failed: dial timeout",
+				LastTransitionTime: now,
+			}},
+		},
+	}
+	seed := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", Labels: memberLabels("test", "test-0")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+		Status:     lll.EtcdMemberStatus{PodName: "test-0"},
+	}
+	c, _ := newTestClient(t, cluster, seed)
+	fe := newFakeEtcd(0xabc, &etcdserverpb.Member{
+		ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")},
+	})
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
+
+	memberList := &lll.EtcdMemberList{}
+	_ = c.List(ctx, memberList, client.InNamespace("ns"))
+	if _, err := r.tryDiscoverCluster(ctx, cluster, memberList.Items); err != nil {
+		t.Fatalf("tryDiscoverCluster: %v", err)
+	}
+	mustGet(t, c, "test", "ns", cluster)
+	var avail *metav1.Condition
+	for i := range cluster.Status.Conditions {
+		if cluster.Status.Conditions[i].Type == lll.ClusterAvailable {
+			avail = &cluster.Status.Conditions[i]
+		}
+	}
+	if avail == nil || avail.Status != metav1.ConditionTrue || avail.Reason != "ClusterDiscovered" {
+		t.Fatalf("Available = %+v, want True/ClusterDiscovered", avail)
 	}
 }
 

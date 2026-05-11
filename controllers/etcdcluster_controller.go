@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -300,20 +301,30 @@ func (r *EtcdClusterReconciler) tryDiscoverCluster(
 		log.Info("waiting for seed member to appear before discovery", "seed", seedName)
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
+	// If the seed's Pod hasn't been created yet, dialing its DNS name just
+	// times out the reconcile budget for no signal. Surface the wait as
+	// Progressing=True/WaitingForSeed — distinct from
+	// Available=False/ClusterUnreachable (which is reserved for "we
+	// expected to dial something and couldn't"). Skips the Status write if
+	// the condition didn't move (e.g. we already wrote WaitingForSeed last
+	// reconcile).
+	if seed.Status.PodName == "" {
+		if setClusterCondition(cluster, lll.ClusterProgressing, metav1.ConditionTrue, "WaitingForSeed",
+			fmt.Sprintf("seed member %q has no Pod yet", seed.Name)) {
+			if upErr := r.Status().Update(ctx, cluster); upErr != nil {
+				if errors.IsConflict(upErr) {
+					return ctrl.Result{Requeue: true}, nil
+				}
+				return ctrl.Result{}, upErr
+			}
+		}
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
 	endpoints := []string{clientURL(seed.Name, cluster.Name, cluster.Namespace)}
 
 	etcdClient, err := r.EtcdClientFactory(ctx, endpoints)
 	if err != nil {
-		log.Error(err, "etcd client construction failed", "endpoints", endpoints)
-		setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionFalse, "ClusterUnreachable",
-			fmt.Sprintf("etcd client construction failed: %v", err))
-		if upErr := r.Status().Update(ctx, cluster); upErr != nil {
-			if errors.IsConflict(upErr) {
-				return ctrl.Result{Requeue: true}, nil
-			}
-			return ctrl.Result{}, upErr
-		}
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		return r.surfaceDiscoveryError(ctx, cluster, "etcd client construction failed", err)
 	}
 	defer etcdClient.Close()
 
@@ -322,16 +333,7 @@ func (r *EtcdClusterReconciler) tryDiscoverCluster(
 
 	resp, err := etcdClient.MemberList(listCtx)
 	if err != nil {
-		log.Error(err, "MemberList failed during cluster discovery", "endpoints", endpoints)
-		setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionFalse, "ClusterUnreachable",
-			fmt.Sprintf("MemberList failed: %v", err))
-		if upErr := r.Status().Update(ctx, cluster); upErr != nil {
-			if errors.IsConflict(upErr) {
-				return ctrl.Result{Requeue: true}, nil
-			}
-			return ctrl.Result{}, upErr
-		}
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		return r.surfaceDiscoveryError(ctx, cluster, "MemberList failed", err)
 	}
 
 	// Only latch ClusterID when the response unambiguously describes the
@@ -358,12 +360,55 @@ func (r *EtcdClusterReconciler) tryDiscoverCluster(
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
+	// Discovery success. Latch ClusterID and clear any stale failure
+	// condition from earlier retries so the cluster doesn't sit
+	// Available=False until the next reconcile cycle.
 	cluster.Status.ClusterID = fmt.Sprintf("%016x", resp.Header.ClusterId)
+	setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionTrue, "ClusterDiscovered",
+		fmt.Sprintf("etcd cluster %s discovered", cluster.Status.ClusterID))
 	if err := r.Status().Update(ctx, cluster); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// surfaceDiscoveryError reports that the seed pod exists but we can't talk
+// to it. Gates the Status write on whether the condition actually moved so
+// we don't bump resourceVersion every 10 s while waiting for the etcd
+// process to come up. Errors with embedded timestamps would defeat the
+// short-circuit, so we strip the variable portion of common timeouts.
+func (r *EtcdClusterReconciler) surfaceDiscoveryError(
+	ctx context.Context,
+	cluster *lll.EtcdCluster,
+	what string,
+	err error,
+) (ctrl.Result, error) {
+	log := log.FromContext(ctx)
+	log.Error(err, what)
+	msg := fmt.Sprintf("%s: %s", what, stableErrorMessage(err))
+	if setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionFalse, "ClusterUnreachable", msg) {
+		if upErr := r.Status().Update(ctx, cluster); upErr != nil {
+			if errors.IsConflict(upErr) {
+				return ctrl.Result{Requeue: true}, nil
+			}
+			return ctrl.Result{}, upErr
+		}
+	}
+	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+// stableErrorMessage strips per-call variable portions (timestamps, addresses
+// embedded in DNS-lookup errors, etc.) from common etcd-client error strings.
+// Keeps the kind-of-error stable across retries so the condition message
+// doesn't move on every reconcile.
+func stableErrorMessage(err error) string {
+	s := err.Error()
+	// "lookup foo on 127.0.0.53:53: server misbehaving" -> "lookup foo: server misbehaving"
+	if i, j := strings.Index(s, " on "), strings.Index(s, ": "); i > 0 && j > i {
+		s = s[:i] + s[j:]
+	}
+	return s
 }
 
 // ── Scale up ─────────────────────────────────────────────────────────────
@@ -575,38 +620,64 @@ func (r *EtcdClusterReconciler) updateStatus(
 		}
 	}
 
-	cluster.Status.ReadyMembers = ready
+	changed := false
+	if cluster.Status.ReadyMembers != ready {
+		cluster.Status.ReadyMembers = ready
+		changed = true
+	}
 
 	switch {
 	case ready == desired:
-		setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionTrue, "QuorumHealthy", "All members are ready")
-		setClusterCondition(cluster, lll.ClusterDegraded, metav1.ConditionFalse, "QuorumHealthy", "")
+		if setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionTrue, "QuorumHealthy", "All members are ready") {
+			changed = true
+		}
+		if setClusterCondition(cluster, lll.ClusterDegraded, metav1.ConditionFalse, "QuorumHealthy", "") {
+			changed = true
+		}
 	case ready > desired/2:
-		setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionTrue, "QuorumAvailable", fmt.Sprintf("%d/%d members ready", ready, desired))
-		setClusterCondition(cluster, lll.ClusterDegraded, metav1.ConditionTrue, "MembersUnhealthy", fmt.Sprintf("%d/%d members ready", ready, desired))
+		msg := fmt.Sprintf("%d/%d members ready", ready, desired)
+		if setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionTrue, "QuorumAvailable", msg) {
+			changed = true
+		}
+		if setClusterCondition(cluster, lll.ClusterDegraded, metav1.ConditionTrue, "MembersUnhealthy", msg) {
+			changed = true
+		}
 	default:
-		setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionFalse, "QuorumLost", fmt.Sprintf("%d/%d members ready, quorum lost", ready, desired))
-		setClusterCondition(cluster, lll.ClusterDegraded, metav1.ConditionTrue, "QuorumLost", "")
+		if setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionFalse, "QuorumLost",
+			fmt.Sprintf("%d/%d members ready, quorum lost", ready, desired)) {
+			changed = true
+		}
+		if setClusterCondition(cluster, lll.ClusterDegraded, metav1.ConditionTrue, "QuorumLost", "") {
+			changed = true
+		}
 	}
 
-	// Steady state: clear progressing flags.
 	if reconciliationComplete(cluster, members) {
-		setClusterCondition(cluster, lll.ClusterProgressing, metav1.ConditionFalse, "Reconciled",
-			"actual state matches status.observed")
-		cluster.Status.ProgressDeadline = nil
+		if setClusterCondition(cluster, lll.ClusterProgressing, metav1.ConditionFalse, "Reconciled",
+			"actual state matches status.observed") {
+			changed = true
+		}
+		if cluster.Status.ProgressDeadline != nil {
+			cluster.Status.ProgressDeadline = nil
+			changed = true
+		}
 	}
 
-	// Surface broken members so future auto-replacement has a tested call site.
-	brokenCount := 0
+	brokenCount := int32(0)
 	for _, m := range members {
 		if r.isBroken(m) {
 			brokenCount++
 		}
 	}
-	cluster.Status.BrokenMembers = int32(brokenCount)
+	if cluster.Status.BrokenMembers != brokenCount {
+		cluster.Status.BrokenMembers = brokenCount
+		changed = true
+	}
 
-	if err := r.Status().Update(ctx, cluster); err != nil {
-		return ctrl.Result{}, err
+	if changed {
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
