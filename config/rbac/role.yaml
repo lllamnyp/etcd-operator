@@ -1,4 +1,3 @@
-
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -7,39 +6,52 @@ metadata:
   name: manager-role
 rules:
 - apiGroups:
-  - etcd.lllamnyp.su
+  - ""
   resources:
-  - etcdbootstrappeers
+  - persistentvolumeclaims
   verbs:
   - create
   - delete
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
   - get
   - list
   - patch
   - update
   - watch
 - apiGroups:
-  - etcd.lllamnyp.su
-  resources:
-  - etcdbootstrappeers/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - etcd.lllamnyp.su
+  - lllamnyp.su
   resources:
   - etcdclusters
   verbs:
-  - create
-  - delete
   - get
   - list
-  - patch
-  - update
   - watch
 - apiGroups:
-  - etcd.lllamnyp.su
+  - lllamnyp.su
+  resources:
+  - etcdclusters/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - lllamnyp.su
   resources:
   - etcdclusters/status
   verbs:
@@ -47,9 +59,9 @@ rules:
   - patch
   - update
 - apiGroups:
-  - etcd.lllamnyp.su
+  - lllamnyp.su
   resources:
-  - etcdpeers
+  - etcdmembers
   verbs:
   - create
   - delete
@@ -59,9 +71,15 @@ rules:
   - update
   - watch
 - apiGroups:
-  - etcd.lllamnyp.su
+  - lllamnyp.su
   resources:
-  - etcdpeers/status
+  - etcdmembers/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - lllamnyp.su
+  resources:
+  - etcdmembers/status
   verbs:
   - get
   - patch
