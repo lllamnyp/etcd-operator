@@ -92,6 +92,12 @@ func (r *EtcdMemberReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// dir with the same ClusterID and member ID. PVC stays put — no
 	// reparenting, no adoption, no cross-resource coordination.
 	if member.Spec.Dormant {
+		// Capture before clear: ensurePodAbsent mutates
+		// member.Status.PodName in-memory. Comparing against the
+		// previous in-memory value (which started life as the stored
+		// value) tells us whether we need a Status update without an
+		// extra apiserver Get round-trip.
+		prevPodName := member.Status.PodName
 		if err := r.ensurePodAbsent(ctx, member); err != nil {
 			log.Error(err, "failed to delete pod for dormant member")
 			return ctrl.Result{}, err
@@ -100,15 +106,7 @@ func (r *EtcdMemberReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		// is for the running flow (reads pod, derives Ready); for dormant
 		// we know the answer directly. Idempotent — setMemberCondition
 		// short-circuits when the condition already matches.
-		changed := false
-		// member.Status.PodName was cleared by ensurePodAbsent; if the
-		// stored version differs, we need to persist.
-		stored := &lll.EtcdMember{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: member.Namespace, Name: member.Name}, stored); err == nil {
-			if stored.Status.PodName != "" {
-				changed = true
-			}
-		}
+		changed := prevPodName != ""
 		if setMemberCondition(member, lll.MemberReady, metav1.ConditionFalse, "Paused",
 			"member is paused (spec.dormant=true); pod deleted, PVC preserved") {
 			changed = true

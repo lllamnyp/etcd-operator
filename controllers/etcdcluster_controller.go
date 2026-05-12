@@ -277,7 +277,15 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	// ── Steady state ───────────────────────────────────────────────────
-	return r.updateStatus(ctx, cluster, running)
+	// Pass the full active set (including any dormant member), not
+	// `running`: updateStatus's Paused-message branch derives the
+	// dormant member from the slice via findDormantMember to name the
+	// preserved PVC. Stripping dormant here would silently fall back
+	// to the fresh-zero "no data has been written" message even when a
+	// dormant member with a real PVC exists. updateStatus re-derives
+	// `running` internally for its accounting, so passing `active`
+	// here is the correct shape.
+	return r.updateStatus(ctx, cluster, active)
 }
 
 // ── Bootstrap ────────────────────────────────────────────────────────────
@@ -811,13 +819,13 @@ func allMembersReady(members []lll.EtcdMember) bool {
 // deterministic choice.
 //
 // The 1→0 transition is special: it is a "pause" rather than a removal.
-// Before deleting the last EtcdMember CR, we record its name in
-// status.DormantMember so the next scale-up can resurrect the same
-// member (preserving ClusterID, member ID, and the raft log). The
-// member controller's finalizer then re-parents the PVC to the
-// EtcdCluster so cascade GC leaves it in place, and skips MemberRemove
-// because there are no peers to remove from and we want etcd's local
-// data dir intact.
+// Instead of Deleting the last EtcdMember CR, we Patch
+// Spec.Dormant=true on it. The CR stays alive, the PVC remains owned
+// by the same EtcdMember, and the member controller's reconcile loop
+// observes the flag and deletes the Pod (only). Resume is handled in
+// scaleUp by Patching Spec.Dormant back to false. The CR is never
+// deleted across the pause cycle, so no name lookup / Create-by-fixed-
+// name / PVC reparenting is needed.
 func (r *EtcdClusterReconciler) scaleDown(
 	ctx context.Context,
 	cluster *lll.EtcdCluster,

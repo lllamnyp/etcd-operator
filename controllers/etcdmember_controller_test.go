@@ -895,19 +895,20 @@ func TestReconcile_WaitsForInitialClusterPatch(t *testing.T) {
 	}
 }
 
-// TestHandleDeletion_ScaleToZeroReparentsPVCAndSkipsMemberRemove covers
-// the pause half of scale-to-zero. When the member carries the pause
-// annotation (stamped by the cluster controller just before issuing
-// Delete on the 1→0 step), the cluster controller flips Spec.Dormant=true
-// on the surviving member instead of issuing Delete. The member's
-// finalizer is no longer the pause path — the member CR stays alive
-// across the pause; deletion proceeds normally (with MemberRemove) only
-// when the user deletes the EtcdCluster or the CR explicitly.
+// TestHandleDeletion_StillCallsMemberRemove pins that the deletion
+// finalizer is no longer a pause path. Under the spec.Dormant design
+// the cluster controller Patches Spec.Dormant=true on the surviving
+// member during a 1→0 scale-down; it never issues a Delete that the
+// finalizer would catch. Any Delete observed by the finalizer is
+// therefore a genuine removal (intermediate scale-down step like
+// 3→2 / 2→1, or user-driven `kubectl delete etcdmember`), and the
+// finalizer must run MemberRemove against remaining peers as it
+// always did.
 //
-// This test pins the new finalizer behaviour: on intermediate scale-
-// down steps and on user-driven member deletion, the finalizer still
-// fires MemberRemove (data-loss path is opt-in via member deletion,
-// not via scale-to-zero).
+// This test reproduces the intermediate-scale-down case: cluster
+// running at observed.Replicas=0 (the 1→0 target the user just set),
+// two members alive, one of them getting deleted. MemberRemove must
+// fire against the surviving peer.
 func TestHandleDeletion_StillCallsMemberRemove(t *testing.T) {
 	ctx := context.Background()
 

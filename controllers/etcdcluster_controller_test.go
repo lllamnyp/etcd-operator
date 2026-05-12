@@ -1161,6 +1161,65 @@ func TestReconcile_FreshZeroToOneAdoptsNewSpec(t *testing.T) {
 	}
 }
 
+// TestReconcile_PausedDormantMessageNamesPVC covers the steady-state
+// call-site: passing `running` instead of `active` to updateStatus
+// strips the dormant member from the slice, so findDormantMember
+// returns nil and the Paused branch falls back to the fresh-zero
+// "no data has been written" message — wrong, because a dormant
+// member with a preserved PVC clearly exists. The fix is to pass the
+// full active set; updateStatus re-derives running internally.
+func TestReconcile_PausedDormantMessageNamesPVC(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns", UID: types.UID("cluster-uid")},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(0),
+			Version:  "3.5.17",
+			Storage:  quickQty(t, "1Gi"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			ClusterID:    "deadbeef",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 0, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+		},
+	}
+	dormant := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-saved1", Namespace: "ns",
+			Labels: memberLabels("test", "test-saved1"),
+		},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			InitialCluster: buildInitialCluster([]string{"test-saved1"}, "test", "ns"),
+			ClusterToken:   "ns-test-x", Bootstrap: true, Dormant: true,
+		},
+	}
+	c, _ := newTestClient(t, cluster, dormant)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead))}
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test", Namespace: "ns"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	mustGet(t, c, "test", "ns", cluster)
+	var av *metav1.Condition
+	for i := range cluster.Status.Conditions {
+		if cluster.Status.Conditions[i].Type == lll.ClusterAvailable {
+			av = &cluster.Status.Conditions[i]
+		}
+	}
+	if av == nil {
+		t.Fatalf("Available condition missing")
+	}
+	if av.Status != metav1.ConditionFalse || av.Reason != "Paused" {
+		t.Fatalf("Available = %+v, want False/Paused", av)
+	}
+	if !strings.Contains(av.Message, "data-test-saved1") {
+		t.Fatalf("Paused message must name the parked PVC; got %q", av.Message)
+	}
+}
+
 // TestReconcile_DormantToOneAdoptsNewSpec covers a regression caught
 // during smoke: when the cluster is paused (one dormant member,
 // observed.Replicas=0) and the user sets spec.replicas=1,
