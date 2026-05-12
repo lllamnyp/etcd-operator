@@ -1,10 +1,10 @@
 module github.com/lllamnyp/etcd-operator
 
-go 1.19
+go 1.25.0
+
+toolchain go1.25.10
 
 require (
-	github.com/onsi/ginkgo/v2 v2.6.0
-	github.com/onsi/gomega v1.24.1
 	go.etcd.io/etcd/api/v3 v3.5.9
 	go.etcd.io/etcd/client/v3 v3.5.9
 	k8s.io/api v0.26.0
