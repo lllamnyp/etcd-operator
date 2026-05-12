@@ -1,0 +1,163 @@
+# Concepts
+
+This document explains the operator's design choices and the contracts they create. The goal is to give an operator running etcd clusters a working mental model — enough to predict what the controller will do, debug it when it doesn't, and read the conditions correctly.
+
+The reader is assumed to be k8s-fluent. For deployment steps see [installation](installation.md); for kubectl recipes see [operations](operations.md).
+
+## API model
+
+Two custom resources, one of them user-facing.
+
+**`EtcdCluster`** — the user-facing object. It captures cluster-wide intent: replica count, etcd version, per-member storage size, a progress deadline. This is the only resource users normally touch.
+
+**`EtcdMember`** — one per etcd member. Created and deleted by the cluster controller. Each `EtcdMember` owns its Pod and PVC. Users should not create or edit these directly.
+
+There is **no StatefulSet**. Each member's Pod and PVC are reconciled independently by the member controller. The motivation is protocol awareness: scale-up adds a member as a learner first and only promotes once it's caught up; scale-down runs `MemberRemove` via a finalizer before reclaiming the Pod; pod restarts reuse the existing data dir and rejoin with the same etcd-side member ID. None of these flows fit StatefulSet's "all replicas are one fungible workload" model.
+
+The cluster controller decides *which* members exist and orchestrates the etcd-side state machine (`MemberAddAsLearner` / `MemberPromote` / `MemberRemove`). The member controller decides *how* a member becomes real — Pod, PVC, etcd flags — and reports observed facts (member ID, readiness) back up to its CR's status.
+
+## Member naming
+
+`EtcdMember` CRs are created with `ObjectMeta.GenerateName="<cluster>-"`. Each member's name is an apiserver-assigned random suffix (e.g. `mycluster-7xq2k`). Names are not predictable, and that is deliberate — the previous design used `<cluster>-<ordinal>` and tied cluster identity to ordinal reuse across incarnations, which is exactly the trap to avoid for stateful systems. Now:
+
+- Deleting an `EtcdCluster` and recreating one with the same name produces fresh member names (different suffixes).
+- The `--initial-cluster-token` is derived as `<namespace>-<cluster>-<uid>`, so the token also differs across incarnations.
+- Together: two incarnations of "same-named EtcdCluster" never look alike to etcd, to k8s, or to a stale PVC trying to mount itself back into the new cluster.
+
+The seed (the original `EtcdMember` created during bootstrap) carries `spec.bootstrap=true`. That flag is the discovery anchor (see [bootstrap](#bootstrap-and-discovery)) and is otherwise just historical metadata — the seed has no permanent special role in raft and can be removed like any other member.
+
+## Locking pattern
+
+A naive operator re-reads `spec` every reconcile and acts on whatever it sees. That breaks etcd in two well-known ways:
+
+1. **Mid-bootstrap replica change.** Etcd requires every bootstrapping member to start with the same `--initial-cluster` flag. Editing `spec.replicas` mid-bootstrap would have two members agreeing on different cluster shapes; etcd refuses to form.
+2. **Scale-up followed immediately by scale-down.** `MemberAdd` registers the new peer with etcd before its pod is Ready. Reverting `spec.replicas` in that window leaves the operator deleting a member it can't yet identify.
+
+Both failures share a root cause: the user's "desired state" mutates on a faster cadence than the operator can converge.
+
+**The fix.** The operator commits to a target. The first time it sees an `EtcdCluster`, it copies the spec into `status.observed` and stamps `status.progressDeadline = now + spec.progressDeadlineSeconds`. From then on the controller reconciles against `status.observed`, not `spec`. Spec changes are *noticed* but not *acted on*; they only get adopted into `observed` when:
+
+- the cluster has reached the current `observed` (the in-flight reconcile finished cleanly), or
+- the deadline has elapsed (the in-flight reconcile gave up).
+
+This is the same pattern Deployments use with `progressDeadlineSeconds`, applied at a coarser granularity. The trade-off is responsiveness: a spec edit takes effect on the next "complete" boundary, not immediately. In practice this is exactly the property you want for stateful workloads.
+
+### What "complete" means
+
+`reconciliationComplete` returns true when:
+
+- `status.observed` has been populated (first-reconcile init has happened),
+- the number of non-dormant active members equals `observed.replicas`,
+- all those members report `MemberReady=True`, and
+- if `observed.replicas > 0`, `status.clusterID` is latched.
+
+The `observed.replicas == 0` case relaxes the ClusterID requirement — a paused or fresh-zero cluster has no running etcd process to source one from. Without this relaxation, a fresh-zero cluster scaled up to 1 would never complete and the spec-change-adoption path would never fire.
+
+### Deadlines as terminal errors
+
+An expired `ProgressDeadline` is a **terminal error**, not a "try again with the latest spec" signal. The operator stops acting on its own and waits for the user. The shape of "intervention" depends on whether the cluster ever bootstrapped:
+
+- **Before bootstrap finished** (`status.clusterID == ""`): the partial members carry an `--initial-cluster` flag baked into their pod specs. There is no in-place recovery — recovery is to delete the EtcdCluster and recreate. The condition stays `Available=False, Reason=BootstrapFailed`.
+- **After bootstrap finished**: the cluster itself is healthy; only the most recent operation got stuck (e.g. a scale-up to a replica count the cluster can't schedule). The user's spec edit is the intervention — when `spec != status.observed`, the operator treats that as "I'm fixing this", snapshots the new spec, sets a fresh deadline, and resumes. Until that edit, the operator sits in `Available=False, Reason=DeadlineExceeded`.
+
+The operator never silently auto-pivots on deadline expiry. Silent recovery is the wrong default for stateful workloads where the failure modes include data divergence.
+
+You can force a deadline by patching `status.progressDeadline` to a past time. This is the documented escalation when a slow reconcile is wedged and the standard 10-minute window hasn't elapsed yet.
+
+## Create-then-Patch
+
+Because each member's `--initial-cluster` flag contains its own name, and that name isn't known until the apiserver fills in `GenerateName`, every member moves through three steps in order:
+
+1. **Create** the `EtcdMember` CR with `GenerateName` and an empty `spec.initialCluster` (for the seed: also `spec.bootstrap=true`).
+2. **MemberAddAsLearner** with the assigned name's peer URL. Skipped for the seed; skipped on scale-up if the peer URL is already registered (crash recovery — see below).
+3. **Patch** `spec.initialCluster` from etcd's authoritative member list.
+
+The member controller refuses to start a Pod while `spec.initialCluster` is empty, so a transient "pending" CR (between steps 1 and 3) never reaches the data plane.
+
+### Crash recovery
+
+If a reconcile crashes between steps 1 and 2, the next reconcile sees a pending CR with no matching peer URL in etcd, and calls `MemberAddAsLearner` (then completes the patch).
+
+If a reconcile crashes between steps 2 and 3, the next reconcile sees a pending CR whose peer URL is already registered, skips `MemberAddAsLearner`, and completes the patch. This must happen *before* any promotion attempt — the orphan learner cannot sync without its pod, the pod cannot start until `spec.initialCluster` is set, and a promote attempt would block forever on the un-synced learner. The control flow in `scaleUp` orders these steps explicitly.
+
+Operators inspecting a cluster mid-reconcile may see CRs with empty `spec.initialCluster`. That is the intentional transient state, not corruption.
+
+## Bootstrap and discovery
+
+The cluster forms from a single seed member. Multi-seed bootstrap (multiple members agreeing on `--initial-cluster` upfront) is historically the source of the "mid-flight replica change corrupts consensus" bug. Single-seed bootstrap eliminates that class of failure: the seed forms a one-member cluster with itself in `--initial-cluster`, the operator latches `clusterID` once that member is up, and every subsequent member joins via `MemberAddAsLearner`.
+
+**Discovery** is the bridge between "seed pod is up" and "operator knows the cluster ID". The cluster controller calls `MemberList` against the seed's client URL, validates the response (exactly one member, matching the seed's name or peer URL), and latches `status.clusterID`. Once latched, discovery is never run again.
+
+The seed is identified by `spec.bootstrap=true`. Member names being random precludes a name-based lookup, and trusting list order (`members[0]`) silently anchors discovery to the wrong member when scale-up CRs land in front of the seed. Once `clusterID` is set, the operator never re-reads `spec.bootstrap` for any decision — the seed is, from that point on, just a regular member.
+
+If the seed's pod hasn't been created yet (between Create and Pod-up), the controller surfaces `Progressing=True/WaitingForSeed` rather than dialing a nonexistent endpoint and burning the reconcile budget.
+
+## Scale to zero
+
+`spec.replicas: 0` parks the cluster rather than dismantling it.
+
+### Pause (1→0)
+
+When the cluster controller's `scaleDown` observes `desired==0 && len(running)==1`, it Patches `spec.dormant=true` on the surviving member. The CR is **not** deleted. On the next reconcile of that member, the member controller observes `spec.dormant=true` and runs `ensurePodAbsent` — deletes the Pod, clears `status.podName`, surfaces `Ready=False/Paused`. The PVC is not touched. It keeps its existing owner-ref to the `EtcdMember`, which still exists. So nothing reparents, nothing cascade-deletes.
+
+Intermediate steps of a multi-member descent (3→2, 2→1) are normal scale-downs: pick newest, Delete CR, finalizer runs `MemberRemove`. Only the final 1→0 step flips dormant.
+
+### Wake (0→1+)
+
+When the user sets `spec.replicas >= 1`, the cluster controller's spec-change-adoption path snapshots the new spec into `observed`. On the next reconcile, `scaleUp` finds the dormant member and Patches `spec.dormant=false`. No name lookup, no Create, no etcd RPC at this stage. The member controller then runs the normal `ensurePVC` (which finds the existing PVC by UID match and accepts it) + `ensurePod` (which creates the Pod). Etcd resumes from the data dir with the same `ClusterID` and member ID.
+
+Further scale-up proceeds normally via `MemberAddAsLearner` + `MemberPromote`.
+
+### Why "dormant on the member" instead of "delete the CR + reparent the PVC"
+
+An earlier iteration of this feature deleted the CR, reparented the PVC to the `EtcdCluster`, latched the member's name in `status.dormantMember`, and recreated the member by name on resume. Every iteration accumulated edge cases: cross-resource cache races on the pause trigger (Status update visible before Delete event delivery, or vice versa), foreign-CR-by-fixed-name adoption on resurrection, stale status field after a missed update, fresh-zero-vs-dormant message divergence. The redesigned mechanism — pause is a Patch, resume is a Patch, CR is never deleted — removes all those failure modes by construction. The mechanism the operator needs to support is "the EtcdMember CR is preserved across the pause and the user can scale to 0 and back without external coordination". It now is.
+
+### Replica accounting
+
+`current` is computed from `filterRunningMembers(...)` — non-deleted, non-dormant. A dormant member contributes zero capacity, so it must not count against `desired`, otherwise:
+
+- A 1-member cluster paused at replicas=0 would look like "we have 1 member, target is 0" and the cluster controller would try to scale down again, finding nothing valid to do.
+- Scaling a paused cluster back up to >=1 would never decide to wake the dormant member because `current==desired` would already be satisfied.
+
+The single exception is the steady-state call to `updateStatus`, which receives the full active set (including dormant). `updateStatus`'s Paused branch uses `findDormantMember(members)` to name the parked PVC in the `Available=False/Paused` message. Stripping the dormant member at that call site would silently fall back to the fresh-zero "no data has been written" message even on real dormant clusters. The asymmetry is deliberate and the call site is commented.
+
+## Conditions
+
+The cluster surfaces three conditions: `Available`, `Progressing`, `Degraded`. The interesting state space is on `Available`:
+
+| `Available` | `Reason` | Meaning |
+|---|---|---|
+| `True` | `QuorumHealthy` | All members ready, target reached. The good state. |
+| `True` | `QuorumAvailable` | More than half ready, less than all. Cluster serves; some members unhealthy. Paired with `Degraded=True/MembersUnhealthy`. |
+| `True` | `ClusterDiscovered` | Bootstrap discovery just succeeded; `clusterID` latched. Transient. |
+| `False` | `Paused` | `spec.replicas=0`. Message names the parked PVC if a dormant member exists, otherwise says no data was ever written. |
+| `False` | `QuorumLost` | Less than half ready. Cluster cannot make progress. |
+| `False` | `ClusterUnreachable` | Discovery couldn't dial etcd (DNS failure, network partition, etcd not yet listening). |
+| `False` | `BootstrapFailed` | Deadline expired before `clusterID` was latched. Terminal — recovery is delete and recreate. |
+| `False` | `DeadlineExceeded` | Deadline expired after bootstrap. Terminal — recovery is to edit spec. |
+
+`Progressing` distinguishes "actively reconciling" from "we hit a wall":
+
+| `Progressing` | `Reason` | Meaning |
+|---|---|---|
+| `True` | `InitialSnapshot` | First-reconcile token + observed latch just happened. |
+| `True` | `SpecChanged` | Previous target reached; adopting the new spec. |
+| `True` | `WaitingForSeed` | Bootstrap seed CR exists but its Pod hasn't been created yet. |
+| `True` | `RetryAfterDeadline` | Deadline-exceeded recovery: user edited spec after a steady-state deadline. |
+| `False` | `Reconciled` | At steady state with the current `observed`. |
+| `False` | `Paused` | Same as Available; emitted when `desired==0`. |
+| `False` | `BootstrapFailed` / `DeadlineExceeded` | Terminal states; see Available. |
+
+`Degraded` is `True` whenever `Available=True/QuorumAvailable` (partial outage) or `Available=False/QuorumLost`. `False` in healthy or paused states. In other words, `Degraded` means "the cluster is not delivering its full intended capacity right now"; reading `Degraded` alone tells an alerting layer whether to page someone.
+
+All conditions carry `observedGeneration` so consumers can tell whether a condition reflects the latest spec. Status writes are gated on "did anything actually change" — the operator does not bump `resourceVersion` every 30 s just because of the periodic reconcile.
+
+## What is not in the design
+
+A few things that recur in similar operators but are intentionally absent here:
+
+- **No automatic broken-member replacement.** The `isBroken` predicate is a stub that returns false. `status.brokenMembers` always reads 0. The intent is to surface the call site so the predicate is testable; the replacement policy (replace immediately? after grace period? user-confirmed?) is not yet decided. Until it is, broken members stay broken and require an explicit user action.
+- **No leader-aware client routing.** Each etcd-client call balanced by clientv3 lands on whatever endpoint is first responsive. Filtering to non-learner endpoints (the issue #12 fix) handles the "rpc not supported for learner" case, but heavy `MemberList` traffic can still spread across followers. A leader-aware proxy or a sidecar that intercepts apiserver→etcd traffic is the proper fix; not in scope here.
+- **No TLS, no auth/RBAC inside etcd.** v1alpha2 ships HTTP-only. Adding TLS means wiring cert-manager (or equivalent), rotating certs, and threading them through the Pod spec. Doable but a separate concern.
+
+See [`What's not supported`](../README.md#whats-not-supported-yet) in the README for the running follow-up list.
