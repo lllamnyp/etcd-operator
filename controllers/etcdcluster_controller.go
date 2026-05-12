@@ -147,9 +147,13 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// --initial-cluster value and any mid-flight replica change would
 	// corrupt that consensus.
 	if cluster.Status.ClusterID == "" {
-		if current == 0 {
+		// Bootstrap path also runs when an existing seed CR is pending its
+		// InitialCluster patch (recovery from a crash between Create and
+		// Update). Without that, the seed sits forever with empty spec and
+		// the member controller refuses to start its pod.
+		if current == 0 || hasPendingBootstrap(active) {
 			log.Info("bootstrapping single-node cluster")
-			return r.bootstrap(ctx, cluster)
+			return r.bootstrap(ctx, cluster, active)
 		}
 		log.Info("waiting for bootstrap member to form cluster")
 		return r.tryDiscoverCluster(ctx, cluster, active)
@@ -219,58 +223,77 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 // ── Bootstrap ────────────────────────────────────────────────────────────
 
-// bootstrap creates the single seed member (member-0) for a fresh cluster.
-// Its --initial-cluster lists only itself, so the etcd protocol cannot get
-// confused by partial agreement. Subsequent members join via MemberAdd once
-// ClusterID is latched.
+// bootstrap brings up the single seed member for a fresh cluster. Its
+// --initial-cluster lists only itself, so the etcd protocol cannot get
+// confused by partial agreement; subsequent members join via MemberAdd
+// once ClusterID is latched.
+//
+// Members are named via GenerateName ("<cluster>-"), not ordinal-suffixed,
+// so seed identity is detected by Spec.Bootstrap=true rather than by a
+// predictable name. Idempotency therefore looks for an existing
+// Bootstrap=true CR before creating a new one. Cross-incarnation safety
+// (a leftover member with this cluster's label but a different
+// controller) is enforced explicitly — see comment below.
+//
+// The Create-then-Update sequence is required: the seed's --initial-cluster
+// flag references its own (apiserver-assigned) name, so we can only fill
+// Spec.InitialCluster *after* Create returns the assigned name. The member
+// controller refuses to start a pod with an empty InitialCluster (see
+// EtcdMemberReconciler.Reconcile), so the half-baked state between Create
+// and Update doesn't reach the data plane.
 func (r *EtcdClusterReconciler) bootstrap(
 	ctx context.Context,
 	cluster *lll.EtcdCluster,
+	members []lll.EtcdMember,
 ) (ctrl.Result, error) {
-	name := fmt.Sprintf("%s-0", cluster.Name)
-	initialCluster := buildInitialCluster([]string{name}, cluster.Name, cluster.Namespace)
+	var seed *lll.EtcdMember
+	for i := range members {
+		if members[i].Spec.Bootstrap {
+			seed = &members[i]
+			break
+		}
+	}
 
-	member := &lll.EtcdMember{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: cluster.Namespace,
-			Labels:    memberLabels(cluster.Name, name),
-		},
-		Spec: lll.EtcdMemberSpec{
-			ClusterName:    cluster.Name,
-			Version:        cluster.Status.Observed.Version,
-			Storage:        cluster.Status.Observed.Storage,
-			Bootstrap:      true,
-			InitialCluster: initialCluster,
-			ClusterToken:   cluster.Status.ClusterToken,
-		},
-	}
-	if err := controllerutil.SetControllerReference(cluster, member, r.Scheme); err != nil {
-		return ctrl.Result{}, err
-	}
-	err := r.Create(ctx, member)
-	if errors.IsAlreadyExists(err) {
-		// A same-named seed already exists — could be (a) ours from a
-		// prior reconcile, (b) leftover from a previous EtcdCluster with
-		// the same name still being GC'd. Refuse to silently adopt (b):
-		// the stale seed will itself be GC'd and the new cluster will
-		// end up with no seed.
-		existing := &lll.EtcdMember{}
-		if gerr := r.Get(ctx, types.NamespacedName{
-			Namespace: cluster.Namespace,
-			Name:      name,
-		}, existing); gerr != nil {
-			return ctrl.Result{}, gerr
+	if seed == nil {
+		seed = &lll.EtcdMember{
+			ObjectMeta: metav1.ObjectMeta{
+				GenerateName: cluster.Name + "-",
+				Namespace:    cluster.Namespace,
+				Labels:       clusterLabels(cluster.Name),
+			},
+			Spec: lll.EtcdMemberSpec{
+				ClusterName:  cluster.Name,
+				Version:      cluster.Status.Observed.Version,
+				Storage:      cluster.Status.Observed.Storage,
+				Bootstrap:    true,
+				ClusterToken: cluster.Status.ClusterToken,
+				// InitialCluster filled in below once apiserver assigns Name.
+			},
 		}
-		if !metav1.IsControlledBy(existing, cluster) {
-			return ctrl.Result{}, fmt.Errorf(
-				"seed member %q exists but is not controlled by this EtcdCluster (uid=%s); "+
-					"waiting for stale resources to GC", name, cluster.UID)
+		if err := controllerutil.SetControllerReference(cluster, seed, r.Scheme); err != nil {
+			return ctrl.Result{}, err
 		}
-		// It's ours — Create idempotency from a previous reconcile that
-		// got interrupted before returning.
-	} else if err != nil {
-		return ctrl.Result{}, err
+		if err := r.Create(ctx, seed); err != nil {
+			return ctrl.Result{}, err
+		}
+	} else if !metav1.IsControlledBy(seed, cluster) {
+		// Defence-in-depth: SetControllerReference on Create would have
+		// rejected any cross-controller member, but a bare label match
+		// with no owner ref could in principle slip through (manual
+		// kubectl creation, orphan from a botched migration). Refuse to
+		// adopt rather than risk treating someone else's etcd member
+		// as ours.
+		return ctrl.Result{}, fmt.Errorf(
+			"bootstrap-flagged EtcdMember %q in namespace %q is not controlled by this EtcdCluster (uid=%s); "+
+				"refusing to adopt", seed.Name, seed.Namespace, cluster.UID)
+	}
+
+	if seed.Spec.InitialCluster == "" {
+		original := seed.DeepCopy()
+		seed.Spec.InitialCluster = buildInitialCluster([]string{seed.Name}, cluster.Name, cluster.Namespace)
+		if err := r.Patch(ctx, seed, client.MergeFrom(original)); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
@@ -285,20 +308,21 @@ func (r *EtcdClusterReconciler) tryDiscoverCluster(
 ) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
-	// Find the seed explicitly by name rather than trusting list order.
-	// apiserver does not guarantee any ordering on List responses; relying
-	// on `members[0]` would silently anchor discovery to the wrong member
-	// (or panic on an empty slice from a future caller).
-	seedName := fmt.Sprintf("%s-0", cluster.Name)
+	// Find the seed by Spec.Bootstrap. Member names are apiserver-assigned
+	// via GenerateName, so the seed cannot be located by a predictable
+	// name; Spec.Bootstrap is set on (and only on) the single CR that
+	// bootstrap() created. apiserver does not guarantee any List ordering,
+	// so trusting members[0] would silently anchor discovery to the wrong
+	// member when scale-up CRs land in front of the seed.
 	var seed *lll.EtcdMember
 	for i := range members {
-		if members[i].Name == seedName {
+		if members[i].Spec.Bootstrap {
 			seed = &members[i]
 			break
 		}
 	}
 	if seed == nil {
-		log.Info("waiting for seed member to appear before discovery", "seed", seedName)
+		log.Info("waiting for seed member to appear before discovery")
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	// If the seed's Pod hasn't been created yet, dialing its DNS name just
@@ -413,6 +437,23 @@ func stableErrorMessage(err error) string {
 
 // ── Scale up ─────────────────────────────────────────────────────────────
 
+// scaleUp adds one member to the etcd cluster. The flow is:
+//
+//  1. List active members. If any has empty Spec.InitialCluster, it is
+//     pending from a prior reconcile that crashed between Create and the
+//     InitialCluster patch — adopt it instead of creating another.
+//  2. Otherwise Create a new EtcdMember with GenerateName="<cluster>-".
+//     The Create response carries the apiserver-assigned Name, which we
+//     use to derive the peer URL.
+//  3. If the peer URL is already in etcd's member list (recovery from a
+//     prior reconcile that crashed between MemberAddAsLearner and the
+//     InitialCluster patch), skip the add. Otherwise MemberAddAsLearner.
+//  4. Patch the CR's Spec.InitialCluster from etcd's authoritative view.
+//
+// Until step 4 completes, the member controller refuses to start a pod —
+// see EtcdMemberReconciler.Reconcile. That keeps half-baked state from
+// reaching the data plane while still letting the finalizer remove an
+// already-added learner if the user deletes the CR mid-flight.
 func (r *EtcdClusterReconciler) scaleUp(
 	ctx context.Context,
 	cluster *lll.EtcdCluster,
@@ -433,17 +474,52 @@ func (r *EtcdClusterReconciler) scaleUp(
 		return resultOrZero(res), err
 	}
 
-	// No learner present. Add the next member.
-	newName := nextMemberName(cluster.Name, members)
+	// Step 1: adopt a pending member if one exists from a prior reconcile.
+	var pending *lll.EtcdMember
+	for i := range members {
+		if !members[i].Spec.Bootstrap && members[i].Spec.InitialCluster == "" {
+			pending = &members[i]
+			break
+		}
+	}
+
+	// Step 2: otherwise Create a fresh CR with GenerateName.
+	if pending == nil {
+		newMember := &lll.EtcdMember{
+			ObjectMeta: metav1.ObjectMeta{
+				GenerateName: cluster.Name + "-",
+				Namespace:    cluster.Namespace,
+				Labels:       clusterLabels(cluster.Name),
+			},
+			Spec: lll.EtcdMemberSpec{
+				ClusterName:  cluster.Name,
+				Version:      cluster.Status.Observed.Version,
+				Storage:      cluster.Status.Observed.Storage,
+				Bootstrap:    false,
+				ClusterToken: cluster.Status.ClusterToken,
+				// InitialCluster filled in below.
+			},
+		}
+		if err := controllerutil.SetControllerReference(cluster, newMember, r.Scheme); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.Create(ctx, newMember); err != nil {
+			return ctrl.Result{}, err
+		}
+		pending = newMember
+	} else if !metav1.IsControlledBy(pending, cluster) {
+		// Defence-in-depth, same reasoning as bootstrap().
+		return ctrl.Result{}, fmt.Errorf(
+			"pending EtcdMember %q in namespace %q is not controlled by this EtcdCluster (uid=%s); "+
+				"refusing to adopt", pending.Name, pending.Namespace, cluster.UID)
+	}
+
+	newName := pending.Name
 	newPeerURL := peerURL(newName, cluster.Name, cluster.Namespace)
 
-	// Crash-safety: a previous reconcile may have called
-	// MemberAddAsLearner successfully and then failed before creating the
-	// EtcdMember CR. The promotion branch above won't fire (etcd's learner
-	// is still uncaught-up). Check whether our intended peerURL is already
-	// registered; if so, skip the add and proceed straight to CR
-	// creation. If the peerURL is registered as a voter (legacy state from
-	// a pre-learner build, or a manual mutation), treat that the same way.
+	// Step 3: skip MemberAddAsLearner if the peer URL is already registered.
+	// This covers the crash between MemberAddAsLearner success and the
+	// InitialCluster patch on a previous reconcile.
 	alreadyAdded := false
 	for _, m := range listResp.Members {
 		for _, p := range m.PeerURLs {
@@ -474,9 +550,9 @@ func (r *EtcdClusterReconciler) scaleUp(
 		etcdMembers = addResp.Members
 	}
 
-	// Build --initial-cluster from etcd's view, not the CR list. The two
-	// can diverge during crash recovery (etcd has a learner whose CR we
-	// haven't yet created) and the new pod's flags MUST match what etcd
+	// Step 4: build --initial-cluster from etcd's view, not the CR list. The
+	// two can diverge during crash recovery (etcd has a learner whose CR
+	// hasn't been finalised) and the new pod's flags MUST match what etcd
 	// will report when the pod tries to join.
 	allNames := make([]string, 0, len(etcdMembers))
 	for _, m := range etcdMembers {
@@ -491,25 +567,9 @@ func (r *EtcdClusterReconciler) scaleUp(
 	sort.Strings(allNames)
 	initialCluster := buildInitialCluster(allNames, cluster.Name, cluster.Namespace)
 
-	member := &lll.EtcdMember{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      newName,
-			Namespace: cluster.Namespace,
-			Labels:    memberLabels(cluster.Name, newName),
-		},
-		Spec: lll.EtcdMemberSpec{
-			ClusterName:    cluster.Name,
-			Version:        cluster.Status.Observed.Version,
-			Storage:        cluster.Status.Observed.Storage,
-			Bootstrap:      false,
-			InitialCluster: initialCluster,
-			ClusterToken:   cluster.Status.ClusterToken,
-		},
-	}
-	if err := controllerutil.SetControllerReference(cluster, member, r.Scheme); err != nil {
-		return ctrl.Result{}, err
-	}
-	if err := r.Create(ctx, member); err != nil {
+	original := pending.DeepCopy()
+	pending.Spec.InitialCluster = initialCluster
+	if err := r.Patch(ctx, pending, client.MergeFrom(original)); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -584,13 +644,23 @@ func allMembersReady(members []lll.EtcdMember) bool {
 
 // ── Scale down ───────────────────────────────────────────────────────────
 
+// scaleDown removes the most-recently-created member. With apiserver-
+// assigned names there is no ordinal to sort by; we pick by
+// CreationTimestamp (newest first) instead, which naturally retires the
+// most recently added scale-up step before touching older members.
+// Tiebreak by name so two members created in the same second produce a
+// deterministic choice.
 func (r *EtcdClusterReconciler) scaleDown(
 	ctx context.Context,
 	cluster *lll.EtcdCluster,
 	members []lll.EtcdMember,
 ) (ctrl.Result, error) {
 	sort.Slice(members, func(i, j int) bool {
-		return memberOrdinal(members[i].Name) > memberOrdinal(members[j].Name)
+		ai, aj := members[i].CreationTimestamp, members[j].CreationTimestamp
+		if !ai.Equal(&aj) {
+			return ai.After(aj.Time)
+		}
+		return members[i].Name > members[j].Name
 	})
 	victim := members[0]
 
@@ -599,6 +669,18 @@ func (r *EtcdClusterReconciler) scaleDown(
 	}
 
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+// hasPendingBootstrap reports whether the bootstrap seed exists but is
+// missing its InitialCluster spec — the state we land in after a crash
+// between Create and the InitialCluster patch.
+func hasPendingBootstrap(members []lll.EtcdMember) bool {
+	for _, m := range members {
+		if m.Spec.Bootstrap && m.Spec.InitialCluster == "" {
+			return true
+		}
+	}
+	return false
 }
 
 // ── Status ───────────────────────────────────────────────────────────────

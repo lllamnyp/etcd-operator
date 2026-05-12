@@ -2,7 +2,6 @@ package controllers
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -76,34 +75,6 @@ func filterActiveMembers(members []lll.EtcdMember) []lll.EtcdMember {
 		}
 	}
 	return active
-}
-
-// nextMemberName returns the lowest unused ordinal name for a cluster.
-func nextMemberName(cluster string, members []lll.EtcdMember) string {
-	used := make(map[int]bool, len(members))
-	for _, m := range members {
-		if ord := memberOrdinal(m.Name); ord >= 0 {
-			used[ord] = true
-		}
-	}
-	for i := 0; ; i++ {
-		if !used[i] {
-			return fmt.Sprintf("%s-%d", cluster, i)
-		}
-	}
-}
-
-// memberOrdinal extracts the trailing integer from a member name like "cluster-2".
-func memberOrdinal(name string) int {
-	idx := strings.LastIndex(name, "-")
-	if idx < 0 {
-		return -1
-	}
-	n, err := strconv.Atoi(name[idx+1:])
-	if err != nil {
-		return -1
-	}
-	return n
 }
 
 // memberNameFromPeerURL recovers the EtcdMember name from a peer URL of the
