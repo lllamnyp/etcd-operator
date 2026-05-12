@@ -1161,6 +1161,64 @@ func TestReconcile_FreshZeroToOneAdoptsNewSpec(t *testing.T) {
 	}
 }
 
+// TestReconcile_DormantToOneAdoptsNewSpec covers a regression caught
+// during smoke: when the cluster is paused (one dormant member,
+// observed.Replicas=0) and the user sets spec.replicas=1,
+// reconciliationComplete must return true so the spec-change-adoption
+// path snapshots the new spec and the wake step can fire. The check
+// uses the `running` (non-dormant) member count — passing `active`
+// would count the dormant CR against the target and `1 != 0` would
+// keep the cluster wedged forever.
+func TestReconcile_DormantToOneAdoptsNewSpec(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns", UID: types.UID("cluster-uid")},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(1),
+			Version:  "3.5.17",
+			Storage:  quickQty(t, "1Gi"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			ClusterID:    "deadbeef",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 0, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+		},
+	}
+	dormant := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-saved1", Namespace: "ns",
+			Labels: memberLabels("test", "test-saved1"),
+		},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			InitialCluster: buildInitialCluster([]string{"test-saved1"}, "test", "ns"),
+			ClusterToken:   "ns-test-x", Bootstrap: true, Dormant: true,
+		},
+	}
+	c, _ := newTestClient(t, cluster, dormant)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead))}
+
+	// First reconcile adopts the new spec (observed.Replicas: 0 → 1).
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test", Namespace: "ns"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	mustGet(t, c, "test", "ns", cluster)
+	if cluster.Status.Observed == nil || cluster.Status.Observed.Replicas != 1 {
+		t.Fatalf("observed.Replicas should adopt spec=1; got %+v", cluster.Status.Observed)
+	}
+
+	// Second reconcile reaches scaleUp and Patches Dormant=false.
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test", Namespace: "ns"}}); err != nil {
+		t.Fatalf("Reconcile (wake): %v", err)
+	}
+	got := mustGet(t, c, "test-saved1", "ns", &lll.EtcdMember{})
+	if got.Spec.Dormant {
+		t.Fatalf("dormant member should have Spec.Dormant=false after wake; still got true")
+	}
+}
+
 // TestScaleDown_WaitsForInFlightDeletion covers reviewer issue #3: while one
 // EtcdMember is being deleted (DeletionTimestamp set, finalizer pending), no
 // further deletion may be issued. Concurrent finalizers running MemberRemove

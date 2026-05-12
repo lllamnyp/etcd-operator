@@ -125,7 +125,13 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	//   - the previous Observed target is complete and spec has changed
 	//   - the deadline has elapsed (handled separately)
 
-	complete := reconciliationComplete(cluster, active)
+	// reconciliationComplete uses the running set (non-dormant). A
+	// paused cluster has observed.Replicas=0 and len(running)=0 even
+	// while a dormant CR sits alongside; passing `active` here would
+	// count the dormant member against the target and never reach
+	// complete=true, so the spec-change-adoption path would never fire
+	// when the user scales the paused cluster back up.
+	complete := reconciliationComplete(cluster, running)
 
 	if !complete && deadlineExpired(cluster, now) {
 		return r.handleDeadlineExceeded(ctx, cluster, now)
