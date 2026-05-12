@@ -22,7 +22,7 @@ import (
 // etcd cluster. *clientv3.Client satisfies this via its embedded Cluster
 // interface.
 type EtcdClusterClient interface {
-	MemberList(ctx context.Context) (*clientv3.MemberListResponse, error)
+	MemberList(ctx context.Context, opts ...clientv3.OpOption) (*clientv3.MemberListResponse, error)
 	MemberAdd(ctx context.Context, peerAddrs []string) (*clientv3.MemberAddResponse, error)
 	MemberAddAsLearner(ctx context.Context, peerAddrs []string) (*clientv3.MemberAddResponse, error)
 	MemberPromote(ctx context.Context, id uint64) (*clientv3.MemberPromoteResponse, error)
