@@ -841,6 +841,443 @@ func TestScaleDown_PicksMostRecentlyCreatedVictim(t *testing.T) {
 	}
 }
 
+// TestScaleDown_OneToZeroPatchesDormant covers the scale-to-zero
+// "pause" path. When desired=0 and only one member remains, scaleDown
+// must Patch Spec.Dormant=true on the surviving member rather than
+// Delete it. The member CR (and its PVC owner-ref) stays in place; the
+// member controller's dormant gate handles deleting the Pod.
+//
+// This is the new mechanism replacing the old "delete CR + reparent PVC
+// to cluster + status.DormantMember" dance. With the CR kept alive
+// across the pause, there is no Create-by-fixed-name on resume, no
+// PVC reparenting, no cross-resource cache race.
+func TestScaleDown_OneToZeroPatchesDormant(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(0),
+			Version:  "3.5.17",
+			Storage:  quickQty(t, "1Gi"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			ClusterID:    "deadbeef",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 0, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
+		},
+	}
+	seed := lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-seed1", Namespace: "ns",
+			CreationTimestamp: metav1.Now(),
+			Labels:            memberLabels("test", "test-seed1"),
+		},
+		Spec: lll.EtcdMemberSpec{ClusterName: "test", InitialCluster: "x", Bootstrap: true},
+	}
+	c, _ := newTestClient(t, cluster, &seed)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead))}
+
+	if _, err := r.scaleDown(ctx, cluster, []lll.EtcdMember{seed}); err != nil {
+		t.Fatalf("scaleDown: %v", err)
+	}
+	// The CR must still exist (no Delete on 1→0), with Spec.Dormant=true.
+	got := mustGet(t, c, "test-seed1", "ns", &lll.EtcdMember{})
+	if !got.Spec.Dormant {
+		t.Fatalf("scaleDown 1→0 must Patch Spec.Dormant=true; got Dormant=%v", got.Spec.Dormant)
+	}
+	if !got.DeletionTimestamp.IsZero() {
+		t.Fatalf("CR must NOT have a DeletionTimestamp after 1→0; the pause keeps the CR alive")
+	}
+}
+
+// TestScaleUp_WakesFromDormant covers the scale-back-up path. When a
+// dormant member exists and scaleUp runs, it must Patch
+// Spec.Dormant=false on that member rather than create anything. The
+// member controller's reconcile loop then brings the Pod back up
+// against the unchanged PVC, and etcd resumes from its data dir with
+// the same ClusterID and member ID.
+//
+// No etcd-client calls happen during wake — the cluster is still
+// offline at the moment of the Patch.
+func TestScaleUp_WakesFromDormant(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns", UID: types.UID("cluster-uid")},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(1),
+			Version:  "3.5.17",
+			Storage:  quickQty(t, "1Gi"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			ClusterID:    "deadbeef",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 1, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
+		},
+	}
+	dormant := lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-saved1", Namespace: "ns",
+			Labels: memberLabels("test", "test-saved1"),
+		},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			InitialCluster: buildInitialCluster([]string{"test-saved1"}, "test", "ns"),
+			ClusterToken:   "ns-test-x", Bootstrap: true, Dormant: true,
+		},
+	}
+	c, _ := newTestClient(t, cluster, &dormant)
+	fe := newFakeEtcd(0xdead)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
+
+	if _, err := r.scaleUp(ctx, cluster, []lll.EtcdMember{dormant}); err != nil {
+		t.Fatalf("scaleUp wake: %v", err)
+	}
+	// Wake must not hit etcd — the cluster is offline at this moment.
+	if n := len(fe.addCalls) + len(fe.addLearnerCalls) + len(fe.promoteCalls) + len(fe.removeCalls); n != 0 {
+		t.Fatalf("wake must not call any etcd RPC; got add=%v addLearner=%v promote=%v remove=%v",
+			fe.addCalls, fe.addLearnerCalls, fe.promoteCalls, fe.removeCalls)
+	}
+	got := mustGet(t, c, "test-saved1", "ns", &lll.EtcdMember{})
+	if got.Spec.Dormant {
+		t.Fatalf("wake must Patch Spec.Dormant=false; still got Dormant=true")
+	}
+	// Other fields are preserved (no full overwrite).
+	if got.Spec.Version != "3.5.17" || got.Spec.InitialCluster == "" {
+		t.Fatalf("wake-from-dormant must preserve Spec.Version and Spec.InitialCluster; got %+v", got.Spec)
+	}
+}
+
+// TestUpdateStatus_PausedClusterReportsPausedCondition: a paused cluster
+// (spec.replicas=0, sole member dormant) must NOT report Available=True.
+// The "ready == desired" arm of the health switch would trigger that
+// with ready=0/desired=0, claiming a fully serving cluster when nothing
+// is running. The Paused branch in updateStatus takes precedence and
+// surfaces Available=False/Paused, with a message naming the parked
+// PVC derived from the dormant member's name.
+func TestUpdateStatus_PausedClusterReportsPausedCondition(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(0),
+			Version:  "3.5.17",
+			Storage:  quickQty(t, "1Gi"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			ClusterID:    "deadbeef",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 0, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+		},
+	}
+	dormant := lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-saved1", Namespace: "ns", Labels: memberLabels("test", "test-saved1")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", InitialCluster: "x", Bootstrap: true, Dormant: true},
+	}
+	c, _ := newTestClient(t, cluster, &dormant)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead))}
+
+	if _, err := r.updateStatus(ctx, cluster, []lll.EtcdMember{dormant}); err != nil {
+		t.Fatalf("updateStatus: %v", err)
+	}
+	mustGet(t, c, "test", "ns", cluster)
+
+	condByType := func(name string) *metav1.Condition {
+		for i := range cluster.Status.Conditions {
+			if cluster.Status.Conditions[i].Type == name {
+				return &cluster.Status.Conditions[i]
+			}
+		}
+		return nil
+	}
+	av := condByType(lll.ClusterAvailable)
+	if av == nil || av.Status != metav1.ConditionFalse || av.Reason != "Paused" {
+		t.Fatalf("Available condition = %+v, want False/Paused", av)
+	}
+	prog := condByType(lll.ClusterProgressing)
+	if prog == nil || prog.Status != metav1.ConditionFalse || prog.Reason != "Paused" {
+		t.Fatalf("Progressing condition = %+v, want False/Paused", prog)
+	}
+	deg := condByType(lll.ClusterDegraded)
+	if deg == nil || deg.Status != metav1.ConditionFalse || deg.Reason != "Paused" {
+		t.Fatalf("Degraded condition = %+v, want False/Paused", deg)
+	}
+	if !strings.Contains(av.Message, "data-test-saved1") {
+		t.Fatalf("dormant Paused message should name the parked PVC; got %q", av.Message)
+	}
+}
+
+// TestUpdateStatus_PausedFreshZeroMessageDifferentiates: a cluster
+// created with replicas=0 from scratch (no DormantMember, no PVC, no
+// data) must NOT have a Paused message that claims data is being
+// preserved — there is nothing to preserve. Dashboards and runbooks
+// that key on the condition message would be misled otherwise.
+func TestUpdateStatus_PausedFreshZeroMessageDifferentiates(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(0),
+			Version:  "3.5.17",
+			Storage:  quickQty(t, "1Gi"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			// No ClusterID (never bootstrapped), no DormantMember (never
+			// had a live member to park).
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 0, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+		},
+	}
+	c, _ := newTestClient(t, cluster)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead))}
+
+	if _, err := r.updateStatus(ctx, cluster, nil); err != nil {
+		t.Fatalf("updateStatus: %v", err)
+	}
+	mustGet(t, c, "test", "ns", cluster)
+
+	var av *metav1.Condition
+	for i := range cluster.Status.Conditions {
+		if cluster.Status.Conditions[i].Type == lll.ClusterAvailable {
+			av = &cluster.Status.Conditions[i]
+		}
+	}
+	if av == nil {
+		t.Fatalf("Available condition missing")
+	}
+	if av.Status != metav1.ConditionFalse || av.Reason != "Paused" {
+		t.Fatalf("Available condition = %+v, want False/Paused", av)
+	}
+	if strings.Contains(av.Message, "data is preserved") {
+		t.Fatalf("fresh-zero Paused message must NOT claim data preservation; got %q", av.Message)
+	}
+}
+
+// TestReconcile_FreshZeroReplicasSkipsBootstrap: an EtcdCluster created
+// with spec.replicas=0 from scratch must NOT bootstrap a transient seed.
+// Without the short-circuit, the reconcile loop would create a seed
+// EtcdMember, let etcd form a 1-node cluster, latch ClusterID, then
+// immediately scale down to 0 and "pause" a cluster that was never
+// actually used.
+func TestReconcile_FreshZeroReplicasSkipsBootstrap(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns", UID: types.UID("uid-1")},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(0),
+			Version:  "3.5.17",
+			Storage:  quickQty(t, "1Gi"),
+		},
+	}
+	c, _ := newTestClient(t, cluster)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead))}
+
+	// Run multiple reconciles to land past the token+observed snapshot
+	// and into the bootstrap branch (which must short-circuit).
+	reconcileUntilStable(t, r, c, "test", "ns", 6)
+
+	members := &lll.EtcdMemberList{}
+	if err := c.List(ctx, members, client.InNamespace("ns")); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(members.Items) != 0 {
+		names := make([]string, 0, len(members.Items))
+		for _, m := range members.Items {
+			names = append(names, m.Name)
+		}
+		t.Fatalf("no EtcdMember should be created for a fresh replicas=0 cluster; got %v", names)
+	}
+	mustGet(t, c, "test", "ns", cluster)
+	if cluster.Status.Observed == nil || cluster.Status.Observed.Replicas != 0 {
+		t.Fatalf("observed.Replicas = %+v, want 0", cluster.Status.Observed)
+	}
+	if cluster.Status.ClusterID != "" {
+		t.Fatalf("ClusterID should NOT be latched (no bootstrap happened); got %q", cluster.Status.ClusterID)
+	}
+}
+
+// TestReconcile_FreshZeroToOneAdoptsNewSpec covers the related bug
+// surfaced during smoke: when a cluster is created with replicas=0
+// (paused from the start) and the user later sets replicas=1, the
+// spec-change-adoption path must fire so the bootstrap branch can
+// create a seed on the next reconcile. The previous check in
+// reconciliationComplete required ClusterID!="" — but a fresh-zero
+// cluster never bootstraps anything, so ClusterID stays empty
+// forever, the "complete && !specEqualsObserved" branch never fires,
+// and observed.Replicas never adopts the new spec.
+func TestReconcile_FreshZeroToOneAdoptsNewSpec(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns", UID: types.UID("uid-1")},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(0),
+			Version:  "3.5.17",
+			Storage:  quickQty(t, "1Gi"),
+		},
+	}
+	c, _ := newTestClient(t, cluster)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead))}
+
+	// Settle into the fresh-paused steady state: observed.replicas=0, no members.
+	reconcileUntilStable(t, r, c, "test", "ns", 6)
+	mustGet(t, c, "test", "ns", cluster)
+	if cluster.Status.Observed == nil || cluster.Status.Observed.Replicas != 0 {
+		t.Fatalf("pre-flip: observed.Replicas = %+v, want 0", cluster.Status.Observed)
+	}
+
+	// User scales up to 1.
+	cluster.Spec.Replicas = ptrInt32(1)
+	if err := c.Update(ctx, cluster); err != nil {
+		t.Fatalf("Update spec=1: %v", err)
+	}
+
+	// Run reconciles until something happens. Specifically: observed.Replicas
+	// must adopt the new spec, and the bootstrap branch must create a seed
+	// EtcdMember.
+	reconcileUntilStable(t, r, c, "test", "ns", 6)
+
+	mustGet(t, c, "test", "ns", cluster)
+	if cluster.Status.Observed == nil || cluster.Status.Observed.Replicas != 1 {
+		t.Fatalf("after spec=1 + reconcile: observed.Replicas = %+v, want 1", cluster.Status.Observed)
+	}
+	members := &lll.EtcdMemberList{}
+	if err := c.List(ctx, members, client.InNamespace("ns")); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(members.Items) != 1 {
+		t.Fatalf("expected exactly one seed EtcdMember after fresh-zero → 1; got %d", len(members.Items))
+	}
+	if !members.Items[0].Spec.Bootstrap {
+		t.Fatalf("the lone member must be the bootstrap seed; got Bootstrap=%v", members.Items[0].Spec.Bootstrap)
+	}
+}
+
+// TestReconcile_PausedDormantMessageNamesPVC covers the steady-state
+// call-site: passing `running` instead of `active` to updateStatus
+// strips the dormant member from the slice, so findDormantMember
+// returns nil and the Paused branch falls back to the fresh-zero
+// "no data has been written" message — wrong, because a dormant
+// member with a preserved PVC clearly exists. The fix is to pass the
+// full active set; updateStatus re-derives running internally.
+func TestReconcile_PausedDormantMessageNamesPVC(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns", UID: types.UID("cluster-uid")},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(0),
+			Version:  "3.5.17",
+			Storage:  quickQty(t, "1Gi"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			ClusterID:    "deadbeef",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 0, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+		},
+	}
+	dormant := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-saved1", Namespace: "ns",
+			Labels: memberLabels("test", "test-saved1"),
+		},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			InitialCluster: buildInitialCluster([]string{"test-saved1"}, "test", "ns"),
+			ClusterToken:   "ns-test-x", Bootstrap: true, Dormant: true,
+		},
+	}
+	c, _ := newTestClient(t, cluster, dormant)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead))}
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test", Namespace: "ns"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	mustGet(t, c, "test", "ns", cluster)
+	var av *metav1.Condition
+	for i := range cluster.Status.Conditions {
+		if cluster.Status.Conditions[i].Type == lll.ClusterAvailable {
+			av = &cluster.Status.Conditions[i]
+		}
+	}
+	if av == nil {
+		t.Fatalf("Available condition missing")
+	}
+	if av.Status != metav1.ConditionFalse || av.Reason != "Paused" {
+		t.Fatalf("Available = %+v, want False/Paused", av)
+	}
+	if !strings.Contains(av.Message, "data-test-saved1") {
+		t.Fatalf("Paused message must name the parked PVC; got %q", av.Message)
+	}
+}
+
+// TestReconcile_DormantToOneAdoptsNewSpec covers a regression caught
+// during smoke: when the cluster is paused (one dormant member,
+// observed.Replicas=0) and the user sets spec.replicas=1,
+// reconciliationComplete must return true so the spec-change-adoption
+// path snapshots the new spec and the wake step can fire. The check
+// uses the `running` (non-dormant) member count — passing `active`
+// would count the dormant CR against the target and `1 != 0` would
+// keep the cluster wedged forever.
+func TestReconcile_DormantToOneAdoptsNewSpec(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns", UID: types.UID("cluster-uid")},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(1),
+			Version:  "3.5.17",
+			Storage:  quickQty(t, "1Gi"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			ClusterID:    "deadbeef",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 0, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+		},
+	}
+	dormant := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-saved1", Namespace: "ns",
+			Labels: memberLabels("test", "test-saved1"),
+		},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			InitialCluster: buildInitialCluster([]string{"test-saved1"}, "test", "ns"),
+			ClusterToken:   "ns-test-x", Bootstrap: true, Dormant: true,
+		},
+	}
+	c, _ := newTestClient(t, cluster, dormant)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead))}
+
+	// First reconcile adopts the new spec (observed.Replicas: 0 → 1).
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test", Namespace: "ns"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	mustGet(t, c, "test", "ns", cluster)
+	if cluster.Status.Observed == nil || cluster.Status.Observed.Replicas != 1 {
+		t.Fatalf("observed.Replicas should adopt spec=1; got %+v", cluster.Status.Observed)
+	}
+
+	// Second reconcile reaches scaleUp and Patches Dormant=false.
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test", Namespace: "ns"}}); err != nil {
+		t.Fatalf("Reconcile (wake): %v", err)
+	}
+	got := mustGet(t, c, "test-saved1", "ns", &lll.EtcdMember{})
+	if got.Spec.Dormant {
+		t.Fatalf("dormant member should have Spec.Dormant=false after wake; still got true")
+	}
+}
+
 // TestScaleDown_WaitsForInFlightDeletion covers reviewer issue #3: while one
 // EtcdMember is being deleted (DeletionTimestamp set, finalizer pending), no
 // further deletion may be issued. Concurrent finalizers running MemberRemove

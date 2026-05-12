@@ -50,7 +50,7 @@ type EtcdMemberReconciler struct {
 //+kubebuilder:rbac:groups=lllamnyp.su,resources=etcdmembers/finalizers,verbs=update
 //+kubebuilder:rbac:groups=lllamnyp.su,resources=etcdclusters,verbs=get
 //+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;delete
-//+kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;delete
+//+kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 
 func (r *EtcdMemberReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
@@ -82,6 +82,41 @@ func (r *EtcdMemberReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// still triggers MemberRemove cleanup.
 	if member.Spec.InitialCluster == "" {
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+
+	// Dormant gate: the cluster controller flips Spec.Dormant=true on the
+	// surviving member during a scale-to-zero pause. Delete the Pod (the
+	// PVC stays owned by this EtcdMember). When the cluster controller
+	// flips Dormant back to false on resume, the next reconcile recreates
+	// the Pod against the existing PVC and etcd resumes from its data
+	// dir with the same ClusterID and member ID. PVC stays put — no
+	// reparenting, no adoption, no cross-resource coordination.
+	if member.Spec.Dormant {
+		// Capture before clear: ensurePodAbsent mutates
+		// member.Status.PodName in-memory. Comparing against the
+		// previous in-memory value (which started life as the stored
+		// value) tells us whether we need a Status update without an
+		// extra apiserver Get round-trip.
+		prevPodName := member.Status.PodName
+		if err := r.ensurePodAbsent(ctx, member); err != nil {
+			log.Error(err, "failed to delete pod for dormant member")
+			return ctrl.Result{}, err
+		}
+		// Persist the cleared PodName + a Paused condition. updateStatus()
+		// is for the running flow (reads pod, derives Ready); for dormant
+		// we know the answer directly. Idempotent — setMemberCondition
+		// short-circuits when the condition already matches.
+		changed := prevPodName != ""
+		if setMemberCondition(member, lll.MemberReady, metav1.ConditionFalse, "Paused",
+			"member is paused (spec.dormant=true); pod deleted, PVC preserved") {
+			changed = true
+		}
+		if changed {
+			if err := r.Status().Update(ctx, member); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
 	if err := r.ensurePVC(ctx, member); err != nil {
@@ -247,10 +282,13 @@ func (r *EtcdMemberReconciler) ensurePVC(ctx context.Context, member *lll.EtcdMe
 	pvc := &corev1.PersistentVolumeClaim{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: member.Namespace, Name: pvcName}, pvc)
 	if err == nil {
-		// Refuse to reuse a PVC owned by a different (typically deleted)
-		// EtcdMember. Same-named members across scale-down/up cycles would
-		// otherwise inherit the prior member's data dir and crashloop after
-		// trying to rejoin with a removed memberID.
+		// The PVC stays owned by this EtcdMember across pause/resume
+		// (the cluster controller flips Spec.Dormant rather than
+		// deleting the member CR), so ownership never moves. If the
+		// PVC's controller-owner doesn't match this member's UID, it
+		// belongs to something else and we must refuse — silently
+		// inheriting another member's data dir would crashloop the
+		// pod when etcd notices a removed memberID in the WAL.
 		if !pvcOwnedBy(pvc, member) {
 			return fmt.Errorf("PVC %q is owned by a different EtcdMember; awaiting GC before reuse", pvcName)
 		}
@@ -289,9 +327,6 @@ func (r *EtcdMemberReconciler) ensurePVC(ctx context.Context, member *lll.EtcdMe
 // pvcOwnedBy returns true only if the PVC carries an EtcdMember owner
 // reference whose UID matches this member — i.e. we created it. PVCs with
 // no owner refs, or with owner refs pointing at anything else, are refused.
-// Adoption of pre-existing PVCs (e.g. for a future scale-to-zero feature)
-// will need an explicit re-parenting step rather than implicit acceptance;
-// see https://github.com/lllamnyp/etcd-operator/issues/3.
 func pvcOwnedBy(pvc *corev1.PersistentVolumeClaim, member *lll.EtcdMember) bool {
 	for _, o := range pvc.OwnerReferences {
 		if o.Kind == "EtcdMember" && o.UID == member.UID {
@@ -322,6 +357,29 @@ func (r *EtcdMemberReconciler) ensurePod(ctx context.Context, member *lll.EtcdMe
 		return err
 	}
 	member.Status.PodName = pod.Name
+	return nil
+}
+
+// ensurePodAbsent is the dormant-state counterpart of ensurePod. It
+// deletes the member's Pod if present (PVC stays in place — that's the
+// whole point of the pause) and clears Status.PodName. Idempotent: if
+// no Pod exists, this is a no-op.
+func (r *EtcdMemberReconciler) ensurePodAbsent(ctx context.Context, member *lll.EtcdMember) error {
+	pod := &corev1.Pod{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: member.Namespace, Name: member.Name}, pod)
+	if errors.IsNotFound(err) {
+		member.Status.PodName = ""
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if pod.DeletionTimestamp.IsZero() {
+		if err := r.Delete(ctx, pod); err != nil && !errors.IsNotFound(err) {
+			return err
+		}
+	}
+	member.Status.PodName = ""
 	return nil
 }
 
@@ -501,6 +559,12 @@ func (r *EtcdMemberReconciler) updateStatus(ctx context.Context, member *lll.Etc
 // corruption, OOM, etc.) its own etcd never responds, but the rest of the
 // cluster knows perfectly well what its ID is. Falling back to self last
 // keeps single-node bootstrap working.
+//
+// Peers are filtered to ones already observed Ready (i.e. voters in etcd
+// terms). Including a still-learner peer in the endpoint list lets
+// clientv3 balance MemberList to it and get back "rpc not supported for
+// learner"; with a 5s context budget and connect-retries, that can wedge
+// the discovery even when a voter peer is also present.
 func (r *EtcdMemberReconciler) discoverMemberID(ctx context.Context, member *lll.EtcdMember) (uint64, error) {
 	memberList := &lll.EtcdMemberList{}
 	if err := r.List(ctx, memberList,
@@ -515,12 +579,18 @@ func (r *EtcdMemberReconciler) discoverMemberID(ctx context.Context, member *lll
 		if m.Name == member.Name {
 			continue
 		}
-		if m.Status.PodName != "" {
-			endpoints = append(endpoints, clientURL(m.Name, member.Spec.ClusterName, member.Namespace))
+		if m.Status.PodName == "" {
+			continue
 		}
+		if !isMemberReady(m) {
+			continue
+		}
+		endpoints = append(endpoints, clientURL(m.Name, member.Spec.ClusterName, member.Namespace))
 	}
 	// Self last — used during single-node bootstrap when there are no
-	// other peers.
+	// other peers, or when no other peer is yet Ready. Etcd handles
+	// MemberList on a single-member-voter cluster fine; the learner
+	// rejection only fires when we route past a voter to a learner.
 	endpoints = append(endpoints, clientURL(member.Name, member.Spec.ClusterName, member.Namespace))
 
 	c, err := r.EtcdClientFactory(ctx, endpoints)

@@ -65,10 +65,17 @@ spec:
                 type: integer
               replicas:
                 default: 3
-                description: Replicas is the desired number of cluster members. Should
-                  be odd.
+                description: |-
+                  Replicas is the desired number of cluster members. Should be odd.
+                  A value of 0 parks the cluster ("scale to zero"): the operator
+                  flips spec.dormant=true on the surviving EtcdMember, which causes
+                  the member controller to delete that member's Pod. The EtcdMember
+                  CR and its PVC are preserved (the PVC stays owned by the same
+                  EtcdMember across the pause). Scaling back up to >=1 flips
+                  spec.dormant=false on the same member; etcd resumes from its
+                  existing data dir with the same ClusterID and member ID.
                 format: int32
-                minimum: 1
+                minimum: 0
                 type: integer
               storage:
                 anyOf:

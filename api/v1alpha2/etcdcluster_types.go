@@ -34,7 +34,14 @@ const (
 // EtcdClusterSpec defines the desired state of an etcd cluster.
 type EtcdClusterSpec struct {
 	// Replicas is the desired number of cluster members. Should be odd.
-	// +kubebuilder:validation:Minimum=1
+	// A value of 0 parks the cluster ("scale to zero"): the operator
+	// flips spec.dormant=true on the surviving EtcdMember, which causes
+	// the member controller to delete that member's Pod. The EtcdMember
+	// CR and its PVC are preserved (the PVC stays owned by the same
+	// EtcdMember across the pause). Scaling back up to >=1 flips
+	// spec.dormant=false on the same member; etcd resumes from its
+	// existing data dir with the same ClusterID and member ID.
+	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:default=3
 	// +optional
 	Replicas *int32 `json:"replicas,omitempty"`

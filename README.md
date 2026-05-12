@@ -22,6 +22,7 @@ Bootstrap is single-member: the operator creates one seed (an `EtcdMember` with 
 - Bootstrap of new clusters. The operator always creates exactly one seed member (`spec.bootstrap=true`) with `--initial-cluster-state=new`. After the seed is up and the cluster ID is latched, additional members are added one at a time as learners (`MemberAddAsLearner`) and promoted (`MemberPromote`) once etcd reports they've caught up, until `spec.replicas` is reached. Scale-up waits for every existing member to report `Ready=True` before starting the next step.
 - Scale up: cluster controller Creates the new `EtcdMember` CR via `GenerateName`, then calls `MemberAddAsLearner` for the assigned name's peer URL, then Patches the CR's `spec.initialCluster` from etcd's authoritative member list. The member controller starts the Pod only once `spec.initialCluster` is set — see "Create-then-Patch" below.
 - Scale down: cluster controller deletes the most-recently-created `EtcdMember` (`CreationTimestamp` DESC, name DESC tiebreak). There is no special seed-protection — etcd has no permanent "seed" role post-bootstrap, so any member can be removed. A finalizer on the deleted member calls `MemberRemove` against remaining peers before the Pod and PVC go away.
+- Scale to zero: setting `spec.replicas: 0` parks the cluster rather than removing it. The 1→0 transition Patches `spec.dormant=true` on the surviving `EtcdMember`; the member controller deletes the Pod and leaves the PVC owned by the EtcdMember. Setting `spec.replicas >= 1` later flips `spec.dormant=false` on the same member, the Pod comes back, and etcd resumes from its existing data dir with the same ClusterID and member ID. The `EtcdMember` CR is preserved across the pause — there is no Create-by-name on resume and no PVC reparenting. See "Scale to zero" below for the caveats.
 - Pod restart / node failure: data PVC is preserved, the new Pod reads the existing WAL and rejoins with the same member ID.
 - Cluster deletion: cascading owner refs clean up everything; finalizers detect "the whole cluster is going away" and skip etcd-side removal to avoid deadlock.
 
@@ -48,10 +49,10 @@ No TLS. No auth/RBAC inside etcd. No version upgrades — changing `spec.version
 | `clusterToken` | The `--initial-cluster-token` value the operator chose at bootstrap. Reused for all subsequent scale-up. Operator-managed; do not edit. The field is locked at first reconcile and persists across the entire cluster lifetime — recovery flows (deadline-exceeded, spec edits) never reset it. |
 | `observed.{replicas,version,storage}` | The locked-in target the controller is currently reconciling toward. See "Locking pattern" below. |
 | `progressDeadline` | Time at which the in-flight target will be abandoned. Patch this to a past time to abort a stuck reconcile. |
-| `conditions[]` | `Available`, `Progressing`, `Degraded`. |
+| `conditions[]` | `Available`, `Progressing`, `Degraded`. `Available=False/Paused` is the steady state of a paused cluster (`spec.replicas: 0`). |
 
 ### EtcdMember spec (operator-managed)
-`clusterName`, `version`, `storage`, `bootstrap` (bool), `initialCluster` (the `--initial-cluster` flag value), `clusterToken`. Names are apiserver-assigned via `GenerateName="<cluster>-"`. All fields except `initialCluster` are populated at Create time; `initialCluster` is filled in by a follow-up Patch — see "Create-then-Patch" below.
+`clusterName`, `version`, `storage`, `bootstrap` (bool), `initialCluster` (the `--initial-cluster` flag value), `clusterToken`, `dormant` (bool). Names are apiserver-assigned via `GenerateName="<cluster>-"`. All fields except `initialCluster` are populated at Create time; `initialCluster` is filled in by a follow-up Patch — see "Create-then-Patch" below. `dormant` is flipped to `true` by the cluster controller on a 1→0 scale-down to pause the member (the member controller then deletes the Pod and leaves the PVC); it is flipped back to `false` on the next scale-up to wake the member against its existing PVC. See "Scale to zero" below.
 
 ### Create-then-Patch
 
@@ -62,6 +63,29 @@ Because each member's `--initial-cluster` flag contains its own name and we don'
 3. **Patch** `spec.initialCluster` from etcd's authoritative member list.
 
 The member controller refuses to start a Pod while `spec.initialCluster` is empty, so a transient "pending" CR (between steps 1 and 3) never reaches the data plane. If a reconcile crashes between any two steps the next reconcile adopts the pending CR and resumes — see the cluster-controller comments for the exact recovery branches. Operators inspecting the cluster mid-reconcile may see CRs with empty `spec.initialCluster`; that is the intentional transient state, not corruption.
+
+### Scale to zero
+
+Setting `spec.replicas: 0` "pauses" the cluster rather than dismantling it. The 1→0 transition is handled differently from any other scale-down step:
+
+1. **Cluster controller** (in `scaleDown`): when it sees `desired == 0 && len(running) == 1`, it Patches `spec.dormant=true` on the surviving `EtcdMember`. The CR is **not** deleted.
+2. **Member controller** (in `Reconcile`): on the next reconcile of that member, it observes `spec.dormant=true` and runs `ensurePodAbsent` — deletes the Pod and clears `status.podName`. The PVC stays owned by the EtcdMember (same UID, same owner-ref) so nothing reparented and nothing cascade-deletes.
+3. The cluster controller's replica accounting filters dormant members from `current`, so the paused cluster reports `current=0/desired=0` and surfaces `Available=False/Paused` rather than `QuorumHealthy`.
+
+The reverse transition (`spec.replicas: 0 → >= 1`) is "wake":
+
+1. **Cluster controller** (in `scaleUp`): if it finds a member with `spec.dormant=true` and `len(running)==0`, it Patches `spec.dormant=false` on the same member. No name lookup, no Create, no PVC reparenting.
+2. **Member controller** (in `Reconcile`): on the next reconcile, `spec.dormant=false` so the dormant gate doesn't fire; the normal `ensurePVC` (finds the still-owned PVC) → `ensurePod` (recreates the Pod) path runs.
+3. **Pod starts**, etcd reads the existing data dir, resumes with the **same ClusterID and member ID** as before the pause.
+
+If further scale-up is requested (`spec.replicas >= 2`), it proceeds normally from the now-running single-member cluster via `MemberAddAsLearner` + `MemberPromote`.
+
+**Caveats:**
+
+- **`spec.replicas: 0` from scratch is also a valid pause state**, but there is nothing to preserve — no member was ever bootstrapped, so no PVC exists. The `Available=False/Paused` condition's message reflects this ("no data has been written"). Scaling up from such a cluster fires a fresh bootstrap.
+- **Don't delete the dormant PVC.** If you remove `data-<dormant-member>` while paused, the wake step still flips `spec.dormant=false` and the member controller creates a new PVC and Pod. Etcd starts with `--initial-cluster-state=new` and an empty data dir, forming a *new* cluster with a *new* ClusterID. The operator's latched `status.clusterID` becomes stale. Recovery is to delete the EtcdCluster and recreate from scratch (you've lost the data either way).
+- **Deleting the EtcdCluster while paused** cascades the EtcdMember (which owns the PVC) and the PVC with it. A subsequently recreated EtcdCluster of the same name is a fresh cluster.
+- **Multi-member scale-to-zero is staged through 1.** Only the 1→0 step Patches `spec.dormant`; intermediate steps (5→4, 4→3, etc.) Delete the victim CR normally and the finalizer calls `MemberRemove`. There is no "freeze all 5 members" mode — the surviving data is always the last remaining member's.
 
 ### EtcdMember status
 `memberID` (hex), `podName`, `pvcName`, `conditions[]` (`Ready`).
@@ -179,7 +203,8 @@ The suite covers, roughly:
 - **Bootstrap**: single-seed creation (via `GenerateName`, anchored on `spec.bootstrap=true`), idempotent recovery of a pending seed with empty `spec.initialCluster`, refusal to adopt a `Bootstrap=true` CR whose owner UID doesn't match this cluster.
 - **Locking pattern**: `Observed`/`ProgressDeadline` mid-flight locking, bootstrap-deadline as terminal, steady-state-deadline waits for a spec edit before resuming.
 - **Scale-up**: learner-mode (`MemberAddAsLearner`), readiness gate before the next step, both crash-recovery branches (CR Created but no AddAsLearner yet; AddAsLearner succeeded but `spec.initialCluster` not yet patched — including the "promote-can-never-succeed-before-patch" deadlock guard), `--initial-cluster` flag sourced from etcd's view, in-flight-deletion gate, post-final-add promotion.
-- **Scale-down**: most-recently-created member is picked (`CreationTimestamp` DESC + name DESC tiebreak), graceful `MemberRemove` via finalizer, in-flight-deletion gate, peer-list fallback when `MemberID` was never populated.
+- **Scale-down**: most-recently-created member is picked (`CreationTimestamp` DESC + name DESC tiebreak), graceful `MemberRemove` via finalizer, in-flight-deletion gate, peer-list fallback when `MemberID` was never populated. The 1→0 step is special: it Patches `spec.dormant=true` on the surviving member instead of deleting it.
+- **Scale to zero / wake**: pause Patches `spec.dormant=true` on the surviving member; the member controller deletes the Pod and leaves the PVC owned by the EtcdMember. Wake Patches `spec.dormant=false`; the member controller recreates the Pod against the existing PVC. The CR is never deleted across the pause cycle, so there is no Create-by-fixed-name, no PVC reparenting, no orphan-adopt machinery.
 - **Discovery**: seed anchored on `spec.bootstrap=true` (robust to list order), rejection of partial / unexpected responses, separate `WaitingForSeed` vs `ClusterUnreachable` signalling, no-churn on repeated errors.
 - **Status**: no-churn at steady state on both CRs, `ObservedGeneration` populated, `BrokenMembers` count (stub predicate).
 - **Member controller**: pod creation is gated on `spec.initialCluster` being set (with the finalizer added first so mid-flight deletes still trigger `MemberRemove`), ready-gating on `MemberID` populated, peer-URL fallback during the post-add propagation window, transient-apiserver-error propagation, PVC stale-owner refusal, Pod liveness shape (TCP-only, no quorum dependency).

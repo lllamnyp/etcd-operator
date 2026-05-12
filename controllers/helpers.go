@@ -40,13 +40,59 @@ func buildInitialCluster(names []string, cluster, namespace string) string {
 	return strings.Join(parts, ",")
 }
 
-// memberEndpoints returns etcd client endpoints for a set of members.
+// memberEndpoints returns etcd client endpoints for the subset of
+// `members` we can safely dial cluster-management RPCs against — i.e.
+// members that are not currently learners.
+//
+// Why filter: etcd refuses several RPCs (MemberList, MemberAdd,
+// MemberPromote, ...) on learner endpoints with
+// "rpc not supported for learner". clientv3's balancer round-robins
+// through whatever endpoints we hand it, so an unfiltered list lets
+// reconcile calls land on the learner intermittently and fail. The
+// failure is not just noisy — when no voter is reachable in the retry
+// budget (5–10s context), the operator wedges: scaleUp's promote step
+// can't see the cluster, allMembersReady gate never opens, and the
+// pod that needs promoting never gets a memberID populated.
+//
+// "Ready=True" is the right proxy for "voter": the member-controller
+// sets Ready=True only after MemberID is populated via discoverMemberID
+// — which itself needs MemberList to succeed against a voter. So
+// Ready=True transitively implies the member has been observed as a
+// non-learner. Members still in the learner state (no MemberID yet,
+// Ready=False) get filtered out.
+//
+// Falls back to the unfiltered list when no member is yet Ready, which
+// covers (a) bootstrap discovery (only the seed exists, its Ready
+// status doesn't matter for this dialer), and (b) a single fresh
+// learner's own discoverMemberID call where the peer list is just
+// "self" — letting the dialer try anyway is no worse than silently
+// returning [].
 func memberEndpoints(members []lll.EtcdMember, cluster, namespace string) []string {
+	voters := make([]string, 0, len(members))
+	for _, m := range members {
+		if isMemberReady(m) {
+			voters = append(voters, clientURL(m.Name, cluster, namespace))
+		}
+	}
+	if len(voters) > 0 {
+		return voters
+	}
 	eps := make([]string, len(members))
 	for i, m := range members {
 		eps[i] = clientURL(m.Name, cluster, namespace)
 	}
 	return eps
+}
+
+// isMemberReady reports whether the EtcdMember's Ready condition is True.
+// Used as a proxy for "etcd-side voter" — see memberEndpoints.
+func isMemberReady(m lll.EtcdMember) bool {
+	for _, c := range m.Status.Conditions {
+		if c.Type == lll.MemberReady && c.Status == metav1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 // clusterLabels returns the standard labels for cluster-level resources.
@@ -75,6 +121,44 @@ func filterActiveMembers(members []lll.EtcdMember) []lll.EtcdMember {
 		}
 	}
 	return active
+}
+
+// filterRunningMembers returns active (non-deleting) members that are not
+// dormant. The cluster controller's replica accounting (`current`),
+// readiness gating, and most scale decisions operate on this set —
+// dormant members have no Pod and contribute no etcd capacity, so
+// counting them would mean "1-member cluster paused via spec.replicas=0"
+// looks like a 1-member cluster from the operator's perspective and
+// scale-back-up could never decide to wake the dormant member.
+func filterRunningMembers(members []lll.EtcdMember) []lll.EtcdMember {
+	var running []lll.EtcdMember
+	for i := range members {
+		if !members[i].DeletionTimestamp.IsZero() {
+			continue
+		}
+		if members[i].Spec.Dormant {
+			continue
+		}
+		running = append(running, members[i])
+	}
+	return running
+}
+
+// findDormantMember returns the first non-deleting member with
+// Spec.Dormant=true, or nil if none. By construction the operator never
+// creates more than one dormant member at a time (only the 1→0 step
+// flips dormant, and the 0→1 step flips it back before any further
+// scale-up), but the helper just returns the first match.
+func findDormantMember(members []lll.EtcdMember) *lll.EtcdMember {
+	for i := range members {
+		if !members[i].DeletionTimestamp.IsZero() {
+			continue
+		}
+		if members[i].Spec.Dormant {
+			return &members[i]
+		}
+	}
+	return nil
 }
 
 // memberNameFromPeerURL recovers the EtcdMember name from a peer URL of the

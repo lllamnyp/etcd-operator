@@ -18,6 +18,7 @@ import (
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -649,10 +650,14 @@ func TestDiscoverMemberID_FallsBackToPeers(t *testing.T) {
 	ctx := context.Background()
 
 	cluster := &lll.EtcdCluster{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"}}
+	now := metav1.Now()
 	peer := &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", Labels: memberLabels("test", "test-0")},
 		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
-		Status:     lll.EtcdMemberStatus{PodName: "test-0", MemberID: "0000000000000001"},
+		Status: lll.EtcdMemberStatus{
+			PodName: "test-0", MemberID: "0000000000000001",
+			Conditions: []metav1.Condition{{Type: lll.MemberReady, Status: metav1.ConditionTrue, Reason: "PodReady", LastTransitionTime: now}},
+		},
 	}
 	target := &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-1", Namespace: "ns", Labels: memberLabels("test", "test-1")},
@@ -693,6 +698,75 @@ func TestDiscoverMemberID_FallsBackToPeers(t *testing.T) {
 	}
 	if !hasPeer {
 		t.Fatalf("discoverMemberID must include peer endpoints; got %v", capturedEndpoints)
+	}
+}
+
+// TestDiscoverMemberID_ExcludesNonReadyPeers pins the fix for issue #12:
+// when one peer is Ready (a voter) and another is still a learner (not
+// yet Ready), the endpoint list passed to clientv3 must include ONLY
+// the Ready peer. Including the learner lets clientv3 round-robin
+// MemberList to it and get back "rpc not supported for learner", which
+// wedges discovery during scale-up.
+//
+// Without the filter, this test sees both peers' URLs in the endpoint
+// list (and the operator wedges in production).
+func TestDiscoverMemberID_ExcludesNonReadyPeers(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+
+	cluster := &lll.EtcdCluster{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"}}
+	voter := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-voter", Namespace: "ns", Labels: memberLabels("test", "test-voter")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+		Status: lll.EtcdMemberStatus{
+			PodName: "test-voter", MemberID: "0000000000000001",
+			Conditions: []metav1.Condition{{Type: lll.MemberReady, Status: metav1.ConditionTrue, Reason: "PodReady", LastTransitionTime: now}},
+		},
+	}
+	learner := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-learner", Namespace: "ns", Labels: memberLabels("test", "test-learner")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+		Status: lll.EtcdMemberStatus{
+			PodName:    "test-learner", // No MemberID, no Ready=True.
+			Conditions: []metav1.Condition{{Type: lll.MemberReady, Status: metav1.ConditionFalse, Reason: "DiscoveringMemberID", LastTransitionTime: now}},
+		},
+	}
+	target := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-target", Namespace: "ns", Labels: memberLabels("test", "test-target")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+	}
+	c, _ := newTestClient(t, cluster, voter, learner, target)
+
+	const wantID uint64 = 0xfeedface
+	fe := newFakeEtcd(0xdead,
+		&etcdserverpb.Member{ID: 0x1, Name: "test-voter", PeerURLs: []string{peerURL("test-voter", "test", "ns")}},
+		&etcdserverpb.Member{ID: wantID, Name: "test-target", PeerURLs: []string{peerURL("test-target", "test", "ns")}},
+	)
+	var captured []string
+	factory := func(_ context.Context, eps []string) (EtcdClusterClient, error) {
+		captured = append([]string(nil), eps...)
+		return fe, nil
+	}
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factory}
+
+	if _, err := r.discoverMemberID(ctx, target); err != nil {
+		t.Fatalf("discoverMemberID: %v", err)
+	}
+	learnerURL := clientURL("test-learner", "test", "ns")
+	for _, ep := range captured {
+		if ep == learnerURL {
+			t.Fatalf("discoverMemberID must not pass the non-Ready learner's URL to clientv3; got %v", captured)
+		}
+	}
+	voterURL := clientURL("test-voter", "test", "ns")
+	hasVoter := false
+	for _, ep := range captured {
+		if ep == voterURL {
+			hasVoter = true
+		}
+	}
+	if !hasVoter {
+		t.Fatalf("discoverMemberID must include the Ready voter's URL; got %v", captured)
 	}
 }
 
@@ -818,6 +892,202 @@ func TestReconcile_WaitsForInitialClusterPatch(t *testing.T) {
 	_ = c.List(ctx, pods)
 	if len(pods.Items) != 0 {
 		t.Fatalf("Pod should not be created while InitialCluster is empty; got %d", len(pods.Items))
+	}
+}
+
+// TestHandleDeletion_StillCallsMemberRemove pins that the deletion
+// finalizer is no longer a pause path. Under the spec.Dormant design
+// the cluster controller Patches Spec.Dormant=true on the surviving
+// member during a 1→0 scale-down; it never issues a Delete that the
+// finalizer would catch. Any Delete observed by the finalizer is
+// therefore a genuine removal (intermediate scale-down step like
+// 3→2 / 2→1, or user-driven `kubectl delete etcdmember`), and the
+// finalizer must run MemberRemove against remaining peers as it
+// always did.
+//
+// This test reproduces the intermediate-scale-down case: cluster
+// running at observed.Replicas=0 (the 1→0 target the user just set),
+// two members alive, one of them getting deleted. MemberRemove must
+// fire against the surviving peer.
+func TestHandleDeletion_StillCallsMemberRemove(t *testing.T) {
+	ctx := context.Background()
+
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test", Namespace: "ns", UID: types.UID("cluster-uid"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			ClusterID:    "deadbeef",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 0, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+		},
+	}
+	now := metav1.Now()
+	survivor := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-keep1", Namespace: "ns", UID: types.UID("keep-uid"),
+			Labels: memberLabels("test", "test-keep1"),
+		},
+		Spec:   lll.EtcdMemberSpec{ClusterName: "test", InitialCluster: "x", ClusterToken: "ns-test-x"},
+		Status: lll.EtcdMemberStatus{PodName: "test-keep1", MemberID: "00000000000000a1"},
+	}
+	victim := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-gone1", Namespace: "ns", UID: types.UID("gone-uid"),
+			DeletionTimestamp: &now,
+			Finalizers:        []string{MemberFinalizer},
+			Labels:            memberLabels("test", "test-gone1"),
+		},
+		Spec:   lll.EtcdMemberSpec{ClusterName: "test", InitialCluster: "x", ClusterToken: "ns-test-x"},
+		Status: lll.EtcdMemberStatus{PodName: "test-gone1", MemberID: "00000000000000b2"},
+	}
+	c, _ := newTestClient(t, cluster, survivor, victim)
+	fe := newFakeEtcd(0xdeadbeef,
+		&etcdserverpb.Member{ID: 0xa1, Name: "test-keep1", PeerURLs: []string{peerURL("test-keep1", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xb2, Name: "test-gone1", PeerURLs: []string{peerURL("test-gone1", "test", "ns")}},
+	)
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
+
+	if _, err := r.handleDeletion(ctx, victim); err != nil {
+		t.Fatalf("handleDeletion: %v", err)
+	}
+	if len(fe.removeCalls) != 1 || fe.removeCalls[0] != 0xb2 {
+		t.Fatalf("MemberRemove(0xb2) expected; got %v", fe.removeCalls)
+	}
+}
+
+// TestReconcile_DormantMemberDeletesPod covers the dormant gate. When
+// the cluster controller flips Spec.Dormant=true on a member, the
+// member controller's next reconcile must delete the Pod and leave the
+// PVC untouched — that's the "park" state.
+func TestReconcile_DormantMemberDeletesPod(t *testing.T) {
+	ctx := context.Background()
+	tru := true
+
+	dormant := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-saved1", Namespace: "ns", UID: types.UID("member-uid"),
+			Labels:     memberLabels("test", "test-saved1"),
+			Finalizers: []string{MemberFinalizer},
+		},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			InitialCluster: "x", ClusterToken: "ns-test-x", Bootstrap: true,
+			Dormant: true,
+		},
+		Status: lll.EtcdMemberStatus{PodName: "test-saved1", PVCName: "data-test-saved1"},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-saved1", Namespace: "ns",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "lllamnyp.su/v1alpha2", Kind: "EtcdMember",
+				Name: "test-saved1", UID: types.UID("member-uid"), Controller: &tru, BlockOwnerDeletion: &tru,
+			}},
+		},
+	}
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "data-test-saved1", Namespace: "ns",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "lllamnyp.su/v1alpha2", Kind: "EtcdMember",
+				Name: "test-saved1", UID: types.UID("member-uid"), Controller: &tru, BlockOwnerDeletion: &tru,
+			}},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+			},
+		},
+	}
+	c, _ := newTestClient(t, dormant, pod, pvc)
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead))}
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-saved1", Namespace: "ns"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	// Pod must be gone (or marked for deletion).
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "test-saved1"}, &corev1.Pod{}); err == nil {
+		t.Fatalf("dormant member's Pod must be deleted")
+	} else if !apierrors.IsNotFound(err) {
+		t.Fatalf("unexpected error fetching Pod: %v", err)
+	}
+	// PVC must still exist with the EtcdMember as its owner-controller —
+	// nothing reparented anything.
+	gotPVC := mustGet(t, c, "data-test-saved1", "ns", &corev1.PersistentVolumeClaim{})
+	if !pvcOwnedBy(gotPVC, dormant) {
+		t.Fatalf("PVC owner-controller must still be the EtcdMember; got %+v", gotPVC.OwnerReferences)
+	}
+	// Status.PodName cleared so /status reflects reality.
+	gotMember := mustGet(t, c, "test-saved1", "ns", &lll.EtcdMember{})
+	if gotMember.Status.PodName != "" {
+		t.Fatalf("Status.PodName should be cleared while dormant; got %q", gotMember.Status.PodName)
+	}
+}
+
+// TestReconcile_WakeFromDormantCreatesPod covers the inverse: when the
+// cluster controller flips Spec.Dormant back to false, the member
+// controller's next reconcile must recreate the Pod against the
+// (unchanged) PVC. etcd resumes from its existing data dir.
+func TestReconcile_WakeFromDormantCreatesPod(t *testing.T) {
+	ctx := context.Background()
+	tru := true
+
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns", UID: types.UID("cluster-uid")},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x", ClusterID: "deadbeef",
+			Observed: &lll.ObservedClusterSpec{Replicas: 1, Version: "3.5.17", Storage: quickQty(t, "1Gi")},
+		},
+	}
+	woken := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-saved1", Namespace: "ns", UID: types.UID("member-uid"),
+			Labels:     memberLabels("test", "test-saved1"),
+			Finalizers: []string{MemberFinalizer},
+		},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			InitialCluster: buildInitialCluster([]string{"test-saved1"}, "test", "ns"),
+			ClusterToken:   "ns-test-x", Bootstrap: true,
+			// Dormant=false — the cluster controller just flipped it back.
+		},
+	}
+	// Pre-existing PVC owned by the same EtcdMember (UID matches) — kept
+	// in place across the pause.
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "data-test-saved1", Namespace: "ns",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "lllamnyp.su/v1alpha2", Kind: "EtcdMember",
+				Name: "test-saved1", UID: types.UID("member-uid"), Controller: &tru, BlockOwnerDeletion: &tru,
+			}},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+			},
+		},
+	}
+	c, _ := newTestClient(t, cluster, woken, pvc)
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead))}
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-saved1", Namespace: "ns"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	// Pod must exist now.
+	gotPod := mustGet(t, c, "test-saved1", "ns", &corev1.Pod{})
+	if gotPod.Name != "test-saved1" {
+		t.Fatalf("expected Pod test-saved1 to exist after wake")
+	}
+	// PVC must still exist with the same owner.
+	gotPVC := mustGet(t, c, "data-test-saved1", "ns", &corev1.PersistentVolumeClaim{})
+	if !pvcOwnedBy(gotPVC, woken) {
+		t.Fatalf("PVC owner-controller must still be the woken EtcdMember; got %+v", gotPVC.OwnerReferences)
 	}
 }
 
