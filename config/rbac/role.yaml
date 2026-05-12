@@ -2,22 +2,12 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  creationTimestamp: null
   name: manager-role
 rules:
 - apiGroups:
   - ""
   resources:
   - persistentvolumeclaims
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - watch
-- apiGroups:
-  - ""
-  resources:
   - pods
   verbs:
   - create
@@ -48,12 +38,14 @@ rules:
   - lllamnyp.su
   resources:
   - etcdclusters/finalizers
+  - etcdmembers/finalizers
   verbs:
   - update
 - apiGroups:
   - lllamnyp.su
   resources:
   - etcdclusters/status
+  - etcdmembers/status
   verbs:
   - get
   - patch
@@ -70,17 +62,3 @@ rules:
   - patch
   - update
   - watch
-- apiGroups:
-  - lllamnyp.su
-  resources:
-  - etcdmembers/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - lllamnyp.su
-  resources:
-  - etcdmembers/status
-  verbs:
-  - get
-  - patch
-  - update
