@@ -122,17 +122,6 @@ type EtcdClusterStatus struct {
 	// Conditions represent the latest available observations of the cluster's state.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
-
-	// DormantMember is the name of the last EtcdMember that existed before
-	// the cluster scaled to zero replicas. Its PVC has been re-parented to
-	// this EtcdCluster so cascading GC leaves it in place. When the cluster
-	// is scaled back up to >=1 replica, the operator recreates an
-	// EtcdMember with this exact name (not via GenerateName), the
-	// pre-existing PVC is adopted, and the etcd process resumes from its
-	// existing data dir — preserving ClusterID, member IDs, and the raft
-	// log. Empty in the normal (non-dormant) state.
-	// +optional
-	DormantMember string `json:"dormantMember,omitempty"`
 }
 
 // +kubebuilder:object:root=true

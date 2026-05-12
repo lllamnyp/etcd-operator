@@ -57,6 +57,18 @@ type EtcdMemberSpec struct {
 	// agree, and so changes to the cluster's token derivation rule don't
 	// affect already-running members.
 	ClusterToken string `json:"clusterToken"`
+
+	// Dormant marks the member as paused. While dormant, the member
+	// controller deletes the member's Pod but leaves the PVC in place
+	// (the PVC stays owned by this EtcdMember). The cluster controller
+	// flips Dormant=true on the surviving member when the user sets
+	// EtcdCluster.spec.replicas=0 on a 1-member cluster, and flips it
+	// back to false when the user scales up. Re-creating the Pod against
+	// the existing PVC lets etcd resume from the existing data dir with
+	// the same ClusterID and member ID. While dormant, the member does
+	// not count toward the EtcdCluster's `current` replica accounting.
+	// +optional
+	Dormant bool `json:"dormant,omitempty"`
 }
 
 // EtcdMemberStatus defines the observed state of a single etcd member.

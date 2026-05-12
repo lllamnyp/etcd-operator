@@ -19,25 +19,6 @@ const (
 	// MemberFinalizer is placed on EtcdMember resources to ensure
 	// graceful removal from the etcd cluster before deletion.
 	MemberFinalizer = "etcd.lllamnyp.su/member-cleanup"
-
-	// PauseAnnotation is set on an EtcdMember by the cluster controller
-	// just before issuing Delete on the 1→0 scale-down step. The member
-	// controller's finalizer keys off this annotation to take the
-	// scale-to-zero "pause" path (reparent PVC to cluster, skip
-	// MemberRemove).
-	//
-	// Why an annotation on the member rather than reading cluster
-	// status: controller-runtime caches the EtcdCluster and EtcdMember
-	// informers independently. When the member-controller's finalizer
-	// fires on the Delete event, the EtcdCluster cache may not yet
-	// reflect the status.DormantMember Status() update written by the
-	// cluster controller a few microseconds earlier — that would cause
-	// the finalizer to fall through to the normal MemberRemove path,
-	// then silently no-op for the last member (no peers to dial), and
-	// cascade GC would take the PVC. By stamping the signal onto the
-	// member CR itself, we read it from the same object whose Delete
-	// event triggered the reconcile — guaranteed cache-coherent.
-	PauseAnnotation = "etcd.lllamnyp.su/pause"
 )
 
 // peerURL returns the etcd peer URL for a member, using the headless Service DNS.
@@ -140,6 +121,44 @@ func filterActiveMembers(members []lll.EtcdMember) []lll.EtcdMember {
 		}
 	}
 	return active
+}
+
+// filterRunningMembers returns active (non-deleting) members that are not
+// dormant. The cluster controller's replica accounting (`current`),
+// readiness gating, and most scale decisions operate on this set —
+// dormant members have no Pod and contribute no etcd capacity, so
+// counting them would mean "1-member cluster paused via spec.replicas=0"
+// looks like a 1-member cluster from the operator's perspective and
+// scale-back-up could never decide to wake the dormant member.
+func filterRunningMembers(members []lll.EtcdMember) []lll.EtcdMember {
+	var running []lll.EtcdMember
+	for i := range members {
+		if !members[i].DeletionTimestamp.IsZero() {
+			continue
+		}
+		if members[i].Spec.Dormant {
+			continue
+		}
+		running = append(running, members[i])
+	}
+	return running
+}
+
+// findDormantMember returns the first non-deleting member with
+// Spec.Dormant=true, or nil if none. By construction the operator never
+// creates more than one dormant member at a time (only the 1→0 step
+// flips dormant, and the 0→1 step flips it back before any further
+// scale-up), but the helper just returns the first match.
+func findDormantMember(members []lll.EtcdMember) *lll.EtcdMember {
+	for i := range members {
+		if !members[i].DeletionTimestamp.IsZero() {
+			continue
+		}
+		if members[i].Spec.Dormant {
+			return &members[i]
+		}
+	}
+	return nil
 }
 
 // memberNameFromPeerURL recovers the EtcdMember name from a peer URL of the

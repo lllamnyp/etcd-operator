@@ -84,6 +84,43 @@ func (r *EtcdMemberReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
 
+	// Dormant gate: the cluster controller flips Spec.Dormant=true on the
+	// surviving member during a scale-to-zero pause. Delete the Pod (the
+	// PVC stays owned by this EtcdMember). When the cluster controller
+	// flips Dormant back to false on resume, the next reconcile recreates
+	// the Pod against the existing PVC and etcd resumes from its data
+	// dir with the same ClusterID and member ID. PVC stays put — no
+	// reparenting, no adoption, no cross-resource coordination.
+	if member.Spec.Dormant {
+		if err := r.ensurePodAbsent(ctx, member); err != nil {
+			log.Error(err, "failed to delete pod for dormant member")
+			return ctrl.Result{}, err
+		}
+		// Persist the cleared PodName + a Paused condition. updateStatus()
+		// is for the running flow (reads pod, derives Ready); for dormant
+		// we know the answer directly. Idempotent — setMemberCondition
+		// short-circuits when the condition already matches.
+		changed := false
+		// member.Status.PodName was cleared by ensurePodAbsent; if the
+		// stored version differs, we need to persist.
+		stored := &lll.EtcdMember{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: member.Namespace, Name: member.Name}, stored); err == nil {
+			if stored.Status.PodName != "" {
+				changed = true
+			}
+		}
+		if setMemberCondition(member, lll.MemberReady, metav1.ConditionFalse, "Paused",
+			"member is paused (spec.dormant=true); pod deleted, PVC preserved") {
+			changed = true
+		}
+		if changed {
+			if err := r.Status().Update(ctx, member); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
 	if err := r.ensurePVC(ctx, member); err != nil {
 		log.Error(err, "failed to ensure PVC")
 		return ctrl.Result{}, err
@@ -107,7 +144,6 @@ func (r *EtcdMemberReconciler) handleDeletion(ctx context.Context, member *lll.E
 	log := log.FromContext(ctx)
 
 	clusterDeleting := false
-	pauseToDormant := false
 	cluster := &lll.EtcdCluster{}
 	err := r.Get(ctx, types.NamespacedName{
 		Namespace: member.Namespace,
@@ -122,28 +158,9 @@ func (r *EtcdMemberReconciler) handleDeletion(ctx context.Context, member *lll.E
 		return ctrl.Result{}, fmt.Errorf("get owner EtcdCluster: %w", err)
 	case !cluster.DeletionTimestamp.IsZero():
 		clusterDeleting = true
-	case member.Annotations[PauseAnnotation] == "true":
-		// The cluster controller stamped the pause annotation on this
-		// member just before Deleting it (the final 1→0 step on the way
-		// to a scale-to-zero pause). The signal is on the member itself
-		// rather than on cluster.Status.DormantMember so the read is
-		// cache-coherent — see PauseAnnotation's doc comment for why
-		// that matters (cross-resource cache races would otherwise drop
-		// the PVC on the last surviving member).
-		//
-		// Intermediate steps of a multi-member scale-to-zero (3→2, 2→1)
-		// do NOT have this annotation — the cluster controller only
-		// stamps it on the actual 1→0 step.
-		pauseToDormant = true
 	}
 
-	if pauseToDormant {
-		if err := r.reparentPVCToCluster(ctx, cluster, member); err != nil {
-			log.Error(err, "failed to reparent PVC to cluster; will retry")
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-		log.Info("scale-to-zero: PVC reparented to EtcdCluster, MemberRemove skipped", "pvc", "data-"+member.Name)
-	} else if !clusterDeleting {
+	if !clusterDeleting {
 		if err := r.removeMemberFromEtcd(ctx, member); err != nil {
 			log.Error(err, "failed to remove member from etcd, will retry")
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
@@ -155,37 +172,6 @@ func (r *EtcdMemberReconciler) handleDeletion(ctx context.Context, member *lll.E
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil
-}
-
-// reparentPVCToCluster moves the member's data PVC from being owned by
-// the EtcdMember (which is about to be deleted) to being owned by the
-// EtcdCluster, so cascade GC leaves it in place. Idempotent: if the PVC
-// is already controlled by the cluster, returns nil. If the PVC is
-// missing (user deleted it manually), returns nil — there's nothing to
-// preserve.
-func (r *EtcdMemberReconciler) reparentPVCToCluster(
-	ctx context.Context,
-	cluster *lll.EtcdCluster,
-	member *lll.EtcdMember,
-) error {
-	pvcName := "data-" + member.Name
-	pvc := &corev1.PersistentVolumeClaim{}
-	err := r.Get(ctx, types.NamespacedName{Namespace: member.Namespace, Name: pvcName}, pvc)
-	if errors.IsNotFound(err) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if metav1.IsControlledBy(pvc, cluster) {
-		return nil
-	}
-	original := pvc.DeepCopy()
-	pvc.OwnerReferences = nil
-	if err := controllerutil.SetControllerReference(cluster, pvc, r.Scheme); err != nil {
-		return err
-	}
-	return r.Patch(ctx, pvc, client.MergeFrom(original))
 }
 
 // removeMemberFromEtcd handles three cases:
@@ -298,26 +284,18 @@ func (r *EtcdMemberReconciler) ensurePVC(ctx context.Context, member *lll.EtcdMe
 	pvc := &corev1.PersistentVolumeClaim{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: member.Namespace, Name: pvcName}, pvc)
 	if err == nil {
-		// Case 1: already owned by us — normal path.
-		if pvcOwnedBy(pvc, member) {
-			member.Status.PVCName = pvcName
-			return nil
+		// The PVC stays owned by this EtcdMember across pause/resume
+		// (the cluster controller flips Spec.Dormant rather than
+		// deleting the member CR), so ownership never moves. If the
+		// PVC's controller-owner doesn't match this member's UID, it
+		// belongs to something else and we must refuse — silently
+		// inheriting another member's data dir would crashloop the
+		// pod when etcd notices a removed memberID in the WAL.
+		if !pvcOwnedBy(pvc, member) {
+			return fmt.Errorf("PVC %q is owned by a different EtcdMember; awaiting GC before reuse", pvcName)
 		}
-		// Case 2: owned by our parent EtcdCluster — this is a dormant
-		// resurrection. Reparent to the new EtcdMember and adopt. Without
-		// this branch, a 0→1 scale-up against a parked PVC would error
-		// out as "owned by a different EtcdMember" forever, because the
-		// dormant PVC's controller is the cluster, not any member.
-		if adopted, err := r.tryAdoptFromCluster(ctx, pvc, member); err != nil {
-			return err
-		} else if adopted {
-			member.Status.PVCName = pvcName
-			return nil
-		}
-		// Case 3: foreign owner — refuse. Reuse across scale-down/up
-		// cycles would inherit a previous member's data dir and
-		// crashloop after rejoining with a removed memberID.
-		return fmt.Errorf("PVC %q is owned by a different EtcdMember; awaiting GC before reuse", pvcName)
+		member.Status.PVCName = pvcName
+		return nil
 	}
 	if !errors.IsNotFound(err) {
 		return err
@@ -351,9 +329,6 @@ func (r *EtcdMemberReconciler) ensurePVC(ctx context.Context, member *lll.EtcdMe
 // pvcOwnedBy returns true only if the PVC carries an EtcdMember owner
 // reference whose UID matches this member — i.e. we created it. PVCs with
 // no owner refs, or with owner refs pointing at anything else, are refused.
-// Cluster-owned PVCs (from a scale-to-zero pause) are handled separately
-// by tryAdoptFromCluster — they are intentionally not considered "owned
-// by us" until the reparent succeeds.
 func pvcOwnedBy(pvc *corev1.PersistentVolumeClaim, member *lll.EtcdMember) bool {
 	for _, o := range pvc.OwnerReferences {
 		if o.Kind == "EtcdMember" && o.UID == member.UID {
@@ -361,52 +336,6 @@ func pvcOwnedBy(pvc *corev1.PersistentVolumeClaim, member *lll.EtcdMember) bool 
 		}
 	}
 	return false
-}
-
-// tryAdoptFromCluster handles the scale-back-up half of the scale-to-zero
-// flow: the dormant PVC's controller is the EtcdCluster (re-parented at
-// pause time). When a fresh EtcdMember CR with the latched dormant name
-// reconciles, we reparent the PVC back to the member so its lifecycle is
-// once again coupled to the member. Returns (true, nil) when reparenting
-// succeeded — caller treats the PVC as ours. Returns (false, nil) when
-// the controller-owner isn't the parent cluster (foreign PVC; caller
-// rejects). Errors propagate.
-func (r *EtcdMemberReconciler) tryAdoptFromCluster(
-	ctx context.Context,
-	pvc *corev1.PersistentVolumeClaim,
-	member *lll.EtcdMember,
-) (bool, error) {
-	for _, o := range pvc.OwnerReferences {
-		if o.Controller == nil || !*o.Controller || o.Kind != "EtcdCluster" {
-			continue
-		}
-		// The PVC names a controller; verify it is the cluster this
-		// member belongs to. (A cluster-owned PVC from some OTHER
-		// cluster in the same namespace is foreign — refuse.)
-		if o.Name != member.Spec.ClusterName {
-			return false, nil
-		}
-		cluster := &lll.EtcdCluster{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: member.Namespace, Name: o.Name}, cluster); err != nil {
-			return false, err
-		}
-		if cluster.UID != o.UID {
-			// Stale owner ref from a previous incarnation of an EtcdCluster
-			// with the same name. Refuse — the data on the PVC was written
-			// by a different cluster identity.
-			return false, nil
-		}
-		original := pvc.DeepCopy()
-		pvc.OwnerReferences = nil
-		if err := controllerutil.SetControllerReference(member, pvc, r.Scheme); err != nil {
-			return false, err
-		}
-		if err := r.Patch(ctx, pvc, client.MergeFrom(original)); err != nil {
-			return false, err
-		}
-		return true, nil
-	}
-	return false, nil
 }
 
 // ── Pod ──────────────────────────────────────────────────────────────────
@@ -430,6 +359,29 @@ func (r *EtcdMemberReconciler) ensurePod(ctx context.Context, member *lll.EtcdMe
 		return err
 	}
 	member.Status.PodName = pod.Name
+	return nil
+}
+
+// ensurePodAbsent is the dormant-state counterpart of ensurePod. It
+// deletes the member's Pod if present (PVC stays in place — that's the
+// whole point of the pause) and clears Status.PodName. Idempotent: if
+// no Pod exists, this is a no-op.
+func (r *EtcdMemberReconciler) ensurePodAbsent(ctx context.Context, member *lll.EtcdMember) error {
+	pod := &corev1.Pod{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: member.Namespace, Name: member.Name}, pod)
+	if errors.IsNotFound(err) {
+		member.Status.PodName = ""
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if pod.DeletionTimestamp.IsZero() {
+		if err := r.Delete(ctx, pod); err != nil && !errors.IsNotFound(err) {
+			return err
+		}
+	}
+	member.Status.PodName = ""
 	return nil
 }
 

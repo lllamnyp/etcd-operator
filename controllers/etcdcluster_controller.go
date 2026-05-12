@@ -88,12 +88,19 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 	active := filterActiveMembers(memberList.Items)
+	// running excludes dormant members. The cluster controller's replica
+	// accounting (`current`), readiness checks, and most scale decisions
+	// operate on this set: a dormant member has no Pod and contributes
+	// no etcd capacity, so it must not count as "we have N members" or
+	// "we need to wait for it to become Ready" — otherwise the resume
+	// flow could never decide to wake it.
+	running := filterRunningMembers(memberList.Items)
 
 	// ── First-reconcile init ──────────────────────────────────────────
 	// Combine the ClusterToken latch, initial Observed snapshot, and
 	// progress deadline into a single Status write so a brand-new cluster
 	// settles into a reconcile-ready shape in one pass.
-	current := int32(len(active))
+	current := int32(len(running))
 	now := metav1.Now()
 
 	if cluster.Status.ClusterToken == "" || cluster.Status.Observed == nil {
@@ -168,12 +175,12 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			log.Info("cluster declared paused from the start; not bootstrapping")
 			return r.updateStatus(ctx, cluster, active)
 		}
-		if current == 0 || hasPendingBootstrap(active) {
+		if current == 0 || hasPendingBootstrap(running) {
 			log.Info("bootstrapping single-node cluster")
-			return r.bootstrap(ctx, cluster, active)
+			return r.bootstrap(ctx, cluster, running)
 		}
 		log.Info("waiting for bootstrap member to form cluster")
-		return r.tryDiscoverCluster(ctx, cluster, active)
+		return r.tryDiscoverCluster(ctx, cluster, running)
 	}
 
 	// ── Scale ──────────────────────────────────────────────────────────
@@ -195,19 +202,31 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	//
 	//  1. The member controller gates pod creation on InitialCluster being
 	//     set, so the pending CR has no pod and contributes a never-Ready
-	//     member to `active`. The standard `current < desired` +
+	//     member to `running`. The standard `current < desired` +
 	//     allMembersReady gate would wait forever.
 	//  2. If the prior reconcile crashed AFTER MemberAddAsLearner but
 	//     BEFORE the patch, etcd already has a learner whose peer URL
 	//     points at the pending CR. promotePendingLearner cannot promote
 	//     that learner (no pod = no sync), so any path that promotes
 	//     first and patches second deadlocks. scaleUp patches first.
-	if hasPendingMember(active) {
+	if hasPendingMember(running) {
 		log.Info("completing pending scale-up member before further action")
 		return r.scaleUp(ctx, cluster, active)
 	}
 
 	if current < desired {
+		// Resurrection from dormant: if a dormant member is parked, wake
+		// it before doing anything else. This is the inverse of the 1→0
+		// pause step — flip spec.Dormant back to false on the same
+		// member and let the member controller bring its pod back up.
+		// The dormant member is in `active` (it has no DeletionTimestamp)
+		// but not in `running` (filtered by Dormant), which is exactly
+		// the state that puts us here: current<desired with the dormant
+		// CR sitting alongside.
+		if findDormantMember(active) != nil {
+			log.Info("waking dormant member", "desired", desired)
+			return r.scaleUp(ctx, cluster, active)
+		}
 		// Don't add another member while existing ones aren't Ready yet.
 		// Even with learner-mode adds (which don't shift voting quorum until
 		// promotion), driving a sequence of MemberAddAsLearner without
@@ -216,7 +235,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		// peers, and stacking joiners against a half-empty cluster is at
 		// best slow, at worst stalls indefinitely. Wait for everyone Ready
 		// before adding the next.
-		if !allMembersReady(active) {
+		if !allMembersReady(running) {
 			log.Info("waiting for existing members to become Ready before next scale-up step")
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
@@ -225,7 +244,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 	if current > desired {
 		log.Info("scaling down", "current", current, "desired", desired)
-		return r.scaleDown(ctx, cluster, active)
+		return r.scaleDown(ctx, cluster, running)
 	}
 
 	// ── current == desired ────────────────────────────────────────────
@@ -234,8 +253,8 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// so scaleUp won't run again on its own). We need a promote attempt
 	// here too. Cheap: list etcd once and try to promote any learner;
 	// no-op if none.
-	if cluster.Status.ClusterID != "" && len(active) > 0 {
-		endpoints := memberEndpoints(active, cluster.Name, cluster.Namespace)
+	if cluster.Status.ClusterID != "" && len(running) > 0 {
+		endpoints := memberEndpoints(running, cluster.Name, cluster.Namespace)
 		etcdClient, err := r.EtcdClientFactory(ctx, endpoints)
 		if err == nil {
 			defer etcdClient.Close()
@@ -252,7 +271,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	// ── Steady state ───────────────────────────────────────────────────
-	return r.updateStatus(ctx, cluster, active)
+	return r.updateStatus(ctx, cluster, running)
 }
 
 // ── Bootstrap ────────────────────────────────────────────────────────────
@@ -519,36 +538,28 @@ func (r *EtcdClusterReconciler) scaleUp(
 ) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
-	// Resurrection from dormant: if the cluster was scaled to zero, the
-	// last member's name was latched in status.DormantMember and its PVC
-	// was re-parented to the EtcdCluster. Re-creating the EtcdMember CR
-	// with that exact name lets the member controller adopt the parked
-	// PVC and resume the etcd process from existing data — same
-	// ClusterID, same member ID. Skip the etcd-client path; there are no
-	// peers yet (this is a single-member resurrection).
-	if cluster.Status.DormantMember != "" && len(members) == 0 {
-		return r.resurrectFromDormant(ctx, cluster)
-	}
-
-	// Defence-in-depth sweep: if DormantMember is set but live members
-	// exist, the cluster is no longer dormant — either the resurrection
-	// already happened (and resurrectFromDormant's Status() update
-	// silently lost the race against an apiserver Conflict) or the
-	// cluster was repopulated by some other path. The same sweep also
-	// runs from updateStatus, but updateStatus only fires from the
-	// current==desired branch — during a 0→N (N≥2) scale-up, the
-	// cluster sits in current<desired for many reconciles, and the
-	// field would otherwise stay stale until steady state. Clear here
-	// to keep /status honest throughout the scale-up window.
-	if cluster.Status.DormantMember != "" {
-		cluster.Status.DormantMember = ""
-		if err := r.Status().Update(ctx, cluster); err != nil {
+	// Wake from dormant: if a dormant member exists, flip its
+	// Spec.Dormant flag back to false. The member controller's
+	// reconcile loop then ensures the Pod is back up against the same
+	// PVC (which never lost its EtcdMember owner-ref). Same ClusterID,
+	// same member ID, same data — etcd resumes from the existing data
+	// dir. No name lookup, no Create-by-fixed-name, no foreign-CR
+	// adoption window to defend against.
+	if dormant := findDormantMember(members); dormant != nil {
+		log.Info("waking dormant member", "name", dormant.Name)
+		original := dormant.DeepCopy()
+		dormant.Spec.Dormant = false
+		if err := r.Patch(ctx, dormant, client.MergeFrom(original)); err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	endpoints := memberEndpoints(members, cluster.Name, cluster.Namespace)
+	// `members` passed in here is the active set (including any dormant
+	// CR, which we just handled). From this point on we only care about
+	// running (non-dormant) members for the etcd-side flow.
+	running := filterRunningMembers(members)
+	endpoints := memberEndpoints(running, cluster.Name, cluster.Namespace)
 	etcdClient, err := r.EtcdClientFactory(ctx, endpoints)
 	if err != nil {
 		log.Error(err, "cannot connect to etcd for scale-up", "endpoints", endpoints)
@@ -569,7 +580,7 @@ func (r *EtcdClusterReconciler) scaleUp(
 	// the comment in bootstrap() — GenerateName precludes name-collision
 	// adoption, but a manually-created CR or a label-matched orphan
 	// could in principle slip through; refuse rather than adopt.
-	pending := findPendingMember(members)
+	pending := findPendingMember(running)
 	if pending != nil {
 		if !metav1.IsControlledBy(pending, cluster) {
 			return ctrl.Result{}, fmt.Errorf(
@@ -720,61 +731,6 @@ func tryPromoteLearner(
 	return nil, nil
 }
 
-// resurrectFromDormant re-creates the EtcdMember CR with the name latched
-// in status.DormantMember. The parked PVC (still owned by the
-// EtcdCluster) is adopted by the member controller's ensurePVC; etcd
-// starts from the existing data dir and resumes its old ClusterID and
-// member ID. We mark Bootstrap=true so the pod's --initial-cluster-state
-// is "new" — etcd with an existing data dir reads its WAL regardless of
-// that flag, so it's effectively a no-op when the PVC is intact. (If
-// the PVC was lost between pause and resume, etcd would start a fresh
-// cluster, diverging from the latched ClusterID — that's the documented
-// "don't delete the PVC while dormant" caveat.)
-//
-// Setting Bootstrap=true on the resurrected member is also safe with
-// respect to tryDiscoverCluster's seed-by-Bootstrap lookup: discovery
-// gates entirely on ClusterID=="", and resurrection runs only when
-// ClusterID is already latched (paused clusters preserve their
-// ClusterID across the pause). So the resurrected member's Bootstrap
-// flag never re-triggers discovery.
-func (r *EtcdClusterReconciler) resurrectFromDormant(
-	ctx context.Context,
-	cluster *lll.EtcdCluster,
-) (ctrl.Result, error) {
-	log := log.FromContext(ctx)
-	name := cluster.Status.DormantMember
-	initialCluster := buildInitialCluster([]string{name}, cluster.Name, cluster.Namespace)
-
-	member := &lll.EtcdMember{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: cluster.Namespace,
-			Labels:    memberLabels(cluster.Name, name),
-		},
-		Spec: lll.EtcdMemberSpec{
-			ClusterName:    cluster.Name,
-			Version:        cluster.Status.Observed.Version,
-			Storage:        cluster.Status.Observed.Storage,
-			Bootstrap:      true,
-			InitialCluster: initialCluster,
-			ClusterToken:   cluster.Status.ClusterToken,
-		},
-	}
-	if err := controllerutil.SetControllerReference(cluster, member, r.Scheme); err != nil {
-		return ctrl.Result{}, err
-	}
-	if err := r.Create(ctx, member); err != nil && !errors.IsAlreadyExists(err) {
-		return ctrl.Result{}, err
-	}
-	log.Info("resurrected dormant cluster member", "name", name)
-
-	cluster.Status.DormantMember = ""
-	if err := r.Status().Update(ctx, cluster); err != nil {
-		return ctrl.Result{}, err
-	}
-	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-}
-
 // findPendingMember returns the first non-bootstrap CR with an empty
 // Spec.InitialCluster (the half-baked state between Create and the
 // follow-up Patch). Returns nil if none.
@@ -870,31 +826,22 @@ func (r *EtcdClusterReconciler) scaleDown(
 	})
 	victim := members[0]
 
+	// Scale-to-zero pause: the 1→0 step does NOT delete the surviving
+	// member. Instead, Patch Spec.Dormant=true; the member controller
+	// will delete the Pod and leave the PVC owned by the EtcdMember.
+	// Resurrection (the 0→1 step in scaleUp) flips Dormant back to
+	// false. Keeping the CR across the pause means no Create-by-fixed-
+	// name on resume, no PVC reparenting, no cross-resource annotation
+	// dance, and no stale status field to sweep.
 	if cluster.Status.Observed != nil && cluster.Status.Observed.Replicas == 0 && len(members) == 1 {
-		// Latch DormantMember in cluster status first — scaleUp's
-		// resurrection path reads it to know which name to recreate.
-		// Then stamp the pause annotation on the victim BEFORE Delete:
-		// the finalizer keys off that annotation rather than reading
-		// cluster.Status (cache-coherence — see helpers.go comment on
-		// PauseAnnotation). Order matters: if we crash after the status
-		// update but before annotating, the next reconcile re-enters
-		// this branch and re-runs both writes idempotently.
-		if cluster.Status.DormantMember != victim.Name {
-			cluster.Status.DormantMember = victim.Name
-			if err := r.Status().Update(ctx, cluster); err != nil {
-				return ctrl.Result{}, err
-			}
-		}
-		if victim.Annotations[PauseAnnotation] != "true" {
+		if !victim.Spec.Dormant {
 			original := victim.DeepCopy()
-			if victim.Annotations == nil {
-				victim.Annotations = map[string]string{}
-			}
-			victim.Annotations[PauseAnnotation] = "true"
+			victim.Spec.Dormant = true
 			if err := r.Patch(ctx, &victim, client.MergeFrom(original)); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
 	if err := r.Delete(ctx, &victim); err != nil && !errors.IsNotFound(err) {
@@ -918,15 +865,21 @@ func hasPendingBootstrap(members []lll.EtcdMember) bool {
 
 // ── Status ───────────────────────────────────────────────────────────────
 
+// updateStatus is called with the full active member list (non-deleted),
+// including any dormant member. It extracts the running subset for the
+// per-condition accounting and uses the dormant member separately for
+// the Paused message's PVC name.
 func (r *EtcdClusterReconciler) updateStatus(
 	ctx context.Context,
 	cluster *lll.EtcdCluster,
 	members []lll.EtcdMember,
 ) (ctrl.Result, error) {
 	desired := cluster.Status.Observed.Replicas
+	running := filterRunningMembers(members)
+	dormant := findDormantMember(members)
 
 	ready := int32(0)
-	for _, m := range members {
+	for _, m := range running {
 		for _, c := range m.Status.Conditions {
 			if c.Type == lll.MemberReady && c.Status == metav1.ConditionTrue {
 				ready++
@@ -960,8 +913,8 @@ func (r *EtcdClusterReconciler) updateStatus(
 		//     message would mislead.
 		var msg string
 		switch {
-		case cluster.Status.DormantMember != "":
-			msg = fmt.Sprintf("cluster is paused (spec.replicas=0); data is preserved on PVC data-%s", cluster.Status.DormantMember)
+		case dormant != nil:
+			msg = fmt.Sprintf("cluster is paused (spec.replicas=0); data is preserved on PVC data-%s", dormant.Name)
 		default:
 			msg = "cluster is paused (spec.replicas=0); no data has been written (cluster never bootstrapped)"
 		}
@@ -1008,7 +961,7 @@ func (r *EtcdClusterReconciler) updateStatus(
 			cluster.Status.ProgressDeadline = nil
 			changed = true
 		}
-	} else if reconciliationComplete(cluster, members) {
+	} else if reconciliationComplete(cluster, running) {
 		if setClusterCondition(cluster, lll.ClusterProgressing, metav1.ConditionFalse, "Reconciled",
 			"actual state matches status.observed") {
 			changed = true
@@ -1019,23 +972,8 @@ func (r *EtcdClusterReconciler) updateStatus(
 		}
 	}
 
-	// Stale-DormantMember sweep. If resurrectFromDormant succeeded at the
-	// Create but failed at its Status().Update (transient apiserver error,
-	// Conflict), DormantMember stays set even though a live member of that
-	// name now exists. Clean it up here so /status doesn't lie about the
-	// cluster being dormant.
-	if cluster.Status.DormantMember != "" {
-		for _, m := range members {
-			if m.Name == cluster.Status.DormantMember && m.DeletionTimestamp.IsZero() {
-				cluster.Status.DormantMember = ""
-				changed = true
-				break
-			}
-		}
-	}
-
 	brokenCount := int32(0)
-	for _, m := range members {
+	for _, m := range running {
 		if r.isBroken(m) {
 			brokenCount++
 		}
