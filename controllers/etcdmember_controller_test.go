@@ -649,10 +649,14 @@ func TestDiscoverMemberID_FallsBackToPeers(t *testing.T) {
 	ctx := context.Background()
 
 	cluster := &lll.EtcdCluster{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"}}
+	now := metav1.Now()
 	peer := &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", Labels: memberLabels("test", "test-0")},
 		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
-		Status:     lll.EtcdMemberStatus{PodName: "test-0", MemberID: "0000000000000001"},
+		Status: lll.EtcdMemberStatus{
+			PodName: "test-0", MemberID: "0000000000000001",
+			Conditions: []metav1.Condition{{Type: lll.MemberReady, Status: metav1.ConditionTrue, Reason: "PodReady", LastTransitionTime: now}},
+		},
 	}
 	target := &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-1", Namespace: "ns", Labels: memberLabels("test", "test-1")},
@@ -693,6 +697,75 @@ func TestDiscoverMemberID_FallsBackToPeers(t *testing.T) {
 	}
 	if !hasPeer {
 		t.Fatalf("discoverMemberID must include peer endpoints; got %v", capturedEndpoints)
+	}
+}
+
+// TestDiscoverMemberID_ExcludesNonReadyPeers pins the fix for issue #12:
+// when one peer is Ready (a voter) and another is still a learner (not
+// yet Ready), the endpoint list passed to clientv3 must include ONLY
+// the Ready peer. Including the learner lets clientv3 round-robin
+// MemberList to it and get back "rpc not supported for learner", which
+// wedges discovery during scale-up.
+//
+// Without the filter, this test sees both peers' URLs in the endpoint
+// list (and the operator wedges in production).
+func TestDiscoverMemberID_ExcludesNonReadyPeers(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+
+	cluster := &lll.EtcdCluster{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"}}
+	voter := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-voter", Namespace: "ns", Labels: memberLabels("test", "test-voter")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+		Status: lll.EtcdMemberStatus{
+			PodName: "test-voter", MemberID: "0000000000000001",
+			Conditions: []metav1.Condition{{Type: lll.MemberReady, Status: metav1.ConditionTrue, Reason: "PodReady", LastTransitionTime: now}},
+		},
+	}
+	learner := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-learner", Namespace: "ns", Labels: memberLabels("test", "test-learner")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+		Status: lll.EtcdMemberStatus{
+			PodName:    "test-learner", // No MemberID, no Ready=True.
+			Conditions: []metav1.Condition{{Type: lll.MemberReady, Status: metav1.ConditionFalse, Reason: "DiscoveringMemberID", LastTransitionTime: now}},
+		},
+	}
+	target := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-target", Namespace: "ns", Labels: memberLabels("test", "test-target")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+	}
+	c, _ := newTestClient(t, cluster, voter, learner, target)
+
+	const wantID uint64 = 0xfeedface
+	fe := newFakeEtcd(0xdead,
+		&etcdserverpb.Member{ID: 0x1, Name: "test-voter", PeerURLs: []string{peerURL("test-voter", "test", "ns")}},
+		&etcdserverpb.Member{ID: wantID, Name: "test-target", PeerURLs: []string{peerURL("test-target", "test", "ns")}},
+	)
+	var captured []string
+	factory := func(_ context.Context, eps []string) (EtcdClusterClient, error) {
+		captured = append([]string(nil), eps...)
+		return fe, nil
+	}
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factory}
+
+	if _, err := r.discoverMemberID(ctx, target); err != nil {
+		t.Fatalf("discoverMemberID: %v", err)
+	}
+	learnerURL := clientURL("test-learner", "test", "ns")
+	for _, ep := range captured {
+		if ep == learnerURL {
+			t.Fatalf("discoverMemberID must not pass the non-Ready learner's URL to clientv3; got %v", captured)
+		}
+	}
+	voterURL := clientURL("test-voter", "test", "ns")
+	hasVoter := false
+	for _, ep := range captured {
+		if ep == voterURL {
+			hasVoter = true
+		}
+	}
+	if !hasVoter {
+		t.Fatalf("discoverMemberID must include the Ready voter's URL; got %v", captured)
 	}
 }
 

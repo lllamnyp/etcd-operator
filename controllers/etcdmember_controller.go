@@ -609,6 +609,12 @@ func (r *EtcdMemberReconciler) updateStatus(ctx context.Context, member *lll.Etc
 // corruption, OOM, etc.) its own etcd never responds, but the rest of the
 // cluster knows perfectly well what its ID is. Falling back to self last
 // keeps single-node bootstrap working.
+//
+// Peers are filtered to ones already observed Ready (i.e. voters in etcd
+// terms). Including a still-learner peer in the endpoint list lets
+// clientv3 balance MemberList to it and get back "rpc not supported for
+// learner"; with a 5s context budget and connect-retries, that can wedge
+// the discovery even when a voter peer is also present.
 func (r *EtcdMemberReconciler) discoverMemberID(ctx context.Context, member *lll.EtcdMember) (uint64, error) {
 	memberList := &lll.EtcdMemberList{}
 	if err := r.List(ctx, memberList,
@@ -623,12 +629,18 @@ func (r *EtcdMemberReconciler) discoverMemberID(ctx context.Context, member *lll
 		if m.Name == member.Name {
 			continue
 		}
-		if m.Status.PodName != "" {
-			endpoints = append(endpoints, clientURL(m.Name, member.Spec.ClusterName, member.Namespace))
+		if m.Status.PodName == "" {
+			continue
 		}
+		if !isMemberReady(m) {
+			continue
+		}
+		endpoints = append(endpoints, clientURL(m.Name, member.Spec.ClusterName, member.Namespace))
 	}
 	// Self last — used during single-node bootstrap when there are no
-	// other peers.
+	// other peers, or when no other peer is yet Ready. Etcd handles
+	// MemberList on a single-member-voter cluster fine; the learner
+	// rejection only fires when we route past a voter to a learner.
 	endpoints = append(endpoints, clientURL(member.Name, member.Spec.ClusterName, member.Namespace))
 
 	c, err := r.EtcdClientFactory(ctx, endpoints)
