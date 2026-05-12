@@ -157,12 +157,16 @@ func testScheme(t *testing.T) *runtime.Scheme {
 func newTestClient(t *testing.T, objs ...client.Object) (client.Client, *runtime.Scheme) {
 	t.Helper()
 	s := testScheme(t)
-	// controller-runtime v0.14 has no WithStatusSubresource; Status().Update()
-	// is just Update() under the fake client. Production-side this is fine
-	// because reconcilers always go through Status().Update().
+	// Register the status subresource for our CRs. Without this,
+	// Status().Update() on a fake-client object (from v0.15+) writes to a
+	// separate store the regular Get reads from, producing surprising
+	// behaviour. The cluster controller's locking-pattern tests in
+	// particular depend on Status().Update being a real partial-update
+	// path.
 	c := fake.NewClientBuilder().
 		WithScheme(s).
 		WithObjects(objs...).
+		WithStatusSubresource(&lll.EtcdCluster{}, &lll.EtcdMember{}).
 		Build()
 	return c, s
 }
