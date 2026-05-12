@@ -1362,25 +1362,29 @@ func TestScaleUp_InitialClusterMatchesEtcdMembership(t *testing.T) {
 	)
 	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
 
+	// The orphan learner CANNOT be promoted yet — its pod doesn't exist
+	// (the member controller blocks on Spec.InitialCluster being set), so
+	// it can't catch up with the leader. Any reasonable etcd returns
+	// "learner not ready" here. Wire that error so the test pins the
+	// "patch must happen *before* promote attempts" guarantee. Without
+	// pending-completion-first ordering, scaleUp would short-circuit on
+	// MemberPromote's error and deadlock the cluster.
+	fe.promoteErr = errors.New("etcdserver: can only promote a learner member which is in sync with leader")
 	memberList := &lll.EtcdMemberList{}
 	_ = c.List(ctx, memberList, client.InNamespace("ns"))
-	// Drive the not-yet-promotable branch first to verify promote-failure
-	// doesn't lose the pending CR. (scaleUp should short-circuit cleanly.)
-	fe.promoteErr = errors.New("etcdserver: can only promote a learner member which is in sync with leader")
 	if _, err := r.scaleUp(ctx, cluster, memberList.Items); err != nil {
-		t.Fatalf("scaleUp (promote-blocked): %v", err)
-	}
-	// Now flip to the CR-completion path: pretend the learner has caught
-	// up enough to skip the promotion branch entirely.
-	fe.promoteErr = nil
-	fe.members[3].IsLearner = false
-	if _, err := r.scaleUp(ctx, cluster, memberList.Items); err != nil {
-		t.Fatalf("scaleUp (completion): %v", err)
+		t.Fatalf("scaleUp: %v", err)
 	}
 	// MemberAddAsLearner must NOT have been called — peer URL is already in
 	// etcd from the pre-crash reconcile.
 	if len(fe.addLearnerCalls) != 0 {
 		t.Fatalf("MemberAddAsLearner should not fire when peer URL already registered; got %v", fe.addLearnerCalls)
+	}
+	// MemberPromote must NOT have been called either — the orphan learner
+	// is still un-synced and a promote attempt would error out, but the
+	// pending-completion path runs first and short-circuits.
+	if len(fe.promoteCalls) != 0 {
+		t.Fatalf("MemberPromote must not fire while a pending CR exists; got %v", fe.promoteCalls)
 	}
 	// Pending CR's Spec.InitialCluster must now reflect etcd's full view
 	// (including the recovered joiner).
@@ -1391,6 +1395,81 @@ func TestScaleUp_InitialClusterMatchesEtcdMembership(t *testing.T) {
 	wantIC := buildInitialCluster([]string{"test-0", "test-1", "test-2", "test-pndng"}, "test", "ns")
 	if got.Spec.InitialCluster != wantIC {
 		t.Fatalf("Spec.InitialCluster mismatch:\n  got  %q\n  want %q", got.Spec.InitialCluster, wantIC)
+	}
+}
+
+// TestScaleUp_RecoversFromCrashBetweenAddAndPatch is the integration-level
+// counterpart of TestScaleUp_InitialClusterMatchesEtcdMembership: rather
+// than calling scaleUp directly, it runs Reconcile against the
+// post-crash state and asserts the deadlock cannot occur. The fake etcd
+// is rigged so MemberPromote always errors (the orphan learner can
+// never sync without its pod), so any reconcile path that promotes
+// before patching wedges forever. The test passes only if Reconcile
+// completes the InitialCluster patch.
+func TestScaleUp_RecoversFromCrashBetweenAddAndPatch(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns", UID: types.UID("cluster-uid")},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(4), Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			ClusterID:    "deadbeef",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 4, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
+		},
+	}
+	objs := []client.Object{cluster}
+	for i := 0; i < 3; i++ {
+		objs = append(objs, &lll.EtcdMember{
+			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("test-%d", i), Namespace: "ns", Labels: memberLabels("test", fmt.Sprintf("test-%d", i))},
+			Spec:       lll.EtcdMemberSpec{ClusterName: "test", InitialCluster: "x"},
+			Status: lll.EtcdMemberStatus{
+				PodName: fmt.Sprintf("test-%d", i), MemberID: "abc",
+				Conditions: []metav1.Condition{{Type: lll.MemberReady, Status: metav1.ConditionTrue, Reason: "PodReady", LastTransitionTime: now}},
+			},
+		})
+	}
+	tru := true
+	pending := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-pndng", Namespace: "ns", Labels: clusterLabels("test"),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "lllamnyp.su/v1alpha2", Kind: "EtcdCluster",
+				Name: "test", UID: types.UID("cluster-uid"), Controller: &tru,
+			}},
+		},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			ClusterToken: "ns-test-x",
+		},
+	}
+	objs = append(objs, pending)
+	c, _ := newTestClient(t, objs...)
+	fe := newFakeEtcd(0xdeadbeef,
+		&etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa02, Name: "test-1", PeerURLs: []string{peerURL("test-1", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa03, Name: "test-2", PeerURLs: []string{peerURL("test-2", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa04, Name: "", PeerURLs: []string{peerURL("test-pndng", "test", "ns")}, IsLearner: true},
+	)
+	// Promote always errors — the orphan learner is permanently stuck
+	// until its pod comes up (which requires the InitialCluster patch).
+	fe.promoteErr = errors.New("etcdserver: can only promote a learner member which is in sync with leader")
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test", Namespace: "ns"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	got := mustGet(t, c, "test-pndng", "ns", &lll.EtcdMember{})
+	if got.Spec.InitialCluster == "" {
+		t.Fatalf("pending CR's Spec.InitialCluster was not patched — deadlock would result in production")
+	}
+	if len(fe.addLearnerCalls) != 0 {
+		t.Fatalf("MemberAddAsLearner should not fire when peer URL already registered; got %v", fe.addLearnerCalls)
 	}
 }
 
