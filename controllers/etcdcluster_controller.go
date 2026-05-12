@@ -148,6 +148,14 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// corrupt that consensus.
 	if cluster.Status.ClusterID == "" {
 		// Pre-bootstrap fan-out:
+		//  - observed.replicas == 0: user declared the cluster as paused
+		//    from the start. Do NOT bootstrap a transient seed only to
+		//    immediately tear it down — that would waste a pod + image
+		//    pull + PVC write, surface a fleeting ClusterID for a cluster
+		//    that was never used, and produce a misleading event sequence.
+		//    Fall through to updateStatus, which has a Paused branch.
+		//    The first non-zero spec the user submits will snapshot into
+		//    observed and the bootstrap branch will fire then.
 		//  - current == 0: fresh cluster, no seed yet → bootstrap() creates it.
 		//  - hasPendingBootstrap: seed CR exists with empty InitialCluster
 		//    (crash between Create and Patch) → bootstrap() completes it;
@@ -156,6 +164,10 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		//    InitialCluster is set.
 		//  - Else: seed CR exists, fully wired, pod is coming up — proceed
 		//    to discovery to latch ClusterID once etcd answers.
+		if desired == 0 {
+			log.Info("cluster declared paused from the start; not bootstrapping")
+			return r.updateStatus(ctx, cluster, active)
+		}
 		if current == 0 || hasPendingBootstrap(active) {
 			log.Info("bootstrapping single-node cluster")
 			return r.bootstrap(ctx, cluster, active)
@@ -886,7 +898,29 @@ func (r *EtcdClusterReconciler) updateStatus(
 		changed = true
 	}
 
+	// "Paused" is a distinct steady state from "Reconciled with N healthy
+	// members". An empty cluster cannot serve a single request, so
+	// reporting Available=True/QuorumHealthy would mislead anything
+	// gating on the Available condition (alerting, GitOps health checks,
+	// downstream operators that wait for Available=True). The Paused
+	// branch takes precedence over the health switch below and also
+	// overrides the Reconciled-Progressing override further down.
+	paused := desired == 0
 	switch {
+	case paused:
+		msg := "cluster is paused (spec.replicas=0); data is preserved on the EtcdCluster-owned PVC"
+		if cluster.Status.DormantMember != "" {
+			msg = fmt.Sprintf("cluster is paused (spec.replicas=0); data is preserved on PVC data-%s", cluster.Status.DormantMember)
+		}
+		if setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionFalse, "Paused", msg) {
+			changed = true
+		}
+		if setClusterCondition(cluster, lll.ClusterDegraded, metav1.ConditionFalse, "Paused", "") {
+			changed = true
+		}
+		if setClusterCondition(cluster, lll.ClusterProgressing, metav1.ConditionFalse, "Paused", "") {
+			changed = true
+		}
 	case ready == desired:
 		if setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionTrue, "QuorumHealthy", "All members are ready") {
 			changed = true
@@ -912,7 +946,16 @@ func (r *EtcdClusterReconciler) updateStatus(
 		}
 	}
 
-	if reconciliationComplete(cluster, members) {
+	// Skip the Reconciled-Progressing override when paused — the Paused
+	// branch above already set Progressing=False/Paused, which is the
+	// truthful signal. Still clear ProgressDeadline so a stale value
+	// doesn't trigger a deadline-exceeded escalation on a paused cluster.
+	if paused {
+		if cluster.Status.ProgressDeadline != nil {
+			cluster.Status.ProgressDeadline = nil
+			changed = true
+		}
+	} else if reconciliationComplete(cluster, members) {
 		if setClusterCondition(cluster, lll.ClusterProgressing, metav1.ConditionFalse, "Reconciled",
 			"actual state matches status.observed") {
 			changed = true
@@ -920,6 +963,21 @@ func (r *EtcdClusterReconciler) updateStatus(
 		if cluster.Status.ProgressDeadline != nil {
 			cluster.Status.ProgressDeadline = nil
 			changed = true
+		}
+	}
+
+	// Stale-DormantMember sweep. If resurrectFromDormant succeeded at the
+	// Create but failed at its Status().Update (transient apiserver error,
+	// Conflict), DormantMember stays set even though a live member of that
+	// name now exists. Clean it up here so /status doesn't lie about the
+	// cluster being dormant.
+	if cluster.Status.DormantMember != "" {
+		for _, m := range members {
+			if m.Name == cluster.Status.DormantMember && m.DeletionTimestamp.IsZero() {
+				cluster.Status.DormantMember = ""
+				changed = true
+				break
+			}
 		}
 	}
 
@@ -1185,7 +1243,12 @@ func reconciliationComplete(cluster *lll.EtcdCluster, members []lll.EtcdMember) 
 	if int32(len(members)) != cluster.Status.Observed.Replicas {
 		return false
 	}
-	if cluster.Status.ClusterID == "" {
+	// ClusterID is required only when there should be members. A paused
+	// or fresh-at-zero cluster has nothing to latch a ClusterID against
+	// (there is no etcd process running), and waiting for one would
+	// prevent the spec-change-adoption path from ever firing when the
+	// user scales replicas back up from 0.
+	if cluster.Status.Observed.Replicas > 0 && cluster.Status.ClusterID == "" {
 		return false
 	}
 	for _, m := range members {

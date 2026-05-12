@@ -70,7 +70,7 @@ The member controller refuses to start a Pod while `spec.initialCluster` is empt
 Setting `spec.replicas: 0` "pauses" the cluster rather than dismantling it. The 1→0 transition is handled differently from any other scale-down step:
 
 1. **Cluster controller** (in `scaleDown`): when it sees `desired == 0 && len(members) == 1`, it latches the surviving member's name in `status.dormantMember` and then deletes the `EtcdMember` CR.
-2. **Member controller** (in the finalizer for that CR): notices the parent `EtcdCluster` has `status.observed.replicas == 0` and treats the deletion as a pause: re-parents the data PVC (`data-<name>`) so the EtcdCluster becomes its sole owner-controller, and skips `MemberRemove` so etcd's local data dir is left intact.
+2. **Member controller** (in the finalizer for that CR): notices that `EtcdCluster.status.dormantMember` equals this member's name — the cluster controller only latches that field on the actual 1→0 step, so the signal is precise — and treats the deletion as a pause: re-parents the data PVC (`data-<name>`) so the EtcdCluster becomes its sole owner-controller, and skips `MemberRemove` so etcd's local data dir is left intact. Note that this is deliberately *not* keyed off `status.observed.replicas == 0` — that would also be true during intermediate steps (3→2, 2→1) and the pause path would wrongly fire for every member of an N→0 descent. See `TestHandleDeletion_IntermediateScaleDownStillCallsMemberRemove` for the regression guard.
 3. **Cascade GC** removes the EtcdMember and its Pod; the PVC stays — its only owner-controller is now the EtcdCluster, which still exists.
 
 The reverse transition (`spec.replicas: 0 → >= 1`) is "resurrection":
