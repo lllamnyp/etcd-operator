@@ -821,5 +821,271 @@ func TestReconcile_WaitsForInitialClusterPatch(t *testing.T) {
 	}
 }
 
+// TestHandleDeletion_ScaleToZeroReparentsPVCAndSkipsMemberRemove covers
+// the pause half of scale-to-zero. When the EtcdCluster's
+// status.observed.replicas is 0, deleting an EtcdMember must:
+//   - Re-parent its data PVC to the EtcdCluster (so cascade GC doesn't
+//     take it),
+//   - Skip MemberRemove (we want etcd's local data dir intact for
+//     resurrection).
+//
+// The same finalizer behaviour fires regardless of which member is
+// being deleted — but the scaleDown path only enters scale-to-zero on
+// the 1→0 step.
+func TestHandleDeletion_ScaleToZeroReparentsPVCAndSkipsMemberRemove(t *testing.T) {
+	ctx := context.Background()
+	tru := true
+
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test", Namespace: "ns", UID: types.UID("cluster-uid"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			ClusterID:    "deadbeef",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 0, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+			// The cluster controller's scaleDown latches DormantMember on
+			// the actual 1→0 step (len(members)==1). That latch is the
+			// signal the finalizer keys off to take the pause path.
+			DormantMember: "test-saved1",
+		},
+	}
+	now := metav1.Now()
+	member := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-saved1", Namespace: "ns", UID: types.UID("member-uid"),
+			DeletionTimestamp: &now,
+			Finalizers:        []string{MemberFinalizer},
+			Labels:            memberLabels("test", "test-saved1"),
+		},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			InitialCluster: "x", ClusterToken: "ns-test-x", Bootstrap: true,
+		},
+		Status: lll.EtcdMemberStatus{MemberID: "0000000000000001", PodName: "test-saved1"},
+	}
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "data-test-saved1", Namespace: "ns",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "lllamnyp.su/v1alpha2", Kind: "EtcdMember",
+				Name: "test-saved1", UID: types.UID("member-uid"), Controller: &tru, BlockOwnerDeletion: &tru,
+			}},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+			},
+		},
+	}
+	c, _ := newTestClient(t, cluster, member, pvc)
+	fe := newFakeEtcd(0xdeadbeef, &etcdserverpb.Member{
+		ID: 0x1, Name: "test-saved1", PeerURLs: []string{peerURL("test-saved1", "test", "ns")},
+	})
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
+
+	if _, err := r.handleDeletion(ctx, member); err != nil {
+		t.Fatalf("handleDeletion: %v", err)
+	}
+	// MemberRemove must NOT have been called — etcd state must be intact.
+	if len(fe.removeCalls) != 0 {
+		t.Fatalf("MemberRemove should be skipped on scale-to-zero; got %v", fe.removeCalls)
+	}
+	// PVC's controller-owner must now be the EtcdCluster, not the EtcdMember.
+	got := mustGet(t, c, "data-test-saved1", "ns", &corev1.PersistentVolumeClaim{})
+	if !metav1.IsControlledBy(got, cluster) {
+		t.Fatalf("PVC controller-owner = %v, want EtcdCluster", got.OwnerReferences)
+	}
+	for _, o := range got.OwnerReferences {
+		if o.Kind == "EtcdMember" {
+			t.Fatalf("PVC should no longer reference the EtcdMember as an owner; got %+v", got.OwnerReferences)
+		}
+	}
+}
+
+// TestHandleDeletion_IntermediateScaleDownStillCallsMemberRemove pins the
+// fix for a subtle bug: when going N→0 the user has set spec.replicas=0
+// and the locking pattern reflects that as status.observed.replicas=0
+// for the duration of the multi-step descent. But only the FINAL step
+// (1→0) is a "pause". Intermediate steps (3→2, 2→1) still need to call
+// MemberRemove or etcd is left with phantom voting members the operator
+// can no longer reach.
+//
+// The cluster controller distinguishes by only setting
+// status.DormantMember when len(members)==1; the member-controller
+// finalizer keys off that exact signal rather than on observed.replicas.
+func TestHandleDeletion_IntermediateScaleDownStillCallsMemberRemove(t *testing.T) {
+	ctx := context.Background()
+	tru := true
+
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test", Namespace: "ns", UID: types.UID("cluster-uid"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			ClusterID:    "deadbeef",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 0, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+			// DormantMember intentionally empty — this is an intermediate
+			// step (3→2 or 2→1), not the final 1→0.
+		},
+	}
+	now := metav1.Now()
+	survivor := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-keep1", Namespace: "ns", UID: types.UID("keep-uid"),
+			Labels: memberLabels("test", "test-keep1"),
+		},
+		Spec:   lll.EtcdMemberSpec{ClusterName: "test", InitialCluster: "x", ClusterToken: "ns-test-x"},
+		Status: lll.EtcdMemberStatus{PodName: "test-keep1", MemberID: "00000000000000a1"},
+	}
+	victim := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-gone1", Namespace: "ns", UID: types.UID("gone-uid"),
+			DeletionTimestamp: &now,
+			Finalizers:        []string{MemberFinalizer},
+			Labels:            memberLabels("test", "test-gone1"),
+		},
+		Spec:   lll.EtcdMemberSpec{ClusterName: "test", InitialCluster: "x", ClusterToken: "ns-test-x"},
+		Status: lll.EtcdMemberStatus{PodName: "test-gone1", MemberID: "00000000000000b2"},
+	}
+	victimPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "data-test-gone1", Namespace: "ns",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "lllamnyp.su/v1alpha2", Kind: "EtcdMember",
+				Name: "test-gone1", UID: types.UID("gone-uid"), Controller: &tru, BlockOwnerDeletion: &tru,
+			}},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+			},
+		},
+	}
+	c, _ := newTestClient(t, cluster, survivor, victim, victimPVC)
+	fe := newFakeEtcd(0xdeadbeef,
+		&etcdserverpb.Member{ID: 0xa1, Name: "test-keep1", PeerURLs: []string{peerURL("test-keep1", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xb2, Name: "test-gone1", PeerURLs: []string{peerURL("test-gone1", "test", "ns")}},
+	)
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
+
+	if _, err := r.handleDeletion(ctx, victim); err != nil {
+		t.Fatalf("handleDeletion: %v", err)
+	}
+	// MemberRemove MUST have fired — etcd's voter set must shrink.
+	if len(fe.removeCalls) != 1 || fe.removeCalls[0] != 0xb2 {
+		t.Fatalf("MemberRemove(0xb2) expected on intermediate scale-down; got %v", fe.removeCalls)
+	}
+	// PVC's controller-owner must remain the EtcdMember (its own pre-existing
+	// owner ref). Cluster-reparenting is the pause path; we must not have
+	// taken it.
+	got := mustGet(t, c, "data-test-gone1", "ns", &corev1.PersistentVolumeClaim{})
+	if metav1.IsControlledBy(got, cluster) {
+		t.Fatalf("PVC must NOT be reparented to cluster on intermediate scale-down; got %+v", got.OwnerReferences)
+	}
+}
+
+// TestEnsurePVC_AdoptsClusterOwnedOnResurrection covers the resume half
+// of scale-to-zero. A PVC controlled by the EtcdCluster (parked at
+// pause time) must be adopted by the fresh EtcdMember that carries the
+// dormant name. The reparented PVC has its OwnerReferences replaced
+// with a single ref to the new EtcdMember; the data dir is preserved.
+func TestEnsurePVC_AdoptsClusterOwnedOnResurrection(t *testing.T) {
+	ctx := context.Background()
+	tru := true
+
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns", UID: types.UID("cluster-uid")},
+	}
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "data-test-saved1", Namespace: "ns",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "lllamnyp.su/v1alpha2", Kind: "EtcdCluster",
+				Name: "test", UID: types.UID("cluster-uid"), Controller: &tru, BlockOwnerDeletion: &tru,
+			}},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+			},
+		},
+	}
+	member := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-saved1", Namespace: "ns", UID: types.UID("fresh-member-uid"),
+			Labels: memberLabels("test", "test-saved1"),
+		},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			InitialCluster: "x", ClusterToken: "ns-test-x", Bootstrap: true,
+		},
+	}
+	c, _ := newTestClient(t, cluster, member, pvc)
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t)}
+
+	if err := r.ensurePVC(ctx, member); err != nil {
+		t.Fatalf("ensurePVC must adopt cluster-owned PVC on resurrection: %v", err)
+	}
+	got := mustGet(t, c, "data-test-saved1", "ns", &corev1.PersistentVolumeClaim{})
+	if !metav1.IsControlledBy(got, member) {
+		t.Fatalf("PVC controller-owner = %v, want EtcdMember %q", got.OwnerReferences, member.Name)
+	}
+	for _, o := range got.OwnerReferences {
+		if o.Kind == "EtcdCluster" {
+			t.Fatalf("PVC should no longer reference the EtcdCluster as an owner; got %+v", got.OwnerReferences)
+		}
+	}
+	if member.Status.PVCName != "data-test-saved1" {
+		t.Fatalf("member.Status.PVCName = %q, want %q", member.Status.PVCName, "data-test-saved1")
+	}
+}
+
+// TestEnsurePVC_RefusesForeignClusterOwnedPVC: defence-in-depth — a PVC
+// controlled by a DIFFERENT EtcdCluster (same namespace, different
+// cluster.Name or different UID — both indicate a stale or cross-cluster
+// owner) must not be adopted as ours.
+func TestEnsurePVC_RefusesForeignClusterOwnedPVC(t *testing.T) {
+	ctx := context.Background()
+	tru := true
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "data-test-saved1", Namespace: "ns",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "lllamnyp.su/v1alpha2", Kind: "EtcdCluster",
+				Name: "other-cluster", UID: types.UID("other-uid"), Controller: &tru, BlockOwnerDeletion: &tru,
+			}},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+			},
+		},
+	}
+	member := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-saved1", Namespace: "ns", UID: types.UID("fresh-member-uid"),
+			Labels: memberLabels("test", "test-saved1"),
+		},
+		Spec: lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"), InitialCluster: "x", ClusterToken: "ns-test-x"},
+	}
+	c, _ := newTestClient(t, member, pvc)
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t)}
+
+	if err := r.ensurePVC(ctx, member); err == nil {
+		t.Fatalf("ensurePVC should refuse a PVC owned by a different EtcdCluster")
+	}
+}
+
 // silence unused imports
 var _ = ctrl.Result{}

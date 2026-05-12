@@ -841,6 +841,161 @@ func TestScaleDown_PicksMostRecentlyCreatedVictim(t *testing.T) {
 	}
 }
 
+// TestScaleDown_OneToZeroSetsDormantMember covers the scale-to-zero
+// "pause" path. When desired=0 and only one member remains, scaleDown
+// must record the surviving member's name in status.DormantMember
+// BEFORE deleting the EtcdMember CR — that name is what
+// resurrectFromDormant looks up on the next scale-up.
+//
+// The companion behaviour (PVC reparenting, MemberRemove skipped) lives
+// in the member-controller finalizer and is tested separately.
+func TestScaleDown_OneToZeroSetsDormantMember(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(0),
+			Version:  "3.5.17",
+			Storage:  quickQty(t, "1Gi"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			ClusterID:    "deadbeef",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 0, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
+		},
+	}
+	seed := lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-seed1", Namespace: "ns",
+			CreationTimestamp: metav1.Now(),
+			Labels:            memberLabels("test", "test-seed1"),
+		},
+		Spec: lll.EtcdMemberSpec{ClusterName: "test", InitialCluster: "x", Bootstrap: true},
+	}
+	c, _ := newTestClient(t, cluster, &seed)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead))}
+
+	if _, err := r.scaleDown(ctx, cluster, []lll.EtcdMember{seed}); err != nil {
+		t.Fatalf("scaleDown: %v", err)
+	}
+	mustGet(t, c, "test", "ns", cluster)
+	if cluster.Status.DormantMember != "test-seed1" {
+		t.Fatalf("status.DormantMember = %q, want %q", cluster.Status.DormantMember, "test-seed1")
+	}
+	// The EtcdMember CR is deleted; in production the finalizer would
+	// run first to reparent the PVC. The fake client (no finalizer)
+	// deletes immediately.
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "test-seed1"}, &lll.EtcdMember{}); err == nil {
+		t.Fatalf("EtcdMember should have been deleted after scaleDown 1->0")
+	} else if !apierrors.IsNotFound(err) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestScaleUp_ResurrectsDormant covers the scale-back-up path. When
+// status.DormantMember is set and there are no live members,
+// resurrectFromDormant must recreate the EtcdMember with that exact name
+// (not via GenerateName) so the parked PVC is adoptable. Bootstrap=true
+// is preserved because the resurrected member is the cluster's sole
+// member and its --initial-cluster lists only itself; DormantMember is
+// cleared once the CR is in place.
+func TestScaleUp_ResurrectsDormant(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns", UID: types.UID("cluster-uid")},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(1),
+			Version:  "3.5.17",
+			Storage:  quickQty(t, "1Gi"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken:  "ns-test-x",
+			ClusterID:     "deadbeef",
+			DormantMember: "test-saved1",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 1, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
+		},
+	}
+	c, _ := newTestClient(t, cluster)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead))}
+
+	if _, err := r.scaleUp(ctx, cluster, nil); err != nil {
+		t.Fatalf("scaleUp resurrection: %v", err)
+	}
+	got := mustGet(t, c, "test-saved1", "ns", &lll.EtcdMember{})
+	if got.Name != "test-saved1" {
+		t.Fatalf("resurrected member name = %q, want %q", got.Name, "test-saved1")
+	}
+	if !got.Spec.Bootstrap {
+		t.Fatalf("resurrected member must have Bootstrap=true (sole member, --initial-cluster lists only itself)")
+	}
+	if got.Spec.InitialCluster == "" {
+		t.Fatalf("resurrected member must have InitialCluster set so the member controller can start the pod")
+	}
+	if !metav1.IsControlledBy(got, cluster) {
+		t.Fatalf("resurrected member must be controlled by the EtcdCluster")
+	}
+	mustGet(t, c, "test", "ns", cluster)
+	if cluster.Status.DormantMember != "" {
+		t.Fatalf("DormantMember should be cleared after resurrection; got %q", cluster.Status.DormantMember)
+	}
+}
+
+// TestScaleUp_NoResurrectionWhenMembersExist: resurrection should not
+// fire if there are already live members (defensive guard). This is the
+// "user manually pre-seeded an EtcdMember while a DormantMember pointer
+// was stale" scenario.
+func TestScaleUp_NoResurrectionWhenMembersExist(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns", UID: types.UID("cluster-uid")},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(2),
+			Version:  "3.5.17",
+			Storage:  quickQty(t, "1Gi"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken:  "ns-test-x",
+			ClusterID:     "deadbeef",
+			DormantMember: "test-saved1",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 2, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
+		},
+	}
+	existing := lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-exist1", Namespace: "ns",
+			Labels: memberLabels("test", "test-exist1"),
+		},
+		Spec: lll.EtcdMemberSpec{ClusterName: "test", InitialCluster: "x", Bootstrap: true},
+		Status: lll.EtcdMemberStatus{
+			PodName: "test-exist1", MemberID: "abc",
+			Conditions: []metav1.Condition{{Type: lll.MemberReady, Status: metav1.ConditionTrue, Reason: "PodReady", LastTransitionTime: metav1.Now()}},
+		},
+	}
+	c, _ := newTestClient(t, cluster, &existing)
+	fe := newFakeEtcd(0xdeadbeef, &etcdserverpb.Member{ID: 0xa01, Name: "test-exist1", PeerURLs: []string{peerURL("test-exist1", "test", "ns")}})
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
+
+	// Members slice has 1 element → resurrection guard sees len(members) != 0 → skip.
+	if _, err := r.scaleUp(ctx, cluster, []lll.EtcdMember{existing}); err != nil {
+		t.Fatalf("scaleUp: %v", err)
+	}
+	// test-saved1 must NOT exist — resurrection should have been skipped.
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "test-saved1"}, &lll.EtcdMember{}); err == nil {
+		t.Fatalf("dormant resurrection should be skipped when live members exist")
+	} else if !apierrors.IsNotFound(err) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 // TestScaleDown_WaitsForInFlightDeletion covers reviewer issue #3: while one
 // EtcdMember is being deleted (DeletionTimestamp set, finalizer pending), no
 // further deletion may be issued. Concurrent finalizers running MemberRemove

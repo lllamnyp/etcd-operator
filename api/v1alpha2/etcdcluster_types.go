@@ -34,7 +34,11 @@ const (
 // EtcdClusterSpec defines the desired state of an etcd cluster.
 type EtcdClusterSpec struct {
 	// Replicas is the desired number of cluster members. Should be odd.
-	// +kubebuilder:validation:Minimum=1
+	// A value of 0 parks the cluster ("scale to zero"): the last member's
+	// name is latched in status.dormantMember and its PVC is preserved by
+	// being re-parented to the EtcdCluster, so a later scale-up to >=1
+	// resurrects the same member with the same ClusterID and data.
+	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:default=3
 	// +optional
 	Replicas *int32 `json:"replicas,omitempty"`
@@ -118,6 +122,17 @@ type EtcdClusterStatus struct {
 	// Conditions represent the latest available observations of the cluster's state.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// DormantMember is the name of the last EtcdMember that existed before
+	// the cluster scaled to zero replicas. Its PVC has been re-parented to
+	// this EtcdCluster so cascading GC leaves it in place. When the cluster
+	// is scaled back up to >=1 replica, the operator recreates an
+	// EtcdMember with this exact name (not via GenerateName), the
+	// pre-existing PVC is adopted, and the etcd process resumes from its
+	// existing data dir — preserving ClusterID, member IDs, and the raft
+	// log. Empty in the normal (non-dormant) state.
+	// +optional
+	DormantMember string `json:"dormantMember,omitempty"`
 }
 
 // +kubebuilder:object:root=true

@@ -507,6 +507,17 @@ func (r *EtcdClusterReconciler) scaleUp(
 ) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
+	// Resurrection from dormant: if the cluster was scaled to zero, the
+	// last member's name was latched in status.DormantMember and its PVC
+	// was re-parented to the EtcdCluster. Re-creating the EtcdMember CR
+	// with that exact name lets the member controller adopt the parked
+	// PVC and resume the etcd process from existing data — same
+	// ClusterID, same member ID. Skip the etcd-client path; there are no
+	// peers yet (this is a single-member resurrection).
+	if cluster.Status.DormantMember != "" && len(members) == 0 {
+		return r.resurrectFromDormant(ctx, cluster)
+	}
+
 	endpoints := memberEndpoints(members, cluster.Name, cluster.Namespace)
 	etcdClient, err := r.EtcdClientFactory(ctx, endpoints)
 	if err != nil {
@@ -679,6 +690,54 @@ func tryPromoteLearner(
 	return nil, nil
 }
 
+// resurrectFromDormant re-creates the EtcdMember CR with the name latched
+// in status.DormantMember. The parked PVC (still owned by the
+// EtcdCluster) is adopted by the member controller's ensurePVC; etcd
+// starts from the existing data dir and resumes its old ClusterID and
+// member ID. We mark Bootstrap=true so the pod's --initial-cluster-state
+// is "new" — etcd with an existing data dir reads its WAL regardless of
+// that flag, so it's effectively a no-op when the PVC is intact. (If
+// the PVC was lost between pause and resume, etcd would start a fresh
+// cluster, diverging from the latched ClusterID — that's the documented
+// "don't delete the PVC while dormant" caveat.)
+func (r *EtcdClusterReconciler) resurrectFromDormant(
+	ctx context.Context,
+	cluster *lll.EtcdCluster,
+) (ctrl.Result, error) {
+	log := log.FromContext(ctx)
+	name := cluster.Status.DormantMember
+	initialCluster := buildInitialCluster([]string{name}, cluster.Name, cluster.Namespace)
+
+	member := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: cluster.Namespace,
+			Labels:    memberLabels(cluster.Name, name),
+		},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName:    cluster.Name,
+			Version:        cluster.Status.Observed.Version,
+			Storage:        cluster.Status.Observed.Storage,
+			Bootstrap:      true,
+			InitialCluster: initialCluster,
+			ClusterToken:   cluster.Status.ClusterToken,
+		},
+	}
+	if err := controllerutil.SetControllerReference(cluster, member, r.Scheme); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.Create(ctx, member); err != nil && !errors.IsAlreadyExists(err) {
+		return ctrl.Result{}, err
+	}
+	log.Info("resurrected dormant cluster member", "name", name)
+
+	cluster.Status.DormantMember = ""
+	if err := r.Status().Update(ctx, cluster); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+}
+
 // findPendingMember returns the first non-bootstrap CR with an empty
 // Spec.InitialCluster (the half-baked state between Create and the
 // follow-up Patch). Returns nil if none.
@@ -751,6 +810,15 @@ func allMembersReady(members []lll.EtcdMember) bool {
 // most recently added scale-up step before touching older members.
 // Tiebreak by name so two members created in the same second produce a
 // deterministic choice.
+//
+// The 1→0 transition is special: it is a "pause" rather than a removal.
+// Before deleting the last EtcdMember CR, we record its name in
+// status.DormantMember so the next scale-up can resurrect the same
+// member (preserving ClusterID, member ID, and the raft log). The
+// member controller's finalizer then re-parents the PVC to the
+// EtcdCluster so cascade GC leaves it in place, and skips MemberRemove
+// because there are no peers to remove from and we want etcd's local
+// data dir intact.
 func (r *EtcdClusterReconciler) scaleDown(
 	ctx context.Context,
 	cluster *lll.EtcdCluster,
@@ -764,6 +832,15 @@ func (r *EtcdClusterReconciler) scaleDown(
 		return members[i].Name > members[j].Name
 	})
 	victim := members[0]
+
+	if cluster.Status.Observed != nil && cluster.Status.Observed.Replicas == 0 && len(members) == 1 {
+		if cluster.Status.DormantMember != victim.Name {
+			cluster.Status.DormantMember = victim.Name
+			if err := r.Status().Update(ctx, cluster); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+	}
 
 	if err := r.Delete(ctx, &victim); err != nil && !errors.IsNotFound(err) {
 		return ctrl.Result{}, err
