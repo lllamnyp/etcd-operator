@@ -13,13 +13,15 @@ There is **no StatefulSet**. Each member's Pod and PVC are reconciled independen
 
 The cluster controller decides *which* members exist and orchestrates `MemberAddAsLearner` / `MemberPromote` / `MemberRemove` against the running etcd cluster. The member controller decides *how* a member becomes real — Pod, PVC, etcd flags — and reports observed facts (memberID, readiness) up to its CR's status.
 
-Bootstrap is single-member: the operator creates one seed (`<cluster>-0`) with `--initial-cluster-state=new` and `--initial-cluster` listing only itself. Once etcd reports that member's ID and the cluster ID, additional members are added one at a time via `MemberAddAsLearner` and then `MemberPromote` once each has caught up — voting quorum doesn't shift until promotion, so an unreachable joiner can never destabilise the existing cluster.
+Bootstrap is single-member: the operator creates one seed (an `EtcdMember` with `spec.bootstrap=true`) with `--initial-cluster-state=new` and `--initial-cluster` listing only itself. Once etcd reports that member's ID and the cluster ID, additional members are added one at a time via `MemberAddAsLearner` and then `MemberPromote` once each has caught up — voting quorum doesn't shift until promotion, so an unreachable joiner can never destabilise the existing cluster.
+
+`EtcdMember` CRs are created with `ObjectMeta.GenerateName="<cluster>-"`, so each member's name is an apiserver-assigned random suffix (e.g. `mycluster-7xq2k`). Seed identity is anchored on `spec.bootstrap=true`, not on a predictable name; cross-incarnation safety (delete a cluster, create another of the same name) holds at every layer: the cluster ID is randomised by etcd, the `clusterToken` includes the EtcdCluster's UID, and member names diverge across incarnations.
 
 ## What's supported today
 
-- Bootstrap of new clusters. The operator always creates exactly one seed member (`<cluster>-0`) with `--initial-cluster-state=new`. After the seed is up and the cluster ID is latched, additional members are added one at a time as learners (`MemberAddAsLearner`) and promoted (`MemberPromote`) once etcd reports they've caught up, until `spec.replicas` is reached. Scale-up waits for every existing member to report `Ready=True` before starting the next step.
-- Scale up: cluster controller calls `MemberAddAsLearner`, creates an `EtcdMember` whose pod joins as a learner with `--initial-cluster-state=existing`, then promotes the learner once etcd allows it.
-- Scale down: cluster controller deletes the highest-ordinal `EtcdMember`. A finalizer on the deleted member calls `MemberRemove` against remaining peers before the Pod and PVC go away.
+- Bootstrap of new clusters. The operator always creates exactly one seed member (`spec.bootstrap=true`) with `--initial-cluster-state=new`. After the seed is up and the cluster ID is latched, additional members are added one at a time as learners (`MemberAddAsLearner`) and promoted (`MemberPromote`) once etcd reports they've caught up, until `spec.replicas` is reached. Scale-up waits for every existing member to report `Ready=True` before starting the next step.
+- Scale up: cluster controller Creates the new `EtcdMember` CR via `GenerateName`, then calls `MemberAddAsLearner` for the assigned name's peer URL, then Patches the CR's `spec.initialCluster` from etcd's authoritative member list. The member controller starts the Pod only once `spec.initialCluster` is set — see "Create-then-Patch" below.
+- Scale down: cluster controller deletes the most-recently-created `EtcdMember` (`CreationTimestamp` DESC, name DESC tiebreak). The seed and oldest non-seed members are preserved. A finalizer on the deleted member calls `MemberRemove` against remaining peers before the Pod and PVC go away.
 - Pod restart / node failure: data PVC is preserved, the new Pod reads the existing WAL and rejoins with the same member ID.
 - Cluster deletion: cascading owner refs clean up everything; finalizers detect "the whole cluster is going away" and skip etcd-side removal to avoid deadlock.
 
@@ -49,7 +51,17 @@ No TLS. No auth/RBAC inside etcd. No version upgrades — changing `spec.version
 | `conditions[]` | `Available`, `Progressing`, `Degraded`. |
 
 ### EtcdMember spec (operator-managed)
-`clusterName`, `version`, `storage`, `bootstrap` (bool), `initialCluster` (the `--initial-cluster` flag value), `clusterToken`. All copied from the cluster at creation time so the member controller is self-contained.
+`clusterName`, `version`, `storage`, `bootstrap` (bool), `initialCluster` (the `--initial-cluster` flag value), `clusterToken`. Names are apiserver-assigned via `GenerateName="<cluster>-"`. All fields except `initialCluster` are populated at Create time; `initialCluster` is filled in by a follow-up Patch — see "Create-then-Patch" below.
+
+### Create-then-Patch
+
+Because each member's `--initial-cluster` flag contains its own name and we don't know that name until the apiserver assigns it via `GenerateName`, the cluster controller drives every member through three steps in order:
+
+1. **Create** the `EtcdMember` CR with `GenerateName`, an empty `spec.initialCluster`, and (for the seed) `spec.bootstrap=true`.
+2. **MemberAddAsLearner** (skipped for the seed; skipped on scale-up too if the peer URL is already registered, i.e. crash recovery) using the assigned name's peer URL.
+3. **Patch** `spec.initialCluster` from etcd's authoritative member list.
+
+The member controller refuses to start a Pod while `spec.initialCluster` is empty, so a transient "pending" CR (between steps 1 and 3) never reaches the data plane. If a reconcile crashes between any two steps the next reconcile adopts the pending CR and resumes — see the cluster-controller comments for the exact recovery branches. Operators inspecting the cluster mid-reconcile may see CRs with empty `spec.initialCluster`; that is the intentional transient state, not corruption.
 
 ### EtcdMember status
 `memberID` (hex), `podName`, `pvcName`, `conditions[]` (`Ready`).
@@ -58,7 +70,7 @@ No TLS. No auth/RBAC inside etcd. No version upgrades — changing `spec.version
 
 A naive operator would re-read `spec` every reconcile and start acting on every change. That breaks etcd in two well-known ways:
 
-1. **Mid-bootstrap replica change** — etcd requires every bootstrapping member to start with an identical `--initial-cluster` flag. If the user edits `spec.replicas` between member-0 and member-2 being created, etcd refuses to form.
+1. **Mid-bootstrap replica change** — etcd requires every bootstrapping member to start with an identical `--initial-cluster` flag. If the user edits `spec.replicas` between successive members being created, etcd refuses to form.
 2. **Scale-up + immediate scale-down** — `MemberAdd` registers the new peer with etcd before its pod becomes Ready. If the user reverts `spec.replicas` in that window, a naive operator deletes a member it can't yet identify.
 
 Both are the same underlying problem: the user's "desired state" is mutable on a faster cadence than the operator can converge.
@@ -145,8 +157,11 @@ kubectl apply -f config/samples/_v1alpha2_etcdcluster.yaml
 
 You should see three pods come up under default namespace, headless and client Services, and three PVCs. `kubectl get etcdcluster.lllamnyp.su` will eventually show `Ready=3` and a populated `clusterID`.
 
+Member names are apiserver-assigned, so don't hard-code a pod name like `etcdcluster-sample-0`. Pick a member via the cluster label:
+
 ```sh
-kubectl exec etcdcluster-sample-0 -- etcdctl --endpoints=http://localhost:2379 endpoint health --cluster
+POD=$(kubectl get pod -l etcd.lllamnyp.su/cluster=etcdcluster-sample -o jsonpath='{.items[0].metadata.name}')
+kubectl exec "$POD" -- etcdctl --endpoints=http://localhost:2379 endpoint health --cluster
 ```
 
 should report all members healthy.
@@ -161,13 +176,13 @@ go test ./controllers/...
 
 The suite covers, roughly:
 
-- **Bootstrap**: single-seed creation, idempotent recovery, refusal to adopt a same-named seed from a deleted prior cluster.
+- **Bootstrap**: single-seed creation (via `GenerateName`, anchored on `spec.bootstrap=true`), idempotent recovery of a pending seed with empty `spec.initialCluster`, refusal to adopt a `Bootstrap=true` CR whose owner UID doesn't match this cluster.
 - **Locking pattern**: `Observed`/`ProgressDeadline` mid-flight locking, bootstrap-deadline as terminal, steady-state-deadline waits for a spec edit before resuming.
-- **Scale-up**: learner-mode (`MemberAddAsLearner`), readiness gate before the next step, crash-recovery when a learner is already in etcd but the CR is missing, `--initial-cluster` flag sourced from etcd's view, in-flight-deletion gate, post-final-add promotion.
-- **Scale-down**: graceful `MemberRemove` via finalizer, in-flight-deletion gate, peer-list fallback when `MemberID` was never populated.
-- **Discovery**: rejection of partial / unexpected responses, separate `WaitingForSeed` vs `ClusterUnreachable` signalling, no-churn on repeated errors.
+- **Scale-up**: learner-mode (`MemberAddAsLearner`), readiness gate before the next step, both crash-recovery branches (CR Created but no AddAsLearner yet; AddAsLearner succeeded but `spec.initialCluster` not yet patched — including the "promote-can-never-succeed-before-patch" deadlock guard), `--initial-cluster` flag sourced from etcd's view, in-flight-deletion gate, post-final-add promotion.
+- **Scale-down**: most-recently-created member is picked (`CreationTimestamp` DESC + name DESC tiebreak), graceful `MemberRemove` via finalizer, in-flight-deletion gate, peer-list fallback when `MemberID` was never populated.
+- **Discovery**: seed anchored on `spec.bootstrap=true` (robust to list order), rejection of partial / unexpected responses, separate `WaitingForSeed` vs `ClusterUnreachable` signalling, no-churn on repeated errors.
 - **Status**: no-churn at steady state on both CRs, `ObservedGeneration` populated, `BrokenMembers` count (stub predicate).
-- **Member controller**: ready-gating on `MemberID` populated, peer-URL fallback during the post-add propagation window, transient-apiserver-error propagation, PVC stale-owner refusal, Pod liveness shape (TCP-only, no quorum dependency).
+- **Member controller**: pod creation is gated on `spec.initialCluster` being set (with the finalizer added first so mid-flight deletes still trigger `MemberRemove`), ready-gating on `MemberID` populated, peer-URL fallback during the post-add propagation window, transient-apiserver-error propagation, PVC stale-owner refusal, Pod liveness shape (TCP-only, no quorum dependency).
 - **Service drift**: reconciles owned fields (selector, ports, `publishNotReadyAddresses`) while preserving user-added labels, annotations, and extra ports.
 
 ## License

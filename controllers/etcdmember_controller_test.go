@@ -766,5 +766,60 @@ func TestUpdateStatus_NoChurnInSteadyState(t *testing.T) {
 	}
 }
 
+// TestReconcile_WaitsForInitialClusterPatch covers the GenerateName flow's
+// pending state: the cluster controller Creates an EtcdMember CR before
+// it can fill Spec.InitialCluster (the assigned name is needed to
+// register the peer URL with etcd first). Until the cluster controller
+// follows up with that patch, the member controller must not start a
+// pod — its etcd container would have no --initial-cluster value. The
+// finalizer is added even in the pending state so a mid-flight delete
+// still triggers MemberRemove cleanup.
+func TestReconcile_WaitsForInitialClusterPatch(t *testing.T) {
+	ctx := context.Background()
+	pending := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-pndng", Namespace: "ns", Labels: clusterLabels("test"),
+		},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			ClusterToken: "ns-test-x",
+			// InitialCluster intentionally empty.
+		},
+	}
+	c, _ := newTestClient(t, pending)
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead))}
+
+	res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-pndng", Namespace: "ns"}})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if res.RequeueAfter == 0 {
+		t.Fatalf("expected RequeueAfter for pending member; got %+v", res)
+	}
+	// Finalizer must be in place even in the pending state.
+	got := mustGet(t, c, "test-pndng", "ns", &lll.EtcdMember{})
+	hasFinalizer := false
+	for _, f := range got.Finalizers {
+		if f == MemberFinalizer {
+			hasFinalizer = true
+			break
+		}
+	}
+	if !hasFinalizer {
+		t.Fatalf("MemberFinalizer must be added before the InitialCluster gate; got %v", got.Finalizers)
+	}
+	// No PVC or Pod must have been created.
+	pvcs := &corev1.PersistentVolumeClaimList{}
+	_ = c.List(ctx, pvcs)
+	if len(pvcs.Items) != 0 {
+		t.Fatalf("PVC should not be created while InitialCluster is empty; got %d", len(pvcs.Items))
+	}
+	pods := &corev1.PodList{}
+	_ = c.List(ctx, pods)
+	if len(pods.Items) != 0 {
+		t.Fatalf("Pod should not be created while InitialCluster is empty; got %d", len(pods.Items))
+	}
+}
+
 // silence unused imports
 var _ = ctrl.Result{}

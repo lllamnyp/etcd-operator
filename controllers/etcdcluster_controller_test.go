@@ -14,12 +14,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -50,8 +52,10 @@ func reconcileUntilStable(t *testing.T, r *EtcdClusterReconciler, c client.Clien
 
 // TestBootstrap_CreatesSingleSeedMember covers the simplified bootstrap
 // model: regardless of spec.replicas, bootstrap creates exactly one seed
-// member (member-0) whose --initial-cluster lists only itself. Subsequent
-// members join via MemberAdd once ClusterID is latched.
+// member whose --initial-cluster lists only itself. Subsequent members
+// join via MemberAdd once ClusterID is latched. Seed identity is
+// established by Spec.Bootstrap=true, not by a predictable name —
+// members are created via GenerateName="<cluster>-".
 func TestBootstrap_CreatesSingleSeedMember(t *testing.T) {
 	ctx := context.Background()
 	cluster := &lll.EtcdCluster{
@@ -85,10 +89,13 @@ func TestBootstrap_CreatesSingleSeedMember(t *testing.T) {
 			}())
 	}
 	seed := members.Items[0]
-	if seed.Name != "test-0" {
-		t.Fatalf("seed member should be test-0; got %q", seed.Name)
+	if !strings.HasPrefix(seed.Name, "test-") {
+		t.Fatalf("seed name should start with %q; got %q", "test-", seed.Name)
 	}
-	wantIC := buildInitialCluster([]string{"test-0"}, "test", "ns")
+	if seed.Name == "test-" {
+		t.Fatalf("seed name should carry a GenerateName-assigned suffix; got bare %q", seed.Name)
+	}
+	wantIC := buildInitialCluster([]string{seed.Name}, "test", "ns")
 	if seed.Spec.InitialCluster != wantIC {
 		t.Fatalf("seed initial-cluster mismatch: got %q want %q", seed.Spec.InitialCluster, wantIC)
 	}
@@ -125,7 +132,7 @@ func TestObservedSpec_LocksMidFlight(t *testing.T) {
 	// One member exists, two more pending — clearly mid scale-up.
 	c, _ := newTestClient(t, cluster, &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", Labels: memberLabels("test", "test-0")},
-		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17"},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", InitialCluster: "x", Bootstrap: true},
 		Status:     lll.EtcdMemberStatus{PodName: "test-0", MemberID: "abc", Conditions: []metav1.Condition{{Type: lll.MemberReady, Status: metav1.ConditionTrue, Reason: "PodReady", LastTransitionTime: metav1.Now()}}},
 	})
 
@@ -344,7 +351,10 @@ func TestTryDiscoverCluster_SurfacesUnreachableEtcd(t *testing.T) {
 				Namespace: "ns",
 				Labels:    memberLabels("test", fmt.Sprintf("test-%d", i)),
 			},
-			Spec: lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"), InitialCluster: "x", ClusterToken: "test"},
+			// test-0 is the seed (Bootstrap=true); the others are scale-up
+			// peers. With GenerateName the names are arbitrary — the
+			// Bootstrap flag is what makes test-0 discoverable as the seed.
+			Spec: lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"), InitialCluster: "x", ClusterToken: "test", Bootstrap: i == 0},
 			// PodName set: we want to exercise the "etcd unreachable" branch,
 			// not the new "waiting for seed pod" gate.
 			Status: lll.EtcdMemberStatus{PodName: fmt.Sprintf("test-%d", i)},
@@ -442,15 +452,19 @@ func TestUpdateStatus_SurfacesBrokenCount(t *testing.T) {
 	}
 }
 
-// TestScaleUp_IdempotentAfterCrash covers reviewer issue #1: if a previous
-// reconcile crashed between MemberAdd succeeding and the EtcdMember CR being
-// created, the next reconcile must NOT call MemberAdd again (etcd would
-// reject the duplicate peerURL); it should detect the existing entry and
-// proceed straight to creating the CR.
-func TestScaleUp_IdempotentAfterCrash(t *testing.T) {
+// TestScaleUp_AdoptsPendingCRAndRetriesAdd covers crash recovery between
+// the EtcdMember Create and MemberAddAsLearner: the next reconcile finds
+// a pending CR (empty Spec.InitialCluster) and must (a) adopt it instead
+// of Creating another, and (b) call MemberAddAsLearner with the pending
+// CR's peer URL (because etcd has no record of it yet).
+//
+// This is the new shape of "idempotent after crash" for the
+// Create-then-Add flow. The symmetric post-Add recovery is covered by
+// TestScaleUp_InitialClusterMatchesEtcdMembership.
+func TestScaleUp_AdoptsPendingCRAndRetriesAdd(t *testing.T) {
 	ctx := context.Background()
 	cluster := &lll.EtcdCluster{
-		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns", UID: types.UID("cluster-uid")},
 		Spec: lll.EtcdClusterSpec{
 			Replicas: ptrInt32(4),
 			Version:  "3.5.17",
@@ -479,20 +493,35 @@ func TestScaleUp_IdempotentAfterCrash(t *testing.T) {
 			Status: lll.EtcdMemberStatus{PodName: fmt.Sprintf("test-%d", i)},
 		})
 	}
+	// Pending CR from a prior reconcile that crashed before MemberAddAsLearner.
+	tru := true
+	pending := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-pndng", Namespace: "ns", Labels: clusterLabels("test"),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "lllamnyp.su/v1alpha2", Kind: "EtcdCluster",
+				Name: "test", UID: types.UID("cluster-uid"), Controller: &tru,
+			}},
+		},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			ClusterToken: "test",
+			// InitialCluster intentionally empty.
+		},
+	}
+	objs = append(objs, pending)
 	c, _ := newTestClient(t, objs...)
 
-	// Etcd already has 4 members — including test-3 from a partial scale-up.
+	// Etcd has only the three pre-existing members; the pending CR's peer
+	// URL is NOT yet registered.
 	fe := newFakeEtcd(0xdeadbeef,
 		&etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")}},
 		&etcdserverpb.Member{ID: 0xa02, Name: "test-1", PeerURLs: []string{peerURL("test-1", "test", "ns")}},
 		&etcdserverpb.Member{ID: 0xa03, Name: "test-2", PeerURLs: []string{peerURL("test-2", "test", "ns")}},
-		&etcdserverpb.Member{ID: 0xa04, Name: "", PeerURLs: []string{peerURL("test-3", "test", "ns")}},
 	)
 
 	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
 
-	// Drive the scale-up branch directly — Reconcile would handle services
-	// + membership snapshots; we want to assert MemberAdd isn't re-called.
 	memberList := &lll.EtcdMemberList{}
 	if err := c.List(ctx, memberList); err != nil {
 		t.Fatalf("List: %v", err)
@@ -502,18 +531,32 @@ func TestScaleUp_IdempotentAfterCrash(t *testing.T) {
 	}
 
 	if len(fe.addCalls) != 0 {
-		t.Fatalf("MemberAdd should not be called when peerURL already in etcd; got %v", fe.addCalls)
+		t.Fatalf("scale-up must use AddAsLearner, not voting MemberAdd; got %v", fe.addCalls)
+	}
+	if len(fe.addLearnerCalls) != 1 || fe.addLearnerCalls[0] != peerURL("test-pndng", "test", "ns") {
+		t.Fatalf("expected one MemberAddAsLearner against the pending CR's peer URL; got %v", fe.addLearnerCalls)
+	}
+	// Pending CR must still exist (adopted, not duplicated) and must now
+	// have Spec.InitialCluster populated.
+	all := &lll.EtcdMemberList{}
+	_ = c.List(ctx, all, client.InNamespace("ns"))
+	if len(all.Items) != 4 {
+		t.Fatalf("expected 4 EtcdMembers (no duplicate created); got %d", len(all.Items))
 	}
 	got := &lll.EtcdMember{}
-	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "test-3"}, got); err != nil {
-		t.Fatalf("EtcdMember test-3 should have been created: %v", err)
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "test-pndng"}, got); err != nil {
+		t.Fatalf("pending CR disappeared: %v", err)
+	}
+	if got.Spec.InitialCluster == "" {
+		t.Fatalf("pending CR's Spec.InitialCluster was not patched")
 	}
 }
 
 // TestBootstrap_Idempotent: if bootstrap re-runs (controller restart between
-// Create and the next reconcile), it must not error or duplicate the seed
-// member. The Create returns AlreadyExists; bootstrap verifies the existing
-// seed is owned by this cluster and returns cleanly.
+// Create and the next reconcile), it must not duplicate the seed member.
+// With GenerateName, idempotency is anchored on Spec.Bootstrap=true rather
+// than the historical name-collision path — bootstrap detects the existing
+// seed via that flag and returns cleanly when InitialCluster is already set.
 func TestBootstrap_Idempotent(t *testing.T) {
 	ctx := context.Background()
 	const clusterUID = "this-cluster-uid"
@@ -528,11 +571,11 @@ func TestBootstrap_Idempotent(t *testing.T) {
 			},
 		},
 	}
-	seedName := "test-0"
+	seedName := "test-abc12"
 	tru := true
 	pre := &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: seedName, Namespace: "ns", Labels: memberLabels("test", seedName),
+			Name: seedName, Namespace: "ns", Labels: clusterLabels("test"),
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: "lllamnyp.su/v1alpha2",
 				Kind:       "EtcdCluster",
@@ -550,7 +593,7 @@ func TestBootstrap_Idempotent(t *testing.T) {
 	c, _ := newTestClient(t, cluster, pre)
 	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdeadbeef))}
 
-	if _, err := r.bootstrap(ctx, cluster); err != nil {
+	if _, err := r.bootstrap(ctx, cluster, []lll.EtcdMember{*pre}); err != nil {
 		t.Fatalf("bootstrap should be idempotent across restart: %v", err)
 	}
 	members := &lll.EtcdMemberList{}
@@ -560,11 +603,68 @@ func TestBootstrap_Idempotent(t *testing.T) {
 	}
 }
 
-// TestBootstrap_RejectsStaleSeed covers blocker B2: a same-named EtcdMember
-// owned by a different (deleted) EtcdCluster must NOT be silently adopted.
-// The stale member will itself be GC'd and the new cluster would end up
-// with no seed. Bootstrap must error so controller-runtime backs off and
-// retries once the stale resource is gone.
+// TestBootstrap_CompletesPendingSeed: if bootstrap crashes between Create
+// and the InitialCluster Patch, the next reconcile sees a Bootstrap=true
+// CR with empty Spec.InitialCluster and must finish wiring it (so the
+// member controller can start the pod). No new seed should be created.
+func TestBootstrap_CompletesPendingSeed(t *testing.T) {
+	ctx := context.Background()
+	const clusterUID = "fresh-uid"
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test", Namespace: "ns", UID: types.UID(clusterUID),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+		},
+	}
+	tru := true
+	seedName := "test-pend1"
+	pending := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: seedName, Namespace: "ns", Labels: clusterLabels("test"),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "lllamnyp.su/v1alpha2",
+				Kind:       "EtcdCluster",
+				Name:       "test",
+				UID:        types.UID(clusterUID),
+				Controller: &tru,
+			}},
+		},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			Bootstrap:    true, // crash-recovery: InitialCluster intentionally empty
+			ClusterToken: "ns-test-x",
+		},
+	}
+	c, _ := newTestClient(t, cluster, pending)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdeadbeef))}
+
+	if _, err := r.bootstrap(ctx, cluster, []lll.EtcdMember{*pending}); err != nil {
+		t.Fatalf("bootstrap completion: %v", err)
+	}
+	members := &lll.EtcdMemberList{}
+	_ = c.List(ctx, members)
+	if len(members.Items) != 1 {
+		t.Fatalf("expected exactly one member after completion; got %d", len(members.Items))
+	}
+	got := members.Items[0]
+	wantIC := buildInitialCluster([]string{seedName}, "test", "ns")
+	if got.Spec.InitialCluster != wantIC {
+		t.Fatalf("pending seed InitialCluster not filled: got %q want %q", got.Spec.InitialCluster, wantIC)
+	}
+}
+
+// TestBootstrap_RejectsStaleSeed: a Bootstrap=true EtcdMember whose owner
+// reference points at a different UID must NOT be silently adopted. With
+// GenerateName the historical "same-name across cluster incarnations"
+// collision is gone, but an unattached or cross-owned Bootstrap CR
+// (orphan from a botched migration, kubectl-created garbage) could still
+// label-match the new cluster's selector. Bootstrap must error so the
+// stale resource is investigated rather than co-opted.
 func TestBootstrap_RejectsStaleSeed(t *testing.T) {
 	ctx := context.Background()
 	freshCluster := &lll.EtcdCluster{
@@ -581,7 +681,7 @@ func TestBootstrap_RejectsStaleSeed(t *testing.T) {
 	tru := true
 	stale := &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "test-0", Namespace: "ns", Labels: memberLabels("test", "test-0"),
+			Name: "test-stalez", Namespace: "ns", Labels: clusterLabels("test"),
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: "lllamnyp.su/v1alpha2",
 				Kind:       "EtcdCluster",
@@ -592,14 +692,14 @@ func TestBootstrap_RejectsStaleSeed(t *testing.T) {
 		},
 		Spec: lll.EtcdMemberSpec{
 			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
-			Bootstrap: true, InitialCluster: buildInitialCluster([]string{"test-0"}, "test", "ns"),
+			Bootstrap: true, InitialCluster: buildInitialCluster([]string{"test-stalez"}, "test", "ns"),
 			ClusterToken: "ns-test-x",
 		},
 	}
 	c, _ := newTestClient(t, freshCluster, stale)
 	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdeadbeef))}
 
-	_, err := r.bootstrap(ctx, freshCluster)
+	_, err := r.bootstrap(ctx, freshCluster, []lll.EtcdMember{*stale})
 	if err == nil {
 		t.Fatalf("bootstrap should refuse to adopt a stale seed; got nil error")
 	}
@@ -658,6 +758,86 @@ func TestScaleUp_WaitsForInFlightDeletion(t *testing.T) {
 	}
 	if len(fe.addCalls) > 0 {
 		t.Fatalf("MemberAdd should not be called while a deletion is in flight; got %v", fe.addCalls)
+	}
+}
+
+// TestScaleDown_PicksMostRecentlyCreatedVictim: with apiserver-assigned
+// names there is no ordinal to scale down by; victim selection sorts by
+// CreationTimestamp (newest first). This naturally retires the most
+// recent scale-up step first — the just-added learner, not the seed —
+// when the user shrinks the cluster.
+//
+// Tiebreak is by name DESC; the assertion below picks two members at
+// the same timestamp so the deterministic-tiebreak behaviour gets
+// exercised too.
+func TestScaleDown_PicksMostRecentlyCreatedVictim(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+	oldT := metav1.NewTime(now.Add(-2 * time.Hour))
+	midT := metav1.NewTime(now.Add(-1 * time.Hour))
+	// Three members, oldest -> newest: "test-seed" (oldest), "test-mid",
+	// then two with the same CreationTimestamp where "test-zzz" > "test-aaa"
+	// by name, so "test-zzz" should win the tiebreak.
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(3),
+			Version:  "3.5.17",
+			Storage:  quickQty(t, "1Gi"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			ClusterID:    "deadbeef",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
+		},
+	}
+	members := []lll.EtcdMember{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-seed", Namespace: "ns", CreationTimestamp: oldT, Labels: memberLabels("test", "test-seed")},
+			Spec:       lll.EtcdMemberSpec{ClusterName: "test", InitialCluster: "x", Bootstrap: true},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-mid", Namespace: "ns", CreationTimestamp: midT, Labels: memberLabels("test", "test-mid")},
+			Spec:       lll.EtcdMemberSpec{ClusterName: "test", InitialCluster: "x"},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-aaa", Namespace: "ns", CreationTimestamp: now, Labels: memberLabels("test", "test-aaa")},
+			Spec:       lll.EtcdMemberSpec{ClusterName: "test", InitialCluster: "x"},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-zzz", Namespace: "ns", CreationTimestamp: now, Labels: memberLabels("test", "test-zzz")},
+			Spec:       lll.EtcdMemberSpec{ClusterName: "test", InitialCluster: "x"},
+		},
+	}
+	objs := []client.Object{cluster}
+	for i := range members {
+		m := members[i]
+		objs = append(objs, &m)
+	}
+	c, _ := newTestClient(t, objs...)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead))}
+
+	if _, err := r.scaleDown(ctx, cluster, members); err != nil {
+		t.Fatalf("scaleDown: %v", err)
+	}
+	// With no finalizer set the fake client removes the object entirely; in
+	// production the member's MemberFinalizer would leave a DeletionTimestamp
+	// instead, but either way the assertion is "scaleDown picked this one".
+	// test-zzz wins the same-timestamp tiebreak (name DESC).
+	gone := func(name string) bool {
+		err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: name}, &lll.EtcdMember{})
+		return apierrors.IsNotFound(err)
+	}
+	if !gone("test-zzz") {
+		t.Fatalf("test-zzz should have been picked (newest + name-DESC tiebreak)")
+	}
+	for _, n := range []string{"test-aaa", "test-mid", "test-seed"} {
+		if gone(n) {
+			t.Fatalf("member %s should NOT have been picked by scaleDown", n)
+		}
 	}
 }
 
@@ -783,7 +963,7 @@ func TestTryDiscoverCluster_RejectsPartialMembership(t *testing.T) {
 	}
 	seed := &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", Labels: memberLabels("test", "test-0")},
-		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Bootstrap: true},
 		Status:     lll.EtcdMemberStatus{PodName: "test-0"},
 	}
 	c, _ := newTestClient(t, cluster, seed)
@@ -823,7 +1003,7 @@ func TestTryDiscoverCluster_LatchesOnValidResponse(t *testing.T) {
 	}
 	seed := &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", Labels: memberLabels("test", "test-0")},
-		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Bootstrap: true},
 		Status:     lll.EtcdMemberStatus{PodName: "test-0"},
 	}
 	c, _ := newTestClient(t, cluster, seed)
@@ -885,12 +1065,13 @@ func TestDeadlineExceeded_NoChurnWhenSteady(t *testing.T) {
 	}
 }
 
-// TestTryDiscoverCluster_FindsSeedByName covers B2: even if the list order
-// puts a non-seed member first, discovery must anchor to the seed (the
-// member with name <cluster>-0). Otherwise a same-name slice from any
-// future caller (or a user-created EtcdMember CR) would silently break
+// TestTryDiscoverCluster_FindsSeedByBootstrapFlag: even if list order puts
+// a non-seed member first, discovery must anchor to the Bootstrap=true CR.
+// Names are apiserver-assigned via GenerateName, so seed identity comes
+// from Spec.Bootstrap, not from a predictable name. Without this anchor,
+// a sibling CR landing earlier in the slice would silently mis-target
 // discovery.
-func TestTryDiscoverCluster_FindsSeedByName(t *testing.T) {
+func TestTryDiscoverCluster_FindsSeedByBootstrapFlag(t *testing.T) {
 	ctx := context.Background()
 	cluster := &lll.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
@@ -905,24 +1086,24 @@ func TestTryDiscoverCluster_FindsSeedByName(t *testing.T) {
 			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
 		},
 	}
-	// Pass members in an order where the seed is NOT first.
-	test3 := lll.EtcdMember{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-3", Namespace: "ns", Labels: memberLabels("test", "test-3")},
-		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
-		Status:     lll.EtcdMemberStatus{PodName: "test-3"},
+	// Non-seed sibling at slice index 0 (Bootstrap=false), seed at index 1.
+	sibling := lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-sib1", Namespace: "ns", Labels: memberLabels("test", "test-sib1")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", InitialCluster: "x"},
+		Status:     lll.EtcdMemberStatus{PodName: "test-sib1"},
 	}
-	test0 := lll.EtcdMember{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", Labels: memberLabels("test", "test-0")},
-		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
-		Status:     lll.EtcdMemberStatus{PodName: "test-0"},
+	seed := lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-seed1", Namespace: "ns", Labels: memberLabels("test", "test-seed1")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Bootstrap: true, InitialCluster: "x"},
+		Status:     lll.EtcdMemberStatus{PodName: "test-seed1"},
 	}
-	c, _ := newTestClient(t, cluster, &test3, &test0)
+	c, _ := newTestClient(t, cluster, &sibling, &seed)
 	fe := newFakeEtcd(0xabc, &etcdserverpb.Member{
-		ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")},
+		ID: 0xa01, Name: seed.Name, PeerURLs: []string{peerURL(seed.Name, "test", "ns")},
 	})
 	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
 
-	if _, err := r.tryDiscoverCluster(ctx, cluster, []lll.EtcdMember{test3, test0}); err != nil {
+	if _, err := r.tryDiscoverCluster(ctx, cluster, []lll.EtcdMember{sibling, seed}); err != nil {
 		t.Fatalf("tryDiscoverCluster: %v", err)
 	}
 	mustGet(t, c, "test", "ns", cluster)
@@ -1095,7 +1276,7 @@ func TestScaleUp_WaitsForAllMembersReady(t *testing.T) {
 		}
 		objs = append(objs, &lll.EtcdMember{
 			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("test-%d", i), Namespace: "ns", Labels: memberLabels("test", fmt.Sprintf("test-%d", i))},
-			Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+			Spec:       lll.EtcdMemberSpec{ClusterName: "test", InitialCluster: "x"},
 			Status: lll.EtcdMemberStatus{
 				PodName:    fmt.Sprintf("test-%d", i),
 				MemberID:   "abc",
@@ -1116,18 +1297,21 @@ func TestScaleUp_WaitsForAllMembersReady(t *testing.T) {
 	}
 }
 
-// TestScaleUp_InitialClusterMatchesEtcdMembership covers blocker B1: when a
-// previous reconcile crashed between MemberAddAsLearner and creating the
-// EtcdMember CR, etcd has a learner with no CR. scaleUp's crash-safety
-// skips the MemberAddAsLearner call — but the new CR's --initial-cluster
-// flag must reflect etcd's *actual* membership (including the recovered
-// learner), not just the CR-side list. The pod's flags must match what
-// etcd will report when it tries to join, or the join is rejected.
+// TestScaleUp_InitialClusterMatchesEtcdMembership covers crash recovery
+// between MemberAddAsLearner and the Spec.InitialCluster patch. In the
+// new flow the EtcdMember CR is Created *before* MemberAddAsLearner, so
+// the leftover-state on the next reconcile is: a pending CR (empty
+// Spec.InitialCluster) whose peer URL is already registered in etcd.
+// scaleUp must (a) adopt the pending CR rather than create another, (b)
+// detect the registered peer URL and skip the AddAsLearner call, (c)
+// fill Spec.InitialCluster from etcd's authoritative view (which
+// includes the still-Name-empty joiner) so the pod's --initial-cluster
+// flag matches what etcd will report when it tries to join.
 func TestScaleUp_InitialClusterMatchesEtcdMembership(t *testing.T) {
 	ctx := context.Background()
 	now := metav1.Now()
 	cluster := &lll.EtcdCluster{
-		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns", UID: types.UID("cluster-uid")},
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "ns-test-x",
 			ClusterID:    "deadbeef",
@@ -1141,56 +1325,151 @@ func TestScaleUp_InitialClusterMatchesEtcdMembership(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		objs = append(objs, &lll.EtcdMember{
 			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("test-%d", i), Namespace: "ns", Labels: memberLabels("test", fmt.Sprintf("test-%d", i))},
-			Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+			Spec:       lll.EtcdMemberSpec{ClusterName: "test", InitialCluster: "x"},
 			Status: lll.EtcdMemberStatus{
 				PodName: fmt.Sprintf("test-%d", i), MemberID: "abc",
 				Conditions: []metav1.Condition{{Type: lll.MemberReady, Status: metav1.ConditionTrue, Reason: "PodReady", LastTransitionTime: now}},
 			},
 		})
 	}
+	// Pending CR from a prior reconcile that crashed after MemberAddAsLearner
+	// but before the InitialCluster patch. Owned by the cluster (mirrors
+	// what SetControllerReference would have written).
+	tru := true
+	pending := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-pndng", Namespace: "ns", Labels: clusterLabels("test"),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "lllamnyp.su/v1alpha2", Kind: "EtcdCluster",
+				Name: "test", UID: types.UID("cluster-uid"), Controller: &tru,
+			}},
+		},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			ClusterToken: "ns-test-x",
+			// InitialCluster intentionally empty — that's the pending state.
+		},
+	}
+	objs = append(objs, pending)
 	c, _ := newTestClient(t, objs...)
-	// Etcd already has 4 members (the post-crash state). test-3's Name is
-	// still empty because etcd hasn't yet seen the joiner report in.
+	// Etcd already has 4 members. The pending member's peer URL is
+	// registered (joiner not yet reported in, so etcd's Name=="").
 	fe := newFakeEtcd(0xdeadbeef,
 		&etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")}},
 		&etcdserverpb.Member{ID: 0xa02, Name: "test-1", PeerURLs: []string{peerURL("test-1", "test", "ns")}},
 		&etcdserverpb.Member{ID: 0xa03, Name: "test-2", PeerURLs: []string{peerURL("test-2", "test", "ns")}},
-		&etcdserverpb.Member{ID: 0xa04, Name: "", PeerURLs: []string{peerURL("test-3", "test", "ns")}, IsLearner: true},
+		&etcdserverpb.Member{ID: 0xa04, Name: "", PeerURLs: []string{peerURL("test-pndng", "test", "ns")}, IsLearner: true},
 	)
 	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
 
+	// The orphan learner CANNOT be promoted yet — its pod doesn't exist
+	// (the member controller blocks on Spec.InitialCluster being set), so
+	// it can't catch up with the leader. Any reasonable etcd returns
+	// "learner not ready" here. Wire that error so the test pins the
+	// "patch must happen *before* promote attempts" guarantee. Without
+	// pending-completion-first ordering, scaleUp would short-circuit on
+	// MemberPromote's error and deadlock the cluster.
+	fe.promoteErr = errors.New("etcdserver: can only promote a learner member which is in sync with leader")
 	memberList := &lll.EtcdMemberList{}
 	_ = c.List(ctx, memberList, client.InNamespace("ns"))
-	// scaleUp will see test-3 is already a learner in etcd, attempt to
-	// promote it — but in this contrived state, promotion succeeds. We
-	// want the CR-creation path, so simulate "not yet promotable" via
-	// a preset error.
-	fe.promoteErr = errors.New("etcdserver: can only promote a learner member which is in sync with leader")
-	res, err := r.scaleUp(ctx, cluster, memberList.Items)
-	if err != nil {
+	if _, err := r.scaleUp(ctx, cluster, memberList.Items); err != nil {
 		t.Fatalf("scaleUp: %v", err)
 	}
-	// promote failure short-circuits scaleUp before CR creation; resume.
-	fe.promoteErr = nil
-	_ = res
-	// Now do the actual CR-creation path: pretend etcd has the learner but
-	// no promotion is attempted (e.g. ResolveAlreadyAdded path). We can
-	// simulate this by removing IsLearner so the promote branch skips.
-	fe.members[3].IsLearner = false
-	if _, err := r.scaleUp(ctx, cluster, memberList.Items); err != nil {
-		t.Fatalf("scaleUp second pass: %v", err)
-	}
-	// MemberAddAsLearner must NOT have been called (peerURL already in etcd).
+	// MemberAddAsLearner must NOT have been called — peer URL is already in
+	// etcd from the pre-crash reconcile.
 	if len(fe.addLearnerCalls) != 0 {
 		t.Fatalf("MemberAddAsLearner should not fire when peer URL already registered; got %v", fe.addLearnerCalls)
 	}
-	got := &lll.EtcdMember{}
-	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "test-3"}, got); err != nil {
-		t.Fatalf("test-3 EtcdMember should have been created: %v", err)
+	// MemberPromote must NOT have been called either — the orphan learner
+	// is still un-synced and a promote attempt would error out, but the
+	// pending-completion path runs first and short-circuits.
+	if len(fe.promoteCalls) != 0 {
+		t.Fatalf("MemberPromote must not fire while a pending CR exists; got %v", fe.promoteCalls)
 	}
-	wantIC := buildInitialCluster([]string{"test-0", "test-1", "test-2", "test-3"}, "test", "ns")
+	// Pending CR's Spec.InitialCluster must now reflect etcd's full view
+	// (including the recovered joiner).
+	got := &lll.EtcdMember{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "test-pndng"}, got); err != nil {
+		t.Fatalf("pending EtcdMember disappeared: %v", err)
+	}
+	wantIC := buildInitialCluster([]string{"test-0", "test-1", "test-2", "test-pndng"}, "test", "ns")
 	if got.Spec.InitialCluster != wantIC {
 		t.Fatalf("Spec.InitialCluster mismatch:\n  got  %q\n  want %q", got.Spec.InitialCluster, wantIC)
+	}
+}
+
+// TestScaleUp_RecoversFromCrashBetweenAddAndPatch is the integration-level
+// counterpart of TestScaleUp_InitialClusterMatchesEtcdMembership: rather
+// than calling scaleUp directly, it runs Reconcile against the
+// post-crash state and asserts the deadlock cannot occur. The fake etcd
+// is rigged so MemberPromote always errors (the orphan learner can
+// never sync without its pod), so any reconcile path that promotes
+// before patching wedges forever. The test passes only if Reconcile
+// completes the InitialCluster patch.
+func TestScaleUp_RecoversFromCrashBetweenAddAndPatch(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns", UID: types.UID("cluster-uid")},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(4), Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			ClusterID:    "deadbeef",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 4, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
+		},
+	}
+	objs := []client.Object{cluster}
+	for i := 0; i < 3; i++ {
+		objs = append(objs, &lll.EtcdMember{
+			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("test-%d", i), Namespace: "ns", Labels: memberLabels("test", fmt.Sprintf("test-%d", i))},
+			Spec:       lll.EtcdMemberSpec{ClusterName: "test", InitialCluster: "x"},
+			Status: lll.EtcdMemberStatus{
+				PodName: fmt.Sprintf("test-%d", i), MemberID: "abc",
+				Conditions: []metav1.Condition{{Type: lll.MemberReady, Status: metav1.ConditionTrue, Reason: "PodReady", LastTransitionTime: now}},
+			},
+		})
+	}
+	tru := true
+	pending := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-pndng", Namespace: "ns", Labels: clusterLabels("test"),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "lllamnyp.su/v1alpha2", Kind: "EtcdCluster",
+				Name: "test", UID: types.UID("cluster-uid"), Controller: &tru,
+			}},
+		},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			ClusterToken: "ns-test-x",
+		},
+	}
+	objs = append(objs, pending)
+	c, _ := newTestClient(t, objs...)
+	fe := newFakeEtcd(0xdeadbeef,
+		&etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa02, Name: "test-1", PeerURLs: []string{peerURL("test-1", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa03, Name: "test-2", PeerURLs: []string{peerURL("test-2", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa04, Name: "", PeerURLs: []string{peerURL("test-pndng", "test", "ns")}, IsLearner: true},
+	)
+	// Promote always errors — the orphan learner is permanently stuck
+	// until its pod comes up (which requires the InitialCluster patch).
+	fe.promoteErr = errors.New("etcdserver: can only promote a learner member which is in sync with leader")
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test", Namespace: "ns"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	got := mustGet(t, c, "test-pndng", "ns", &lll.EtcdMember{})
+	if got.Spec.InitialCluster == "" {
+		t.Fatalf("pending CR's Spec.InitialCluster was not patched — deadlock would result in production")
+	}
+	if len(fe.addLearnerCalls) != 0 {
+		t.Fatalf("MemberAddAsLearner should not fire when peer URL already registered; got %v", fe.addLearnerCalls)
 	}
 }
 
@@ -1215,7 +1494,7 @@ func TestScaleUp_AddsAsLearner(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		objs = append(objs, &lll.EtcdMember{
 			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("test-%d", i), Namespace: "ns", Labels: memberLabels("test", fmt.Sprintf("test-%d", i))},
-			Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+			Spec:       lll.EtcdMemberSpec{ClusterName: "test", InitialCluster: "x"},
 			Status: lll.EtcdMemberStatus{
 				PodName:    fmt.Sprintf("test-%d", i),
 				MemberID:   "abc",
@@ -1238,8 +1517,21 @@ func TestScaleUp_AddsAsLearner(t *testing.T) {
 	if len(fe.addCalls) > 0 {
 		t.Fatalf("scale-up must use AddAsLearner, not voting MemberAdd; got addCalls=%v", fe.addCalls)
 	}
-	if len(fe.addLearnerCalls) != 1 || fe.addLearnerCalls[0] != peerURL("test-2", "test", "ns") {
-		t.Fatalf("expected one MemberAddAsLearner against test-2 peer URL; got %v", fe.addLearnerCalls)
+	// With GenerateName the new member's name is apiserver-assigned, so
+	// we can't predict the exact peer URL. Assert shape instead: exactly
+	// one AddAsLearner against a "<cluster>-*" peer URL.
+	if len(fe.addLearnerCalls) != 1 {
+		t.Fatalf("expected one MemberAddAsLearner call; got %v", fe.addLearnerCalls)
+	}
+	gotURL := fe.addLearnerCalls[0]
+	if !strings.HasPrefix(gotURL, "http://test-") || !strings.HasSuffix(gotURL, ".test.ns.svc:2380") {
+		t.Fatalf("AddAsLearner peer URL %q does not match expected GenerateName shape", gotURL)
+	}
+	// And the new CR carries that peer URL via its assigned name.
+	members := &lll.EtcdMemberList{}
+	_ = c.List(ctx, members, client.InNamespace("ns"))
+	if len(members.Items) != 3 {
+		t.Fatalf("expected 3 EtcdMembers after scale-up (2 existing + 1 new); got %d", len(members.Items))
 	}
 }
 
@@ -1265,7 +1557,7 @@ func TestScaleUp_PromotesExistingLearner(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		objs = append(objs, &lll.EtcdMember{
 			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("test-%d", i), Namespace: "ns", Labels: memberLabels("test", fmt.Sprintf("test-%d", i))},
-			Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+			Spec:       lll.EtcdMemberSpec{ClusterName: "test", InitialCluster: "x"},
 			Status: lll.EtcdMemberStatus{
 				PodName:    fmt.Sprintf("test-%d", i),
 				MemberID:   "abc",
@@ -1321,7 +1613,7 @@ func TestReconcile_PromotesLearnerWhenCurrentEqualsDesired(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		objs = append(objs, &lll.EtcdMember{
 			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("test-%d", i), Namespace: "ns", Labels: memberLabels("test", fmt.Sprintf("test-%d", i))},
-			Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+			Spec:       lll.EtcdMemberSpec{ClusterName: "test", InitialCluster: "x"},
 			Status: lll.EtcdMemberStatus{
 				PodName:    fmt.Sprintf("test-%d", i),
 				MemberID:   "abc",
@@ -1407,7 +1699,7 @@ func TestClusterUpdateStatus_NoChurnInSteadyState(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		objs = append(objs, &lll.EtcdMember{
 			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("test-%d", i), Namespace: "ns", Labels: memberLabels("test", fmt.Sprintf("test-%d", i))},
-			Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+			Spec:       lll.EtcdMemberSpec{ClusterName: "test", InitialCluster: "x"},
 			Status: lll.EtcdMemberStatus{
 				PodName: fmt.Sprintf("test-%d", i), MemberID: "abc",
 				Conditions: []metav1.Condition{{Type: lll.MemberReady, Status: metav1.ConditionTrue, Reason: "PodReady", LastTransitionTime: now}},
@@ -1449,7 +1741,7 @@ func TestTryDiscoverCluster_NoChurnOnSameError(t *testing.T) {
 	}
 	seed := &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", Labels: memberLabels("test", "test-0")},
-		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Bootstrap: true},
 		Status:     lll.EtcdMemberStatus{PodName: "test-0"},
 	}
 	c, _ := newTestClient(t, cluster, seed)
@@ -1498,7 +1790,7 @@ func TestTryDiscoverCluster_WaitingForSeed(t *testing.T) {
 	// Seed exists as a CR but its pod hasn't been created yet (PodName empty).
 	seed := &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", Labels: memberLabels("test", "test-0")},
-		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Bootstrap: true},
 		// Status.PodName intentionally empty.
 	}
 	c, _ := newTestClient(t, cluster, seed)
@@ -1554,7 +1846,7 @@ func TestTryDiscoverCluster_LatchesAvailableTrueOnSuccess(t *testing.T) {
 	}
 	seed := &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", Labels: memberLabels("test", "test-0")},
-		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Bootstrap: true},
 		Status:     lll.EtcdMemberStatus{PodName: "test-0"},
 	}
 	c, _ := newTestClient(t, cluster, seed)

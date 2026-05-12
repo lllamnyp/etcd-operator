@@ -74,6 +74,16 @@ func (r *EtcdMemberReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 	}
 
+	// The cluster controller creates this CR before it knows the peer URL
+	// it'll register with etcd (apiserver fills GenerateName in the Create
+	// response), so Spec.InitialCluster is populated in a follow-up Patch.
+	// Until that patch lands, the pod has no valid --initial-cluster flag
+	// to start with — wait. Finalizer was added above so deletion mid-flight
+	// still triggers MemberRemove cleanup.
+	if member.Spec.InitialCluster == "" {
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+
 	if err := r.ensurePVC(ctx, member); err != nil {
 		log.Error(err, "failed to ensure PVC")
 		return ctrl.Result{}, err
