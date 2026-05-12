@@ -53,7 +53,7 @@ func newFakeEtcd(clusterID uint64, members ...*etcdserverpb.Member) *fakeEtcd {
 	return &fakeEtcd{clusterID: clusterID, members: members}
 }
 
-func (f *fakeEtcd) MemberList(_ context.Context) (*clientv3.MemberListResponse, error) {
+func (f *fakeEtcd) MemberList(_ context.Context, _ ...clientv3.OpOption) (*clientv3.MemberListResponse, error) {
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
