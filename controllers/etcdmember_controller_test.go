@@ -822,16 +822,17 @@ func TestReconcile_WaitsForInitialClusterPatch(t *testing.T) {
 }
 
 // TestHandleDeletion_ScaleToZeroReparentsPVCAndSkipsMemberRemove covers
-// the pause half of scale-to-zero. When the EtcdCluster's
-// status.observed.replicas is 0, deleting an EtcdMember must:
+// the pause half of scale-to-zero. When the member carries the pause
+// annotation (stamped by the cluster controller just before issuing
+// Delete on the 1→0 step), deleting an EtcdMember must:
 //   - Re-parent its data PVC to the EtcdCluster (so cascade GC doesn't
 //     take it),
 //   - Skip MemberRemove (we want etcd's local data dir intact for
 //     resurrection).
 //
-// The same finalizer behaviour fires regardless of which member is
-// being deleted — but the scaleDown path only enters scale-to-zero on
-// the 1→0 step.
+// The annotation is the signal — NOT cluster.Status.DormantMember.
+// That switch is documented in PauseAnnotation's comment and tested
+// further in TestHandleDeletion_PauseSurvivesStaleClusterCache.
 func TestHandleDeletion_ScaleToZeroReparentsPVCAndSkipsMemberRemove(t *testing.T) {
 	ctx := context.Background()
 	tru := true
@@ -846,9 +847,6 @@ func TestHandleDeletion_ScaleToZeroReparentsPVCAndSkipsMemberRemove(t *testing.T
 			Observed: &lll.ObservedClusterSpec{
 				Replicas: 0, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
 			},
-			// The cluster controller's scaleDown latches DormantMember on
-			// the actual 1→0 step (len(members)==1). That latch is the
-			// signal the finalizer keys off to take the pause path.
 			DormantMember: "test-saved1",
 		},
 	}
@@ -859,6 +857,7 @@ func TestHandleDeletion_ScaleToZeroReparentsPVCAndSkipsMemberRemove(t *testing.T
 			DeletionTimestamp: &now,
 			Finalizers:        []string{MemberFinalizer},
 			Labels:            memberLabels("test", "test-saved1"),
+			Annotations:       map[string]string{PauseAnnotation: "true"},
 		},
 		Spec: lll.EtcdMemberSpec{
 			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
@@ -903,6 +902,93 @@ func TestHandleDeletion_ScaleToZeroReparentsPVCAndSkipsMemberRemove(t *testing.T
 		if o.Kind == "EtcdMember" {
 			t.Fatalf("PVC should no longer reference the EtcdMember as an owner; got %+v", got.OwnerReferences)
 		}
+	}
+}
+
+// TestHandleDeletion_PauseSurvivesStaleClusterCache covers the
+// cross-resource cache-stale race. The cluster controller issues two
+// writes during 1→0: first a Status() update setting DormantMember,
+// then a Delete on the member. The EtcdCluster and EtcdMember
+// informers cache independently, so the watch delivering the Delete
+// event to the member controller may fire BEFORE the cluster
+// informer's cache reflects the Status update. If the pause decision
+// keyed off cluster.Status.DormantMember, a stale read here would
+// fall through to MemberRemove (which silently no-ops for the last
+// member), and cascade GC would take the PVC.
+//
+// Switching the trigger to a pause annotation on the member itself
+// makes the read cache-coherent (same object that fired the watch).
+// This test stages the race by leaving cluster.Status.DormantMember
+// empty while the member carries the annotation, and asserts the
+// pause path still fires correctly.
+func TestHandleDeletion_PauseSurvivesStaleClusterCache(t *testing.T) {
+	ctx := context.Background()
+	tru := true
+
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test", Namespace: "ns", UID: types.UID("cluster-uid"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			ClusterID:    "deadbeef",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 0, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+			// Stale cache: the Status update setting DormantMember hasn't
+			// reached this informer yet. If the pause decision keyed off
+			// DormantMember, the finalizer would mistakenly take the
+			// normal removal path and the PVC would be lost.
+			DormantMember: "",
+		},
+	}
+	now := metav1.Now()
+	member := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-saved1", Namespace: "ns", UID: types.UID("member-uid"),
+			DeletionTimestamp: &now,
+			Finalizers:        []string{MemberFinalizer},
+			Labels:            memberLabels("test", "test-saved1"),
+			// Annotation is on the member (the object whose Delete event
+			// triggered the reconcile) — guaranteed cache-coherent.
+			Annotations: map[string]string{PauseAnnotation: "true"},
+		},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			InitialCluster: "x", ClusterToken: "ns-test-x", Bootstrap: true,
+		},
+		Status: lll.EtcdMemberStatus{MemberID: "0000000000000001", PodName: "test-saved1"},
+	}
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "data-test-saved1", Namespace: "ns",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "lllamnyp.su/v1alpha2", Kind: "EtcdMember",
+				Name: "test-saved1", UID: types.UID("member-uid"), Controller: &tru, BlockOwnerDeletion: &tru,
+			}},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+			},
+		},
+	}
+	c, _ := newTestClient(t, cluster, member, pvc)
+	fe := newFakeEtcd(0xdeadbeef, &etcdserverpb.Member{
+		ID: 0x1, Name: "test-saved1", PeerURLs: []string{peerURL("test-saved1", "test", "ns")},
+	})
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
+
+	if _, err := r.handleDeletion(ctx, member); err != nil {
+		t.Fatalf("handleDeletion: %v", err)
+	}
+	if len(fe.removeCalls) != 0 {
+		t.Fatalf("MemberRemove must not fire even with stale cluster.Status; got %v", fe.removeCalls)
+	}
+	got := mustGet(t, c, "data-test-saved1", "ns", &corev1.PersistentVolumeClaim{})
+	if !metav1.IsControlledBy(got, cluster) {
+		t.Fatalf("PVC must be reparented to EtcdCluster despite stale DormantMember; got %+v", got.OwnerReferences)
 	}
 }
 

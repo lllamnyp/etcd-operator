@@ -841,15 +841,21 @@ func TestScaleDown_PicksMostRecentlyCreatedVictim(t *testing.T) {
 	}
 }
 
-// TestScaleDown_OneToZeroSetsDormantMember covers the scale-to-zero
-// "pause" path. When desired=0 and only one member remains, scaleDown
-// must record the surviving member's name in status.DormantMember
-// BEFORE deleting the EtcdMember CR — that name is what
-// resurrectFromDormant looks up on the next scale-up.
+// TestScaleDown_OneToZeroSetsDormantMemberAndAnnotation covers the
+// scale-to-zero "pause" path. When desired=0 and only one member
+// remains, scaleDown must:
+//   - record the surviving member's name in status.DormantMember (so
+//     resurrectFromDormant can recreate the same member on a later
+//     scale-up),
+//   - stamp the pause annotation on the victim EtcdMember BEFORE
+//     issuing Delete (so the member controller's finalizer takes the
+//     pause path from a cache-coherent read — see PauseAnnotation's
+//     doc comment),
+//   - then delete the EtcdMember.
 //
 // The companion behaviour (PVC reparenting, MemberRemove skipped) lives
 // in the member-controller finalizer and is tested separately.
-func TestScaleDown_OneToZeroSetsDormantMember(t *testing.T) {
+func TestScaleDown_OneToZeroSetsDormantMemberAndAnnotation(t *testing.T) {
 	ctx := context.Background()
 	cluster := &lll.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
@@ -867,11 +873,15 @@ func TestScaleDown_OneToZeroSetsDormantMember(t *testing.T) {
 			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
 		},
 	}
+	// Pre-add a finalizer to the seed so the fake client's Delete leaves
+	// a DeletionTimestamp instead of removing the object — that lets us
+	// observe the pause annotation written just before Delete.
 	seed := lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "test-seed1", Namespace: "ns",
 			CreationTimestamp: metav1.Now(),
 			Labels:            memberLabels("test", "test-seed1"),
+			Finalizers:        []string{MemberFinalizer},
 		},
 		Spec: lll.EtcdMemberSpec{ClusterName: "test", InitialCluster: "x", Bootstrap: true},
 	}
@@ -885,13 +895,12 @@ func TestScaleDown_OneToZeroSetsDormantMember(t *testing.T) {
 	if cluster.Status.DormantMember != "test-seed1" {
 		t.Fatalf("status.DormantMember = %q, want %q", cluster.Status.DormantMember, "test-seed1")
 	}
-	// The EtcdMember CR is deleted; in production the finalizer would
-	// run first to reparent the PVC. The fake client (no finalizer)
-	// deletes immediately.
-	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "test-seed1"}, &lll.EtcdMember{}); err == nil {
-		t.Fatalf("EtcdMember should have been deleted after scaleDown 1->0")
-	} else if !apierrors.IsNotFound(err) {
-		t.Fatalf("unexpected error: %v", err)
+	got := mustGet(t, c, "test-seed1", "ns", &lll.EtcdMember{})
+	if got.Annotations[PauseAnnotation] != "true" {
+		t.Fatalf("pause annotation missing on victim; got annotations=%+v", got.Annotations)
+	}
+	if got.DeletionTimestamp.IsZero() {
+		t.Fatalf("EtcdMember should have a DeletionTimestamp after scaleDown 1→0")
 	}
 }
 
@@ -922,10 +931,19 @@ func TestScaleUp_ResurrectsDormant(t *testing.T) {
 		},
 	}
 	c, _ := newTestClient(t, cluster)
-	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead))}
+	fe := newFakeEtcd(0xdead)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
 
 	if _, err := r.scaleUp(ctx, cluster, nil); err != nil {
 		t.Fatalf("scaleUp resurrection: %v", err)
+	}
+	// Resurrection must not hit etcd at all — there is no etcd cluster
+	// reachable yet (the resurrected member's pod hasn't started). A
+	// regression that reintroduces an accidental MemberAdd here would
+	// either error or duplicate state.
+	if n := len(fe.addCalls) + len(fe.addLearnerCalls) + len(fe.promoteCalls) + len(fe.removeCalls); n != 0 {
+		t.Fatalf("resurrection must not call any etcd RPC; got add=%v addLearner=%v promote=%v remove=%v",
+			fe.addCalls, fe.addLearnerCalls, fe.promoteCalls, fe.removeCalls)
 	}
 	got := mustGet(t, c, "test-saved1", "ns", &lll.EtcdMember{})
 	if got.Name != "test-saved1" {
@@ -1062,6 +1080,112 @@ func TestUpdateStatus_PausedClusterReportsPausedCondition(t *testing.T) {
 	deg := condByType(lll.ClusterDegraded)
 	if deg == nil || deg.Status != metav1.ConditionFalse || deg.Reason != "Paused" {
 		t.Fatalf("Degraded condition = %+v, want False/Paused", deg)
+	}
+	if !strings.Contains(av.Message, "data-test-saved1") {
+		t.Fatalf("dormant Paused message should name the parked PVC; got %q", av.Message)
+	}
+}
+
+// TestUpdateStatus_PausedFreshZeroMessageDifferentiates: a cluster
+// created with replicas=0 from scratch (no DormantMember, no PVC, no
+// data) must NOT have a Paused message that claims data is being
+// preserved — there is nothing to preserve. Dashboards and runbooks
+// that key on the condition message would be misled otherwise.
+func TestUpdateStatus_PausedFreshZeroMessageDifferentiates(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(0),
+			Version:  "3.5.17",
+			Storage:  quickQty(t, "1Gi"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-test-x",
+			// No ClusterID (never bootstrapped), no DormantMember (never
+			// had a live member to park).
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 0, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+		},
+	}
+	c, _ := newTestClient(t, cluster)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead))}
+
+	if _, err := r.updateStatus(ctx, cluster, nil); err != nil {
+		t.Fatalf("updateStatus: %v", err)
+	}
+	mustGet(t, c, "test", "ns", cluster)
+
+	var av *metav1.Condition
+	for i := range cluster.Status.Conditions {
+		if cluster.Status.Conditions[i].Type == lll.ClusterAvailable {
+			av = &cluster.Status.Conditions[i]
+		}
+	}
+	if av == nil {
+		t.Fatalf("Available condition missing")
+	}
+	if av.Status != metav1.ConditionFalse || av.Reason != "Paused" {
+		t.Fatalf("Available condition = %+v, want False/Paused", av)
+	}
+	if strings.Contains(av.Message, "data is preserved") {
+		t.Fatalf("fresh-zero Paused message must NOT claim data preservation; got %q", av.Message)
+	}
+}
+
+// TestScaleUp_ClearsStaleDormantMemberDuringScaleUp covers the
+// scale-up sweep. During a 0→N scale-up (N≥2), the cluster sits in
+// current<desired for many reconciles before reaching updateStatus's
+// steady-state sweep. If DormantMember was left stale (e.g. by a
+// failed Status update after a successful resurrection Create),
+// /status would lie about the cluster being dormant throughout that
+// window. scaleUp clears DormantMember as soon as it observes live
+// members.
+func TestScaleUp_ClearsStaleDormantMemberDuringScaleUp(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns", UID: types.UID("cluster-uid")},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(2),
+			Version:  "3.5.17",
+			Storage:  quickQty(t, "1Gi"),
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken:  "ns-test-x",
+			ClusterID:     "deadbeef",
+			DormantMember: "test-saved1", // stale — live member of that name already exists.
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 2, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			},
+			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
+		},
+	}
+	live := lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-saved1", Namespace: "ns",
+			Labels: memberLabels("test", "test-saved1"),
+		},
+		Spec: lll.EtcdMemberSpec{ClusterName: "test", InitialCluster: "x", Bootstrap: true},
+		Status: lll.EtcdMemberStatus{
+			PodName: "test-saved1", MemberID: "abc",
+			Conditions: []metav1.Condition{{Type: lll.MemberReady, Status: metav1.ConditionTrue, Reason: "PodReady", LastTransitionTime: now}},
+		},
+	}
+	c, _ := newTestClient(t, cluster, &live)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdeadbeef,
+		&etcdserverpb.Member{ID: 0xa1, Name: "test-saved1", PeerURLs: []string{peerURL("test-saved1", "test", "ns")}},
+	))}
+
+	// One scaleUp call is enough — the sweep is at the top of scaleUp,
+	// right after the resurrection guard.
+	if _, err := r.scaleUp(ctx, cluster, []lll.EtcdMember{live}); err != nil {
+		t.Fatalf("scaleUp: %v", err)
+	}
+	mustGet(t, c, "test", "ns", cluster)
+	if cluster.Status.DormantMember != "" {
+		t.Fatalf("stale DormantMember should be swept by scaleUp; got %q", cluster.Status.DormantMember)
 	}
 }
 

@@ -19,6 +19,25 @@ const (
 	// MemberFinalizer is placed on EtcdMember resources to ensure
 	// graceful removal from the etcd cluster before deletion.
 	MemberFinalizer = "etcd.lllamnyp.su/member-cleanup"
+
+	// PauseAnnotation is set on an EtcdMember by the cluster controller
+	// just before issuing Delete on the 1→0 scale-down step. The member
+	// controller's finalizer keys off this annotation to take the
+	// scale-to-zero "pause" path (reparent PVC to cluster, skip
+	// MemberRemove).
+	//
+	// Why an annotation on the member rather than reading cluster
+	// status: controller-runtime caches the EtcdCluster and EtcdMember
+	// informers independently. When the member-controller's finalizer
+	// fires on the Delete event, the EtcdCluster cache may not yet
+	// reflect the status.DormantMember Status() update written by the
+	// cluster controller a few microseconds earlier — that would cause
+	// the finalizer to fall through to the normal MemberRemove path,
+	// then silently no-op for the last member (no peers to dial), and
+	// cascade GC would take the PVC. By stamping the signal onto the
+	// member CR itself, we read it from the same object whose Delete
+	// event triggered the reconcile — guaranteed cache-coherent.
+	PauseAnnotation = "etcd.lllamnyp.su/pause"
 )
 
 // peerURL returns the etcd peer URL for a member, using the headless Service DNS.

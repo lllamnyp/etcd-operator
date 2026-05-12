@@ -530,6 +530,24 @@ func (r *EtcdClusterReconciler) scaleUp(
 		return r.resurrectFromDormant(ctx, cluster)
 	}
 
+	// Defence-in-depth sweep: if DormantMember is set but live members
+	// exist, the cluster is no longer dormant — either the resurrection
+	// already happened (and resurrectFromDormant's Status() update
+	// silently lost the race against an apiserver Conflict) or the
+	// cluster was repopulated by some other path. The same sweep also
+	// runs from updateStatus, but updateStatus only fires from the
+	// current==desired branch — during a 0→N (N≥2) scale-up, the
+	// cluster sits in current<desired for many reconciles, and the
+	// field would otherwise stay stale until steady state. Clear here
+	// to keep /status honest throughout the scale-up window.
+	if cluster.Status.DormantMember != "" {
+		cluster.Status.DormantMember = ""
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
 	endpoints := memberEndpoints(members, cluster.Name, cluster.Namespace)
 	etcdClient, err := r.EtcdClientFactory(ctx, endpoints)
 	if err != nil {
@@ -712,6 +730,13 @@ func tryPromoteLearner(
 // the PVC was lost between pause and resume, etcd would start a fresh
 // cluster, diverging from the latched ClusterID — that's the documented
 // "don't delete the PVC while dormant" caveat.)
+//
+// Setting Bootstrap=true on the resurrected member is also safe with
+// respect to tryDiscoverCluster's seed-by-Bootstrap lookup: discovery
+// gates entirely on ClusterID=="", and resurrection runs only when
+// ClusterID is already latched (paused clusters preserve their
+// ClusterID across the pause). So the resurrected member's Bootstrap
+// flag never re-triggers discovery.
 func (r *EtcdClusterReconciler) resurrectFromDormant(
 	ctx context.Context,
 	cluster *lll.EtcdCluster,
@@ -846,9 +871,27 @@ func (r *EtcdClusterReconciler) scaleDown(
 	victim := members[0]
 
 	if cluster.Status.Observed != nil && cluster.Status.Observed.Replicas == 0 && len(members) == 1 {
+		// Latch DormantMember in cluster status first — scaleUp's
+		// resurrection path reads it to know which name to recreate.
+		// Then stamp the pause annotation on the victim BEFORE Delete:
+		// the finalizer keys off that annotation rather than reading
+		// cluster.Status (cache-coherence — see helpers.go comment on
+		// PauseAnnotation). Order matters: if we crash after the status
+		// update but before annotating, the next reconcile re-enters
+		// this branch and re-runs both writes idempotently.
 		if cluster.Status.DormantMember != victim.Name {
 			cluster.Status.DormantMember = victim.Name
 			if err := r.Status().Update(ctx, cluster); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		if victim.Annotations[PauseAnnotation] != "true" {
+			original := victim.DeepCopy()
+			if victim.Annotations == nil {
+				victim.Annotations = map[string]string{}
+			}
+			victim.Annotations[PauseAnnotation] = "true"
+			if err := r.Patch(ctx, &victim, client.MergeFrom(original)); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
@@ -908,9 +951,19 @@ func (r *EtcdClusterReconciler) updateStatus(
 	paused := desired == 0
 	switch {
 	case paused:
-		msg := "cluster is paused (spec.replicas=0); data is preserved on the EtcdCluster-owned PVC"
-		if cluster.Status.DormantMember != "" {
+		// Two flavours of paused:
+		//   - dormant: a member existed, was paused, its PVC is preserved.
+		//   - fresh-zero: the user created the cluster with replicas=0
+		//     from the start; no member was ever created and there is no
+		//     PVC. Don't claim "data is preserved" — there is no data to
+		//     preserve, and runbooks/dashboards keyed on the condition
+		//     message would mislead.
+		var msg string
+		switch {
+		case cluster.Status.DormantMember != "":
 			msg = fmt.Sprintf("cluster is paused (spec.replicas=0); data is preserved on PVC data-%s", cluster.Status.DormantMember)
+		default:
+			msg = "cluster is paused (spec.replicas=0); no data has been written (cluster never bootstrapped)"
 		}
 		if setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionFalse, "Paused", msg) {
 			changed = true

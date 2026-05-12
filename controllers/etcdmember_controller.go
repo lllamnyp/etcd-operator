@@ -122,14 +122,18 @@ func (r *EtcdMemberReconciler) handleDeletion(ctx context.Context, member *lll.E
 		return ctrl.Result{}, fmt.Errorf("get owner EtcdCluster: %w", err)
 	case !cluster.DeletionTimestamp.IsZero():
 		clusterDeleting = true
-	case cluster.Status.DormantMember == member.Name:
-		// The cluster controller marked this member as the dormant one
-		// (it is the final 1→0 step on the way to a scale-to-zero
-		// pause). Preserve the PVC and skip MemberRemove so etcd's
-		// local data dir stays intact for resurrection. Intermediate
-		// steps of a multi-member scale-to-zero (e.g. 3→2, 2→1) do
-		// NOT match this case — the cluster controller only latches
-		// DormantMember on the surviving member at the actual 1→0 step.
+	case member.Annotations[PauseAnnotation] == "true":
+		// The cluster controller stamped the pause annotation on this
+		// member just before Deleting it (the final 1→0 step on the way
+		// to a scale-to-zero pause). The signal is on the member itself
+		// rather than on cluster.Status.DormantMember so the read is
+		// cache-coherent — see PauseAnnotation's doc comment for why
+		// that matters (cross-resource cache races would otherwise drop
+		// the PVC on the last surviving member).
+		//
+		// Intermediate steps of a multi-member scale-to-zero (3→2, 2→1)
+		// do NOT have this annotation — the cluster controller only
+		// stamps it on the actual 1→0 step.
 		pauseToDormant = true
 	}
 
