@@ -191,9 +191,22 @@ func deriveClusterToken(cluster *lll.EtcdCluster) string {
 	return fmt.Sprintf("%s-%s-%s", cluster.Namespace, cluster.Name, cluster.UID)
 }
 
-// isBroken decides whether a member should be treated as broken (and replaced).
-// Stub: always false. Filled in once auto-replacement policy is decided.
-func (r *EtcdClusterReconciler) isBroken(_ lll.EtcdMember) bool {
+// isBroken decides whether a member should be treated as broken (and
+// replaced). For memory-backed members, "Pod UID was recorded, Pod not
+// currently present" is the unambiguous signal: the tmpfs is gone with
+// the Pod and the member cannot recover. The member controller responds
+// to the same condition by self-deleting the EtcdMember; this predicate
+// is what makes the count surface on EtcdCluster.status.brokenMembers
+// during the brief window between the loss being observed and the
+// member-controller deleting the CR.
+//
+// For PVC-backed members this stays a stub. Auto-replacement on PVC
+// loss is a richer policy decision (data dir corruption, irrecoverable
+// crashloop, etc.) and is not yet implemented.
+func (r *EtcdClusterReconciler) isBroken(m lll.EtcdMember) bool {
+	if m.Spec.StorageMedium == lll.StorageMediumMemory {
+		return m.Status.PodUID != "" && m.Status.PodName == ""
+	}
 	return false
 }
 
