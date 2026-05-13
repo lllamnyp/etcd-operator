@@ -2311,3 +2311,85 @@ func TestTryDiscoverCluster_LatchesAvailableTrueOnSuccess(t *testing.T) {
 
 // silence unused imports
 var _ = etcdserverpb.Member{}
+
+// TestBootstrap_PropagatesStorageMediumToSeed verifies the wiring:
+// EtcdCluster.spec.storageMedium=Memory must end up on the seed
+// EtcdMember's spec and on Status.Observed.StorageMedium (so the
+// locking pattern protects subsequent reconciles from a mid-flight
+// medium flip).
+//
+// Without this propagation the member controller would silently default
+// to a PVC volume even though the user asked for memory backing — a
+// catastrophic silent failure for the feature.
+func TestBootstrap_PropagatesStorageMediumToSeed(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Spec: lll.EtcdClusterSpec{
+			Replicas:      ptrInt32(3),
+			Version:       "3.5.17",
+			Storage:       quickQty(t, "256Mi"),
+			StorageMedium: lll.StorageMediumMemory,
+		},
+	}
+	c, _ := newTestClient(t, cluster)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdeadbeef))}
+
+	reconcileUntilStable(t, r, c, "test", "ns", 8)
+
+	// Observed snapshot must record the medium.
+	got := mustGet(t, c, "test", "ns", &lll.EtcdCluster{})
+	if got.Status.Observed == nil {
+		t.Fatalf("Status.Observed must be set after first reconciles")
+	}
+	if got.Status.Observed.StorageMedium != lll.StorageMediumMemory {
+		t.Fatalf("Observed.StorageMedium = %q, want %q", got.Status.Observed.StorageMedium, lll.StorageMediumMemory)
+	}
+
+	// Seed EtcdMember must inherit the medium.
+	members := &lll.EtcdMemberList{}
+	if err := c.List(ctx, members, client.InNamespace("ns")); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(members.Items) != 1 {
+		t.Fatalf("expected exactly one seed member; got %d", len(members.Items))
+	}
+	if members.Items[0].Spec.StorageMedium != lll.StorageMediumMemory {
+		t.Fatalf("seed Spec.StorageMedium = %q, want %q",
+			members.Items[0].Spec.StorageMedium, lll.StorageMediumMemory)
+	}
+}
+
+// TestSpecEqualsObserved_StorageMediumMatters guards the locking pattern:
+// flipping spec.storageMedium with an unchanged observed must be treated
+// as "spec differs from observed" so the deadline gate fires when the
+// in-flight target is reached. Without this the user could change the
+// medium mid-flight and the operator would silently lock the old value
+// permanently.
+func TestSpecEqualsObserved_StorageMediumMatters(t *testing.T) {
+	cluster := &lll.EtcdCluster{
+		Spec: lll.EtcdClusterSpec{
+			Replicas:      ptrInt32(3),
+			Version:       "3.5.17",
+			Storage:       quickQty(t, "1Gi"),
+			StorageMedium: lll.StorageMediumMemory,
+		},
+		Status: lll.EtcdClusterStatus{
+			Observed: &lll.ObservedClusterSpec{
+				Replicas:      3,
+				Version:       "3.5.17",
+				Storage:       quickQty(t, "1Gi"),
+				StorageMedium: lll.StorageMediumDefault, // mismatch
+			},
+		},
+	}
+	if specEqualsObserved(cluster) {
+		t.Fatalf("specEqualsObserved must return false when StorageMedium differs")
+	}
+
+	// Match restored — should be true.
+	cluster.Status.Observed.StorageMedium = lll.StorageMediumMemory
+	if !specEqualsObserved(cluster) {
+		t.Fatalf("specEqualsObserved must return true when all fields including StorageMedium match")
+	}
+}
