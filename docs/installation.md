@@ -116,7 +116,7 @@ spec:
   storageMedium: Memory
 ```
 
-This trades durability for speed: a Pod that loses its tmpfs (eviction, node failure) loses its data and the member is automatically replaced via `MemberRemove` + scale-up. **Don't use it as a general-purpose etcd backend** — see [docs/concepts.md](concepts.md#storage) and [docs/operations.md](operations.md#memory-backed-clusters) for the full trade-off, the production hardening this PR doesn't ship yet ([#16](https://github.com/lllamnyp/etcd-operator/issues/16)), and the `replicas: 0` wedge to avoid ([#15](https://github.com/lllamnyp/etcd-operator/issues/15)).
+This trades durability for speed: a Pod that loses its tmpfs (eviction, node failure) loses its data and the member is automatically replaced via `MemberRemove` + scale-up. **Don't use it as a general-purpose etcd backend** — see [docs/concepts.md](concepts.md#storage) and [docs/operations.md](operations.md#memory-backed-clusters) for the full trade-off, and the production hardening this PR doesn't ship yet ([#16](https://github.com/lllamnyp/etcd-operator/issues/16)). The apiserver rejects `replicas: 0` on memory clusters via the [CEL validation rules](concepts.md#apiserver-enforced-validation).
 
 ## Image versions
 

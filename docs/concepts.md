@@ -161,9 +161,18 @@ Three things are not yet auto-emitted and matter for production memory clusters 
 - **Pod anti-affinity**. Without it, scheduling can co-locate voters on one node; a single node failure then loses quorum on a 3-member cluster.
 - **Container memory limits**. Without `limits.memory`, tmpfs writes count against node memory rather than the pod's cgroup and the etcd container ends up in BestEffort/Burstable QoS — first to be evicted under pressure. Workaround: deploy a `LimitRange` in the cluster's namespace until a `spec.resources` field exists.
 
-### Known limitation: replicas=0 wedges
+### Apiserver-enforced validation
 
-Combining `spec.storageMedium: Memory` with `spec.replicas: 0` is not safe. The pause path flips `spec.dormant=true`, the Pod is deleted, the tmpfs is gone with it. On resume the cluster controller wakes the same member as if its data were preserved; etcd refuses to start because the data dir is empty but the member ID is in raft state. Until an admission webhook ([issue #15](https://github.com/lllamnyp/etcd-operator/issues/15)) blocks this combination, **delete and recreate the cluster instead of pausing it**.
+Four CEL `x-kubernetes-validations` rules on `EtcdClusterSpec` are evaluated at admission time (k8s 1.28+ required for the `quantity()` library):
+
+| Rule | When | Why |
+|---|---|---|
+| `storageMedium` immutable | UPDATE | Flipping the medium would orphan the previous PVC (or tmpfs); rolling-migrate is not implemented. |
+| `replicas: 0` + `storageMedium: Memory` rejected | CREATE + UPDATE | The pause path deletes the Pod, the tmpfs evaporates, and resume would silently produce an empty data dir; etcd refuses to start. |
+| `storage > 0` when `storageMedium: Memory` | CREATE + UPDATE | Zero `Storage` produces an unbounded tmpfs `SizeLimit` against node memory. |
+| `storage` cannot shrink | UPDATE | PVCs cannot shrink and tmpfs `SizeLimit` reduction does not free allocated memory. |
+
+These rules live in the CRD itself; the apiserver enforces them with no separate webhook, no cert-manager, no extra Deployment. Errors come back as standard apiserver admission rejections (`kubectl apply` prints the rule's `message` field).
 
 ## Conditions
 
