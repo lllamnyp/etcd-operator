@@ -119,6 +119,34 @@ func (r *EtcdMemberReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
+	// Memory-backed pod-loss detection: a tmpfs emptyDir dies with the Pod,
+	// so a missing Pod whose UID we previously recorded means the data is
+	// permanently lost. Re-creating a fresh Pod here would fail to rejoin
+	// the cluster (this member's ID is in raft state but the WAL is empty).
+	// Self-delete instead — the finalizer runs MemberRemove against peers
+	// (quorum permitting) and the cluster controller's gap-fill creates a
+	// replacement EtcdMember with a fresh member ID.
+	//
+	// If quorum is already lost (e.g. >floor((n-1)/2) memory members lost
+	// simultaneously), MemberRemove will fail and the member stays in
+	// Terminating until quorum returns. That is the correct outcome for
+	// memory-backed clusters: the cluster is dead and the user has to
+	// recreate.
+	if member.Spec.StorageMedium == lll.StorageMediumMemory && member.Status.PodUID != "" {
+		lost, err := r.memoryMemberPodLost(ctx, member)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if lost {
+			log.Info("memory-backed member's pod is gone; deleting member for replacement",
+				"previousPodUID", member.Status.PodUID)
+			if err := r.Delete(ctx, member); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, nil
+		}
+	}
+
 	if err := r.ensurePVC(ctx, member); err != nil {
 		log.Error(err, "failed to ensure PVC")
 		return ctrl.Result{}, err
@@ -130,6 +158,22 @@ func (r *EtcdMemberReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	return r.updateStatus(ctx, member)
+}
+
+// memoryMemberPodLost reports whether the Pod we previously recorded a
+// UID for is gone (NotFound) or has been replaced by a Pod with a
+// different UID. A Terminating Pod with the recorded UID still counts as
+// present — wait for kubelet GC before declaring loss.
+func (r *EtcdMemberReconciler) memoryMemberPodLost(ctx context.Context, member *lll.EtcdMember) (bool, error) {
+	pod := &corev1.Pod{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: member.Namespace, Name: member.Name}, pod)
+	if errors.IsNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return string(pod.UID) != member.Status.PodUID, nil
 }
 
 // ── Deletion ─────────────────────────────────────────────────────────────
