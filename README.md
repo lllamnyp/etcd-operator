@@ -25,7 +25,7 @@ The full design rationale is in [docs/concepts.md](docs/concepts.md).
 
 ## What's not supported (yet)
 
-No TLS. No auth/RBAC inside etcd. No in-place version upgrades (changing `spec.version` only affects newly-created members). No PVC resizing — see [#2](https://github.com/lllamnyp/etcd-operator/issues/2). No automatic broken-member replacement (the predicate is stubbed; `status.brokenMembers` always reads 0). No backups, no defragmentation scheduling, no PodAntiAffinity by default. See the [issue tracker](https://github.com/lllamnyp/etcd-operator/issues) for the running follow-up list.
+No TLS. No auth/RBAC inside etcd. No in-place version upgrades (changing `spec.version` only affects newly-created members). No PVC resizing — see [#2](https://github.com/lllamnyp/etcd-operator/issues/2). No automatic broken-member replacement for PVC-backed clusters (memory-backed members do auto-replace on Pod loss; `status.brokenMembers` reads 0 in practice — see [docs/concepts.md](docs/concepts.md#storage)). No backups, no defragmentation scheduling, no PodAntiAffinity by default. See the [issue tracker](https://github.com/lllamnyp/etcd-operator/issues) for the running follow-up list.
 
 ## Quick start
 
