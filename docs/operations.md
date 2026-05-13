@@ -207,7 +207,7 @@ This pushes the cluster into the terminal-error state immediately. Recovery foll
 
 ## Broken member
 
-Recovery from a permanently broken member (e.g. PVC lost, node retired) is currently manual. The operator's `isBroken` predicate is a stub; auto-replacement is not wired up (see [concepts](concepts.md#what-is-not-in-the-design)).
+Recovery from a permanently broken **PVC-backed** member (e.g. PVC lost, node retired) is currently manual. Memory-backed members are auto-replaced on Pod loss — see [Memory-backed clusters](#memory-backed-clusters) above. For PVC-backed clusters the `isBroken` predicate stays a stub; auto-replacement is not wired up (see [concepts](concepts.md#what-is-not-in-the-design)).
 
 Manual recovery:
 
@@ -377,6 +377,8 @@ The operator detects Pod loss via `Status.PodUID`. The two scenarios:
 
 - **Single Pod lost while quorum holds**: operator deletes the EtcdMember CR, finalizer runs `MemberRemove` against peers, cluster controller's scale-up creates a fresh replacement with a new `GenerateName` and a new etcd member ID. The cluster heals automatically.
 - **More than quorum lost simultaneously**: `MemberRemove` against the surviving peers fails (no quorum), the dying members sit in `Terminating`. The cluster is dead and the user has to recreate.
+
+**Detection latency depends on what killed the Pod.** A `kubectl delete pod` or kubelet eviction transitions the Pod to NotFound within seconds — auto-replacement starts on the next reconcile (~5 s). A node going NotReady is slower: the kubelet on a healthy node would clean up immediately, but the kube-controller-manager's `--pod-eviction-timeout` (default 5 minutes) gates the Pod's transition out of Terminating. Until then the operator's loss check sees a Pod with the same UID (status reports it as Terminating but it still exists from the API's perspective) and waits — better than racing the kubelet GC. So budget **up to 5 minutes of degraded quorum** when an etcd-hosting node fails unannounced. Tune `kube-controller-manager --pod-eviction-timeout` cluster-wide if you need it shorter; this is outside the operator's control.
 
 Watch the auto-replacement happen:
 

@@ -151,7 +151,7 @@ The member controller self-deletes the `EtcdMember`. The existing finalizer runs
 
 If quorum is already lost across multiple simultaneous failures, `MemberRemove` will fail and the dying members stay in `Terminating` until quorum returns. That is the correct outcome: the cluster is dead and the user has to recreate it. The operator does not try to be clever about restoring a quorum from inconsistent half-states.
 
-`Status.BrokenMembers` reports the count of memory members currently in the lost-Pod state (typically 0 in steady state, briefly non-zero between the loss being observed and the member being deleted). For PVC-backed members `isBroken` stays a stub; richer detection (corruption, irrecoverable crashloop) is a future concern.
+`Status.BrokenMembers` stays at 0 in normal operation, including across a memory pod-loss + auto-replacement cycle. The `isBroken` predicate is implemented for memory members (lost-Pod state), but the member controller intercepts the loss and self-deletes the member in the same reconcile pass — by the time the cluster controller computes the count, the lost member is already `Terminating` and excluded from the running set. The field exists as a future hook for broken-member detection policies that don't immediately tear the member down (e.g. PVC corruption with a grace period). For PVC-backed members today, `isBroken` stays a stub; richer detection is a future concern.
 
 ### What is missing from memory clusters today
 
