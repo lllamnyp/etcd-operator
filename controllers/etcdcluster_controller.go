@@ -920,8 +920,15 @@ func (r *EtcdClusterReconciler) updateStatus(
 	paused := desired == 0
 	switch {
 	case paused:
-		// Two flavours of paused:
-		//   - dormant: a member existed, was paused, its PVC is preserved.
+		// Three flavours of paused:
+		//   - dormant + PVC-backed: a member existed, was paused, its PVC
+		//     is preserved; scale-up resumes the same etcd cluster.
+		//   - dormant + memory-backed: the user paused a memory cluster
+		//     despite docs saying not to (admission webhook in #15 will
+		//     reject this combination). The tmpfs went with the Pod and
+		//     there is no PVC; the cluster cannot be resumed. The condition
+		//     is still Paused (the cluster is paused) but the message
+		//     must not claim durability the cluster doesn't have.
 		//   - fresh-zero: the user created the cluster with replicas=0
 		//     from the start; no member was ever created and there is no
 		//     PVC. Don't claim "data is preserved" — there is no data to
@@ -929,6 +936,8 @@ func (r *EtcdClusterReconciler) updateStatus(
 		//     message would mislead.
 		var msg string
 		switch {
+		case dormant != nil && dormant.Spec.StorageMedium == lll.StorageMediumMemory:
+			msg = "cluster is paused (spec.replicas=0); data was on tmpfs and has been lost — recreate the cluster to resume"
 		case dormant != nil:
 			msg = fmt.Sprintf("cluster is paused (spec.replicas=0); data is preserved on PVC data-%s", dormant.Name)
 		default:
