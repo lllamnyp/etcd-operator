@@ -31,6 +31,8 @@ make docker-build docker-push IMG=<your-registry>/etcd-operator:<tag>
 make deploy IMG=<your-registry>/etcd-operator:<tag>
 ```
 
+The cluster must be able to pull from `<your-registry>`. For local clusters (`kind` / `minikube` / `k3d`), either sideload the image (`kind load docker-image ...`) or push to an ephemeral registry the cluster can reach (e.g. `ttl.sh/<random>:1h`); otherwise the operator Deployment goes `ImagePullBackOff` with no clear hint from the operator side.
+
 By default this lands in the `etcd-operator-system` namespace. The deployment name is `etcd-operator-controller-manager`. Verify:
 
 ```sh
@@ -121,20 +123,14 @@ All pinned in `go.mod`, `Dockerfile`, and `Makefile`.
 
 The operator runs as a ClusterRole — it needs to watch `EtcdCluster` and `EtcdMember` across all namespaces, plus create/delete the per-member Pods, PVCs, and Services in each user namespace. The full role lives in `config/rbac/role.yaml` (regenerated from `+kubebuilder:rbac` markers — don't hand-edit).
 
-If you want to scope it down (e.g. to a single namespace), you'd need to:
-
-1. Convert the ClusterRole to a Role (lose cross-namespace coverage).
-2. Bind it via a RoleBinding in just the target namespace.
-3. Set the operator's manager to watch a single namespace via `--namespace=<ns>` (see `main.go` — currently unset, meaning all namespaces).
-
-Not officially supported, but mechanically straightforward.
+Single-namespace scoping is not currently exposed: `cmd/main.go` does not wire a namespace flag into the manager's `Cache.DefaultNamespaces`, so the manager always watches all namespaces. Limiting RBAC alone (ClusterRole → Role) is not sufficient — the manager will still attempt list/watch across the cluster and the API server will deny it. Scoped deployment is a follow-up.
 
 ## Networking
 
 The operator creates two Services per `EtcdCluster`:
 
-- **`<cluster>`** — headless (`clusterIP: None`), `publishNotReadyAddresses: true`, selector `etcd.lllamnyp.su/cluster=<cluster>`. Used by the operator and by etcd itself for peer discovery. The `publishNotReadyAddresses` setting is required for bootstrap: members during the initial join window aren't `Ready` yet but still need DNS entries to find each other.
-- **`<cluster>-client`** — `ClusterIP`, exposes port 2379 only. Intended for client traffic.
+- **`<cluster>`** — headless (`clusterIP: None`), `publishNotReadyAddresses: true`, selector `etcd.lllamnyp.su/cluster=<cluster>`, exposes **both 2379 (client) and 2380 (peer)**. Used by etcd for peer discovery and by the operator's own etcd client (which dials per-pod DNS `<member>.<cluster>.<ns>.svc:2379` resolved through this service). `publishNotReadyAddresses` is required for bootstrap: members during the initial join window aren't `Ready` yet but still need DNS entries to find each other.
+- **`<cluster>-client`** — `ClusterIP`, exposes 2379 only. Intended for end-user client traffic (load-balanced across all pods backing the selector).
 
 External access (NodePort / LoadBalancer / Ingress) isn't created automatically. If you need it, layer a separate Service or Ingress on top of `<cluster>-client`'s selector.
 

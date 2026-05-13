@@ -30,7 +30,10 @@ No TLS. No auth/RBAC inside etcd. No in-place version upgrades (changing `spec.v
 
 ```sh
 # 1. Install CRDs and the operator. Builds an image and pushes it to your
-#    registry; substitute IMG= for a prebuilt tag if you have one.
+#    registry; substitute IMG= for a prebuilt tag if you have one. The cluster
+#    must be able to pull from <your-registry> — for local clusters (kind /
+#    minikube / k3d) sideload the image or use an ephemeral registry such as
+#    ttl.sh, otherwise the operator Deployment will sit in ImagePullBackOff.
 make install
 make docker-build docker-push deploy IMG=<your-registry>/etcd-operator:<tag>
 
@@ -71,7 +74,15 @@ For step-by-step setup, RBAC, image versions, and teardown see [docs/installatio
 go test ./controllers/...
 ```
 
-The suite uses controller-runtime's fake client and a fake etcd client; no envtest assets needed at the unit level. The tests pin: bootstrap (single-seed, idempotent recovery, GenerateName); locking pattern (Observed/ProgressDeadline mid-flight locking, bootstrap-deadline as terminal); scale-up (learner-mode, readiness gate, both crash-recovery branches between Create/AddAsLearner/Patch); scale-down (CreationTimestamp DESC selection, finalizer-driven MemberRemove); scale-to-zero (1→0 Patches `spec.dormant`, 0→1 flips it back, dormant member's Pod gone but PVC preserved); discovery (seed found via `spec.bootstrap=true`, voter-only endpoint filtering for `MemberList`); status no-churn at steady state.
+The suite uses controller-runtime's fake client and a fake etcd client; no envtest assets needed at the unit level. Pinned behaviours:
+
+- **Bootstrap** — single-seed creation, idempotent recovery, `GenerateName`-assigned names.
+- **Locking pattern** — `status.observed` / `progressDeadline` lock the in-flight target; bootstrap-deadline is terminal.
+- **Scale up** — learner-mode add, readiness gate before the next step, crash-recovery branches between `Create` / `MemberAddAsLearner` / `Patch(initialCluster)`.
+- **Scale down** — `CreationTimestamp` DESC (name DESC tiebreak) victim selection, finalizer-driven `MemberRemove`.
+- **Scale to zero** — 1→0 Patches `spec.dormant=true`; 0→1 flips it back; dormant member's Pod is gone but its PVC is preserved.
+- **Discovery** — seed found via `spec.bootstrap=true`; etcd client endpoints filtered to voters (`MemberReady=True`) so `MemberList` doesn't route to a learner.
+- **Status no-churn** — steady-state reconciles don't repeatedly mutate status.
 
 ## License
 

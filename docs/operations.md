@@ -43,7 +43,7 @@ kubectl patch etcdcluster.lllamnyp.su <name> -n <ns> --type=merge \
   -p '{"spec":{"replicas":5}}'
 ```
 
-The operator adds one member at a time as a learner, waits for it to report `Ready=True`, then promotes it before adding the next. A 1→5 scale-up takes a few minutes per step on most clusters because etcd has to copy the data dir to each new learner before promotion is allowed. Watch progress with:
+The operator adds one member at a time as a learner, waits for it to report `Ready=True`, then promotes it before adding the next. Each step is gated on the previous learner reaching `Ready`. On a fresh cluster with no data each step completes in well under a second on etcd's side and the operator's reconcile cadence (~30 s requeue) dominates wall time; on clusters with non-trivial data volumes the learner-sync time can become the dominant factor (etcd has to ship the data dir before `MemberPromote` is accepted). Watch progress with:
 
 ```sh
 kubectl get etcdcluster.lllamnyp.su <name> -n <ns> \
@@ -181,15 +181,18 @@ The next reconcile notices `spec != observed`, treats your edit as the intervent
 
 ### `Progressing=True/WaitingForSeed`
 
-The seed CR exists but its Pod hasn't been created yet (PVC pending, image pulling, node scheduling). Check the Pod's events:
+The seed `EtcdMember` CR exists but the member controller hasn't yet created its Pod — this is the gap between the cluster controller creating the CR and the member controller's next reconcile pass. `kubectl describe pod` is **not** useful here: there is no Pod yet, so it returns "not found" and obscures the actual state. Inspect the CR and the namespace's events instead:
 
 ```sh
 SEED=$(kubectl get etcdmember.lllamnyp.su -n <ns> \
   -o jsonpath='{.items[?(@.spec.bootstrap==true)].metadata.name}')
-kubectl describe pod -n <ns> "$SEED"
+kubectl describe etcdmember.lllamnyp.su -n <ns> "$SEED"
+kubectl get events -n <ns> --field-selector involvedObject.name=$SEED
 ```
 
-Common causes: no `StorageClass` matching the requested storage, image-pull failure, `PodSecurity` admission rejecting the spec (the operator deploys with `restricted` profile-compatible settings; if your namespace enforces stricter, you'll see admission errors here).
+In normal operation this state clears within one or two reconcile cycles. If it persists, the operator controller is wedged — check its logs (see [Operator logs](#operator-logs)).
+
+Once the seed Pod is created, `WaitingForSeed` clears and any *Pod*-side problems (`StorageClass` missing, image-pull failure, `PodSecurity` admission rejection of the `restricted`-compatible spec) surface separately. At that point `kubectl describe pod -l etcd.lllamnyp.su/cluster=<cluster> -n <ns>` is the right tool.
 
 ## Forcing escalation: shortening the deadline
 
