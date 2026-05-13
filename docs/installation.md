@@ -99,6 +99,25 @@ kubectl exec -it "$POD" -- etcdctl --endpoints=http://localhost:2379 \
 
 Don't hard-code Pod names — they carry a random suffix from `GenerateName` (e.g. `my-etcd-7xq2k`). The label selector is the stable handle.
 
+### Memory-backed variant
+
+For reconstructable workloads (e.g. a Kubernetes-in-Kubernetes apiserver whose state is GitOps-managed) you can opt the cluster onto a tmpfs `emptyDir` instead of a PVC:
+
+```yaml
+apiVersion: lllamnyp.su/v1alpha2
+kind: EtcdCluster
+metadata:
+  name: my-mem-etcd
+  namespace: default
+spec:
+  replicas: 3
+  version: 3.5.17
+  storage: 256Mi       # tmpfs SizeLimit per member
+  storageMedium: Memory
+```
+
+This trades durability for speed: a Pod that loses its tmpfs (eviction, node failure) loses its data and the member is automatically replaced via `MemberRemove` + scale-up. **Don't use it as a general-purpose etcd backend** — see [docs/concepts.md](concepts.md#storage) and [docs/operations.md](operations.md#memory-backed-clusters) for the full trade-off, the production hardening this PR doesn't ship yet ([#16](https://github.com/lllamnyp/etcd-operator/issues/16)), and the `replicas: 0` wedge to avoid ([#15](https://github.com/lllamnyp/etcd-operator/issues/15)).
+
 ## Image versions
 
 `spec.version` in an `EtcdCluster` becomes `quay.io/coreos/etcd:v<version>`. The image repository is hard-coded in `controllers/helpers.go:EtcdImage`. Override it by patching the operator image with your own registry/repo if you mirror etcd internally.
