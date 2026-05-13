@@ -1062,6 +1062,67 @@ func TestUpdateStatus_PausedFreshZeroMessageDifferentiates(t *testing.T) {
 	}
 }
 
+// TestUpdateStatus_PausedMessageHonestForMemoryMember verifies the
+// Paused condition does not claim "data is preserved on PVC data-X"
+// when the dormant member is memory-backed (no PVC ever existed; the
+// tmpfs evaporated with the Pod). Until admission gates the
+// replicas=0+memory combination (issue #15), the operator allows this
+// wedge to be entered — but the condition message must not mislead
+// runbooks or dashboards about durability.
+func TestUpdateStatus_PausedMessageHonestForMemoryMember(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: "ns"},
+		Spec: lll.EtcdClusterSpec{
+			Replicas:      ptrInt32(0),
+			Version:       "3.5.17",
+			Storage:       quickQty(t, "128Mi"),
+			StorageMedium: lll.StorageMediumMemory,
+		},
+		Status: lll.EtcdClusterStatus{
+			Observed: &lll.ObservedClusterSpec{
+				Replicas:      0,
+				Version:       "3.5.17",
+				Storage:       quickQty(t, "128Mi"),
+				StorageMedium: lll.StorageMediumMemory,
+			},
+		},
+	}
+	dormant := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "c-x", Namespace: "ns", Labels: memberLabels("c", "c-x")},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName:   "c",
+			Version:       "3.5.17",
+			Storage:       quickQty(t, "128Mi"),
+			StorageMedium: lll.StorageMediumMemory,
+			Dormant:       true,
+		},
+	}
+	c, _ := newTestClient(t, cluster, dormant)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead))}
+
+	if _, err := r.updateStatus(ctx, cluster, []lll.EtcdMember{*dormant}); err != nil {
+		t.Fatalf("updateStatus: %v", err)
+	}
+	got := mustGet(t, c, "c", "ns", &lll.EtcdCluster{})
+
+	var av *metav1.Condition
+	for i := range got.Status.Conditions {
+		if got.Status.Conditions[i].Type == lll.ClusterAvailable {
+			av = &got.Status.Conditions[i]
+		}
+	}
+	if av == nil {
+		t.Fatalf("Available condition missing")
+	}
+	if av.Status != metav1.ConditionFalse || av.Reason != "Paused" {
+		t.Fatalf("Available condition = %+v, want False/Paused", av)
+	}
+	if strings.Contains(av.Message, "PVC data-") || strings.Contains(av.Message, "data is preserved") {
+		t.Fatalf("memory-member Paused message must not claim a PVC or preserved data; got %q", av.Message)
+	}
+}
+
 // TestReconcile_FreshZeroReplicasSkipsBootstrap: an EtcdCluster created
 // with spec.replicas=0 from scratch must NOT bootstrap a transient seed.
 // Without the short-circuit, the reconcile loop would create a seed
@@ -2311,3 +2372,85 @@ func TestTryDiscoverCluster_LatchesAvailableTrueOnSuccess(t *testing.T) {
 
 // silence unused imports
 var _ = etcdserverpb.Member{}
+
+// TestBootstrap_PropagatesStorageMediumToSeed verifies the wiring:
+// EtcdCluster.spec.storageMedium=Memory must end up on the seed
+// EtcdMember's spec and on Status.Observed.StorageMedium (so the
+// locking pattern protects subsequent reconciles from a mid-flight
+// medium flip).
+//
+// Without this propagation the member controller would silently default
+// to a PVC volume even though the user asked for memory backing — a
+// catastrophic silent failure for the feature.
+func TestBootstrap_PropagatesStorageMediumToSeed(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Spec: lll.EtcdClusterSpec{
+			Replicas:      ptrInt32(3),
+			Version:       "3.5.17",
+			Storage:       quickQty(t, "256Mi"),
+			StorageMedium: lll.StorageMediumMemory,
+		},
+	}
+	c, _ := newTestClient(t, cluster)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdeadbeef))}
+
+	reconcileUntilStable(t, r, c, "test", "ns", 8)
+
+	// Observed snapshot must record the medium.
+	got := mustGet(t, c, "test", "ns", &lll.EtcdCluster{})
+	if got.Status.Observed == nil {
+		t.Fatalf("Status.Observed must be set after first reconciles")
+	}
+	if got.Status.Observed.StorageMedium != lll.StorageMediumMemory {
+		t.Fatalf("Observed.StorageMedium = %q, want %q", got.Status.Observed.StorageMedium, lll.StorageMediumMemory)
+	}
+
+	// Seed EtcdMember must inherit the medium.
+	members := &lll.EtcdMemberList{}
+	if err := c.List(ctx, members, client.InNamespace("ns")); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(members.Items) != 1 {
+		t.Fatalf("expected exactly one seed member; got %d", len(members.Items))
+	}
+	if members.Items[0].Spec.StorageMedium != lll.StorageMediumMemory {
+		t.Fatalf("seed Spec.StorageMedium = %q, want %q",
+			members.Items[0].Spec.StorageMedium, lll.StorageMediumMemory)
+	}
+}
+
+// TestSpecEqualsObserved_StorageMediumMatters guards the locking pattern:
+// flipping spec.storageMedium with an unchanged observed must be treated
+// as "spec differs from observed" so the deadline gate fires when the
+// in-flight target is reached. Without this the user could change the
+// medium mid-flight and the operator would silently lock the old value
+// permanently.
+func TestSpecEqualsObserved_StorageMediumMatters(t *testing.T) {
+	cluster := &lll.EtcdCluster{
+		Spec: lll.EtcdClusterSpec{
+			Replicas:      ptrInt32(3),
+			Version:       "3.5.17",
+			Storage:       quickQty(t, "1Gi"),
+			StorageMedium: lll.StorageMediumMemory,
+		},
+		Status: lll.EtcdClusterStatus{
+			Observed: &lll.ObservedClusterSpec{
+				Replicas:      3,
+				Version:       "3.5.17",
+				Storage:       quickQty(t, "1Gi"),
+				StorageMedium: lll.StorageMediumDefault, // mismatch
+			},
+		},
+	}
+	if specEqualsObserved(cluster) {
+		t.Fatalf("specEqualsObserved must return false when StorageMedium differs")
+	}
+
+	// Match restored — should be true.
+	cluster.Status.Observed.StorageMedium = lll.StorageMediumMemory
+	if !specEqualsObserved(cluster) {
+		t.Fatalf("specEqualsObserved must return true when all fields including StorageMedium match")
+	}
+}

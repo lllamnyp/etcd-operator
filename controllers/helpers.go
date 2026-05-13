@@ -191,9 +191,25 @@ func deriveClusterToken(cluster *lll.EtcdCluster) string {
 	return fmt.Sprintf("%s-%s-%s", cluster.Namespace, cluster.Name, cluster.UID)
 }
 
-// isBroken decides whether a member should be treated as broken (and replaced).
-// Stub: always false. Filled in once auto-replacement policy is decided.
-func (r *EtcdClusterReconciler) isBroken(_ lll.EtcdMember) bool {
+// isBroken decides whether a member should be treated as broken. In the
+// current implementation the field it drives — EtcdCluster.status.broken
+// Members — stays at 0 in practice, because the member controller
+// detects memory-backed Pod loss and self-deletes the EtcdMember in the
+// same reconcile pass; by the time updateStatus runs over the running
+// set the lost member is already Terminating and filtered out.
+//
+// The predicate is left in place as a hook for future broken-member
+// detection policies that don't tear the member down immediately (e.g.
+// PVC corruption with a grace period, irrecoverable crashloop with a
+// retry budget). The "memory member with PodUID recorded but PodName
+// empty" condition would only arise if the member-controller's loss
+// path is delayed or fails after a partial Status write — defensive
+// rather than expected. For PVC-backed members the predicate stays a
+// stub.
+func (r *EtcdClusterReconciler) isBroken(m lll.EtcdMember) bool {
+	if m.Spec.StorageMedium == lll.StorageMediumMemory {
+		return m.Status.PodUID != "" && m.Status.PodName == ""
+	}
 	return false
 }
 

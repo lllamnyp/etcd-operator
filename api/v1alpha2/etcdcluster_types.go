@@ -31,6 +31,35 @@ const (
 	ClusterDegraded = "Degraded"
 )
 
+// StorageMedium selects the volume backend for each member's etcd data
+// directory. The values mirror corev1.StorageMedium semantics: the empty
+// string is the default (a PVC backed by the namespace's default
+// StorageClass) and "Memory" is a tmpfs emptyDir whose lifetime is bound
+// to the Pod.
+//
+// Memory-backed clusters trade durability for speed: a Pod that loses its
+// tmpfs (eviction, node failure, deletion) loses its data and the member
+// must be replaced. The operator detects this and removes the member via
+// the existing finalizer flow; the cluster controller's scale-up gap-fill
+// then creates a replacement member. This works only when quorum holds
+// across the loss, so a single-replica memory cluster cannot survive a
+// Pod eviction.
+//
+// Production memory clusters should also have a PodDisruptionBudget, hard
+// pod-anti-affinity, and a container memory limit covering the tmpfs size
+// plus etcd's own headroom. None of that is auto-emitted by the operator
+// yet — see https://github.com/lllamnyp/etcd-operator/issues/16.
+//
+// +kubebuilder:validation:Enum="";Memory
+type StorageMedium string
+
+const (
+	// StorageMediumDefault uses a PersistentVolumeClaim per member.
+	StorageMediumDefault StorageMedium = ""
+	// StorageMediumMemory uses a tmpfs emptyDir per member.
+	StorageMediumMemory StorageMedium = "Memory"
+)
+
 // EtcdClusterSpec defines the desired state of an etcd cluster.
 type EtcdClusterSpec struct {
 	// Replicas is the desired number of cluster members. Should be odd.
@@ -50,11 +79,27 @@ type EtcdClusterSpec struct {
 	// +kubebuilder:validation:Pattern=`^\d+\.\d+\.\d+$`
 	Version string `json:"version"`
 
-	// Storage is the requested PVC size per member for the etcd data directory.
-	// Uses the default StorageClass.
+	// Storage is the requested size per member for the etcd data directory.
+	// For StorageMedium="" (PVC) this is the PVC's requested capacity backed by
+	// the default StorageClass. For StorageMedium="Memory" this is the tmpfs
+	// emptyDir's SizeLimit.
 	// +kubebuilder:default="1Gi"
 	// +optional
 	Storage resource.Quantity `json:"storage,omitempty"`
+
+	// StorageMedium selects the volume backend for each member's data
+	// directory. Empty string (the default) means a PVC; "Memory" means a
+	// tmpfs emptyDir whose lifetime is bound to the Pod. See the
+	// StorageMedium type doc for the operational trade-offs.
+	//
+	// Combining StorageMedium=Memory with replicas=0 currently wedges the
+	// cluster on resume (the tmpfs is gone but the cluster controller wakes
+	// the member as if its data were preserved). Until that is properly
+	// gated by an admission webhook
+	// (https://github.com/lllamnyp/etcd-operator/issues/15), do not pause a
+	// memory-backed cluster — delete and recreate instead.
+	// +optional
+	StorageMedium StorageMedium `json:"storageMedium,omitempty"`
 
 	// ProgressDeadlineSeconds bounds the time the operator spends trying to
 	// reach a desired state before abandoning the in-flight target and
@@ -79,8 +124,14 @@ type ObservedClusterSpec struct {
 	// Version is the locked target etcd version.
 	Version string `json:"version"`
 
-	// Storage is the locked target PVC size.
+	// Storage is the locked target data-directory size.
 	Storage resource.Quantity `json:"storage"`
+
+	// StorageMedium is the locked target storage backend. The locking
+	// pattern prevents a mid-flight medium flip from being honoured until
+	// the current target is reached or its deadline expires.
+	// +optional
+	StorageMedium StorageMedium `json:"storageMedium,omitempty"`
 }
 
 // EtcdClusterStatus defines the observed state of an etcd cluster.

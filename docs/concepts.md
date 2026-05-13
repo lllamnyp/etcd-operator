@@ -121,6 +121,50 @@ An earlier iteration of this feature deleted the CR, reparented the PVC to the `
 
 The single exception is the steady-state call to `updateStatus`, which receives the full active set (including dormant). `updateStatus`'s Paused branch uses `findDormantMember(members)` to name the parked PVC in the `Available=False/Paused` message. Stripping the dormant member at that call site would silently fall back to the fresh-zero "no data has been written" message even on real dormant clusters. The asymmetry is deliberate and the call site is commented.
 
+## Storage
+
+Each member's data dir is backed by one of two volume types, selected per-cluster via `spec.storageMedium`. The locking pattern protects the medium just like `replicas` and `version` — a mid-flight flip is locked out until the current target is reached or the deadline expires.
+
+| `spec.storageMedium` | Backend | Lifetime | Pod loss → |
+|---|---|---|---|
+| `""` (default) | PVC, default `StorageClass`, `ReadWriteOnce` | Survives Pod restart, eviction, node failure (re-attached to new Pod). | Same Pod / new Pod re-uses existing data dir; etcd rejoins with the same member ID and `ClusterID`. |
+| `"Memory"` | `emptyDir{medium: Memory}` with `sizeLimit: spec.storage` | Bound to the Pod. Container restart preserves tmpfs; Pod deletion / eviction / node failure destroys it. | Operator detects Pod loss via recorded `Status.PodUID`, self-deletes the `EtcdMember`, finalizer calls `MemberRemove`, scale-up gap-fill creates a replacement with a fresh member ID. |
+
+### Why memory-backed is opt-in
+
+It trades durability for speed and isolation from node-level storage. Suits:
+
+- Kubernetes-in-Kubernetes apiservers whose state is GitOps-managed and reconstructable.
+- Throwaway test clusters.
+- Workloads where etcd is a transient cache, not the system of record.
+
+It is **not** appropriate as a general-purpose etcd backend. A node drain or simultaneous evictions of more-than-quorum members destroys the cluster permanently — there is no data to restart from.
+
+### Pod-loss detection (memory only)
+
+On every reconcile of a memory-backed member the controller stamps `Status.PodUID` with the live Pod's UID. On a subsequent reconcile:
+
+- Pod present, UID matches → steady state.
+- Pod absent (or UID differs) with a previously recorded UID → loss confirmed.
+
+The member controller self-deletes the `EtcdMember`. The existing finalizer runs `MemberRemove` against quorum-reachable peers and the Pod / PVC owner-refs handle the rest of GC. The cluster controller's normal `current < desired` arm then scales up: a fresh `EtcdMember` is created with a new `GenerateName` and a new etcd-side member ID. There is no in-place "rejoin with empty data dir" — that path would require lying to raft.
+
+If quorum is already lost across multiple simultaneous failures, `MemberRemove` will fail and the dying members stay in `Terminating` until quorum returns. That is the correct outcome: the cluster is dead and the user has to recreate it. The operator does not try to be clever about restoring a quorum from inconsistent half-states.
+
+`Status.BrokenMembers` stays at 0 in normal operation, including across a memory pod-loss + auto-replacement cycle. The `isBroken` predicate is implemented for memory members (lost-Pod state), but the member controller intercepts the loss and self-deletes the member in the same reconcile pass — by the time the cluster controller computes the count, the lost member is already `Terminating` and excluded from the running set. The field exists as a future hook for broken-member detection policies that don't immediately tear the member down (e.g. PVC corruption with a grace period). For PVC-backed members today, `isBroken` stays a stub; richer detection is a future concern.
+
+### What is missing from memory clusters today
+
+Three things are not yet auto-emitted and matter for production memory clusters — all tracked in [issue #16](https://github.com/lllamnyp/etcd-operator/issues/16):
+
+- **`PodDisruptionBudget`**. A `kubectl drain` will happily evict more than the quorum can survive. Recommended manual: `maxUnavailable: floor((replicas-1)/2)`.
+- **Pod anti-affinity**. Without it, scheduling can co-locate voters on one node; a single node failure then loses quorum on a 3-member cluster.
+- **Container memory limits**. Without `limits.memory`, tmpfs writes count against node memory rather than the pod's cgroup and the etcd container ends up in BestEffort/Burstable QoS — first to be evicted under pressure. Workaround: deploy a `LimitRange` in the cluster's namespace until a `spec.resources` field exists.
+
+### Known limitation: replicas=0 wedges
+
+Combining `spec.storageMedium: Memory` with `spec.replicas: 0` is not safe. The pause path flips `spec.dormant=true`, the Pod is deleted, the tmpfs is gone with it. On resume the cluster controller wakes the same member as if its data were preserved; etcd refuses to start because the data dir is empty but the member ID is in raft state. Until an admission webhook ([issue #15](https://github.com/lllamnyp/etcd-operator/issues/15)) blocks this combination, **delete and recreate the cluster instead of pausing it**.
+
 ## Conditions
 
 The cluster surfaces three conditions: `Available`, `Progressing`, `Degraded`. The interesting state space is on `Available`:
@@ -156,7 +200,7 @@ All conditions carry `observedGeneration` so consumers can tell whether a condit
 
 A few things that recur in similar operators but are intentionally absent here:
 
-- **No automatic broken-member replacement.** The `isBroken` predicate is a stub that returns false. `status.brokenMembers` always reads 0. The intent is to surface the call site so the predicate is testable; the replacement policy (replace immediately? after grace period? user-confirmed?) is not yet decided. Until it is, broken members stay broken and require an explicit user action.
+- **No automatic broken-member replacement for PVC clusters.** `isBroken` is a real predicate only for memory-backed members (Pod lost → memory gone → member replaced); for PVC-backed members it stays a stub. The replacement policy (corruption? irrecoverable crashloop? quorum-loss handling?) is a richer decision and not yet wired up. Broken PVC members stay broken and require an explicit user action (see [operations.md](operations.md#broken-member)).
 - **No leader-aware client routing.** Each etcd-client call balanced by clientv3 lands on whatever endpoint is first responsive. Filtering to non-learner endpoints (the issue #12 fix) handles the "rpc not supported for learner" case, but heavy `MemberList` traffic can still spread across followers. A leader-aware proxy or a sidecar that intercepts apiserver→etcd traffic is the proper fix; not in scope here.
 - **No TLS, no auth/RBAC inside etcd.** v1alpha2 ships HTTP-only. Adding TLS means wiring cert-manager (or equivalent), rotating certs, and threading them through the Pod spec. Doable but a separate concern.
 

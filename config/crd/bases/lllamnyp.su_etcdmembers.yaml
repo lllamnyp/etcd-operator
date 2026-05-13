@@ -94,9 +94,21 @@ spec:
                 anyOf:
                 - type: integer
                 - type: string
-                description: Storage is the PVC size for this member's data directory.
+                description: |-
+                  Storage is the requested size for this member's data directory. For
+                  StorageMedium="" this is the PVC's requested capacity; for
+                  StorageMedium="Memory" this is the tmpfs emptyDir's SizeLimit.
                 pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                 x-kubernetes-int-or-string: true
+              storageMedium:
+                description: |-
+                  StorageMedium selects the volume backend for this member's data
+                  directory. Mirrors EtcdCluster.spec.storageMedium at the time this
+                  member was created and is not edited afterwards.
+                enum:
+                - ""
+                - Memory
+                type: string
               version:
                 description: Version is the etcd version for this member.
                 pattern: ^\d+\.\d+\.\d+$
@@ -178,6 +190,15 @@ spec:
                 type: string
               podName:
                 description: PodName is the name of the Pod running this member.
+                type: string
+              podUID:
+                description: |-
+                  PodUID is the UID of the Pod most recently observed for this member.
+                  Set when the Pod is created or found; cleared when the Pod is gone
+                  and the member controller intentionally removed it (e.g. dormant).
+                  For memory-backed members the operator compares the live Pod's UID
+                  against this value to detect Pod loss: a stored UID with no live
+                  matching Pod means the tmpfs is gone and the member must be replaced.
                 type: string
               pvcName:
                 description: PVCName is the name of the PersistentVolumeClaim for

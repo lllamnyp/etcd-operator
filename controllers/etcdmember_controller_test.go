@@ -1093,3 +1093,371 @@ func TestReconcile_WakeFromDormantCreatesPod(t *testing.T) {
 
 // silence unused imports
 var _ = ctrl.Result{}
+
+// TestBuildPod_MemoryMediumUsesEmptyDir verifies that StorageMedium=Memory
+// flips the Pod's data volume from a PVC to a tmpfs emptyDir with
+// SizeLimit set from Spec.Storage. Without this, etcd writes to the
+// node's filesystem and the whole "memory-backed cluster" feature is a
+// no-op.
+func TestBuildPod_MemoryMediumUsesEmptyDir(t *testing.T) {
+	r := &EtcdMemberReconciler{}
+	storage := quickQty(t, "256Mi")
+	pod := r.buildPod(&lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "m-1", Namespace: "ns"},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName:   "test",
+			Version:       "3.5.17",
+			Storage:       storage,
+			StorageMedium: lll.StorageMediumMemory,
+		},
+	})
+
+	if len(pod.Spec.Volumes) != 1 {
+		t.Fatalf("expected one Volume; got %d", len(pod.Spec.Volumes))
+	}
+	v := pod.Spec.Volumes[0]
+	if v.PersistentVolumeClaim != nil {
+		t.Fatalf("memory member must not have a PVC volume source; got %+v", v.PersistentVolumeClaim)
+	}
+	if v.EmptyDir == nil {
+		t.Fatalf("memory member must have an EmptyDir volume source; got %+v", v)
+	}
+	if v.EmptyDir.Medium != corev1.StorageMediumMemory {
+		t.Fatalf("EmptyDir.Medium = %q, want %q", v.EmptyDir.Medium, corev1.StorageMediumMemory)
+	}
+	if v.EmptyDir.SizeLimit == nil || v.EmptyDir.SizeLimit.Cmp(storage) != 0 {
+		t.Fatalf("EmptyDir.SizeLimit = %v, want %v", v.EmptyDir.SizeLimit, storage)
+	}
+}
+
+// TestBuildPod_DefaultMediumUsesPVC is the negative guard: an empty
+// StorageMedium must still produce a PVC-backed volume so existing
+// clusters' Pods don't silently start writing to tmpfs after a controller
+// upgrade.
+func TestBuildPod_DefaultMediumUsesPVC(t *testing.T) {
+	r := &EtcdMemberReconciler{}
+	pod := r.buildPod(&lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "m-1", Namespace: "ns"},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName: "test",
+			Version:     "3.5.17",
+			Storage:     quickQty(t, "1Gi"),
+			// StorageMedium left empty.
+		},
+	})
+	v := pod.Spec.Volumes[0]
+	if v.EmptyDir != nil {
+		t.Fatalf("default member must not have an EmptyDir volume source; got %+v", v.EmptyDir)
+	}
+	if v.PersistentVolumeClaim == nil {
+		t.Fatalf("default member must have a PVC volume source; got %+v", v)
+	}
+	if v.PersistentVolumeClaim.ClaimName != "data-m-1" {
+		t.Fatalf("PVC claim name = %q, want data-m-1", v.PersistentVolumeClaim.ClaimName)
+	}
+}
+
+// TestEnsurePVC_SkippedForMemoryMember verifies ensurePVC does not create
+// a PVC and leaves Status.PVCName empty for memory members. A PVC sneaking
+// into the namespace would be a silent attached cost (allocated capacity
+// no one reads from) and would also wrongly suggest "data is preserved"
+// via Status.PVCName.
+func TestEnsurePVC_SkippedForMemoryMember(t *testing.T) {
+	ctx := context.Background()
+	member := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "m-1", Namespace: "ns", UID: types.UID("mu")},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName:   "test",
+			Version:       "3.5.17",
+			Storage:       quickQty(t, "1Gi"),
+			StorageMedium: lll.StorageMediumMemory,
+		},
+	}
+	c, _ := newTestClient(t, member)
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t)}
+
+	if err := r.ensurePVC(ctx, member); err != nil {
+		t.Fatalf("ensurePVC: %v", err)
+	}
+
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "data-m-1"}, &corev1.PersistentVolumeClaim{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("memory member must not create a PVC; got err=%v", err)
+	}
+	if member.Status.PVCName != "" {
+		t.Fatalf("memory member Status.PVCName must stay empty; got %q", member.Status.PVCName)
+	}
+}
+
+// TestEnsurePod_CapturesUIDOfExistingPod verifies that on a reconcile
+// pass that finds an already-running Pod, ensurePod copies the Pod's
+// UID into Status.PodUID. This is the steady-state path that runs on
+// every reconcile, and it's the source of truth the next reconcile uses
+// to detect Pod loss (Pod replaced → new UID → mismatch → loss).
+//
+// Pre-creating the Pod with an explicit UID rather than relying on
+// ensurePod's Create branch: the controller-runtime fake client doesn't
+// auto-assign UIDs on Create, so testing the Create-then-read path would
+// be testing the fake's behaviour, not ours. The next-reconcile path is
+// the one that matters anyway — Create races with reconcile cadence and
+// the Get-then-read path will run within milliseconds in production.
+func TestEnsurePod_CapturesUIDOfExistingPod(t *testing.T) {
+	ctx := context.Background()
+	tru := true
+
+	member := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "m-1", Namespace: "ns", UID: types.UID("mu")},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName:    "test",
+			Version:        "3.5.17",
+			Storage:        quickQty(t, "1Gi"),
+			InitialCluster: "m-1=" + peerURL("m-1", "test", "ns"),
+			ClusterToken:   "ns-test-x",
+			Bootstrap:      true,
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "m-1", Namespace: "ns", UID: types.UID("known-uid"),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "lllamnyp.su/v1alpha2", Kind: "EtcdMember",
+				Name: "m-1", UID: types.UID("mu"), Controller: &tru, BlockOwnerDeletion: &tru,
+			}},
+		},
+	}
+	c, _ := newTestClient(t, member, pod)
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t)}
+
+	if err := r.ensurePod(ctx, member); err != nil {
+		t.Fatalf("ensurePod: %v", err)
+	}
+	if member.Status.PodUID != "known-uid" {
+		t.Fatalf("Status.PodUID = %q, want %q", member.Status.PodUID, "known-uid")
+	}
+	if member.Status.PodName != "m-1" {
+		t.Fatalf("Status.PodName = %q, want m-1", member.Status.PodName)
+	}
+}
+
+// TestReconcile_MemoryMemberDeletesSelfOnPodLoss covers the central
+// guarantee of the feature: a memory-backed member whose Pod is gone
+// (tmpfs lost with it) must trigger its own deletion. The finalizer
+// then runs MemberRemove against peers and the cluster controller's
+// scale-up gap-fill replaces it.
+//
+// Without this path, the next reconcile would re-create the Pod with
+// an empty tmpfs and etcd would refuse to start (member ID is in raft
+// state but WAL is empty), wedging the member.
+func TestReconcile_MemoryMemberDeletesSelfOnPodLoss(t *testing.T) {
+	ctx := context.Background()
+
+	member := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "m-1", Namespace: "ns", UID: types.UID("mu"),
+			Labels:     memberLabels("test", "m-1"),
+			Finalizers: []string{MemberFinalizer},
+		},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName:    "test",
+			Version:        "3.5.17",
+			Storage:        quickQty(t, "1Gi"),
+			StorageMedium:  lll.StorageMediumMemory,
+			InitialCluster: "m-1=" + peerURL("m-1", "test", "ns"),
+			ClusterToken:   "ns-test-x",
+			Bootstrap:      true,
+		},
+		Status: lll.EtcdMemberStatus{
+			PodName: "m-1",
+			PodUID:  "previously-recorded-uid",
+			// MemberID empty: simulates the case where the Pod went away
+			// before discovery could attach a member ID. The finalizer's
+			// fallback-by-name path covers that elsewhere.
+		},
+	}
+	// No Pod object — that's the loss condition.
+	c, _ := newTestClient(t, member)
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead))}
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "m-1", Namespace: "ns"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	// The EtcdMember must now carry a DeletionTimestamp (or be gone
+	// outright — the fake client may not run finalizers, but it does
+	// stamp the timestamp on Delete).
+	got := &lll.EtcdMember{}
+	err := c.Get(ctx, types.NamespacedName{Name: "m-1", Namespace: "ns"}, got)
+	switch {
+	case apierrors.IsNotFound(err):
+		// finalizer already ran; that's fine.
+	case err != nil:
+		t.Fatalf("Get(member): %v", err)
+	case got.DeletionTimestamp.IsZero():
+		t.Fatalf("memory member with lost Pod must be marked for deletion; got DeletionTimestamp empty")
+	}
+
+	// And critically: no fresh Pod must have been created. ensurePod
+	// would otherwise have run after the (false-negative) loss check and
+	// created a new tmpfs-backed Pod.
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "m-1"}, &corev1.Pod{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("memory member with lost Pod must not have a fresh Pod created; got err=%v", err)
+	}
+}
+
+// TestReconcile_MemoryMemberStablePodIsNotLost is the negative guard for
+// the above: a memory member whose Pod is present with the recorded UID
+// must NOT be self-deleted on reconcile. Without this guard the loss
+// check would fire on every reconcile and the cluster would churn itself
+// to death.
+func TestReconcile_MemoryMemberStablePodIsNotLost(t *testing.T) {
+	ctx := context.Background()
+	tru := true
+
+	member := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "m-1", Namespace: "ns", UID: types.UID("mu"),
+			Labels:     memberLabels("test", "m-1"),
+			Finalizers: []string{MemberFinalizer},
+		},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName:    "test",
+			Version:        "3.5.17",
+			Storage:        quickQty(t, "1Gi"),
+			StorageMedium:  lll.StorageMediumMemory,
+			InitialCluster: "m-1=" + peerURL("m-1", "test", "ns"),
+			ClusterToken:   "ns-test-x",
+			Bootstrap:      true,
+		},
+		Status: lll.EtcdMemberStatus{
+			PodName: "m-1",
+			PodUID:  "stable-uid",
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "m-1", Namespace: "ns", UID: types.UID("stable-uid"),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "lllamnyp.su/v1alpha2", Kind: "EtcdMember",
+				Name: "m-1", UID: types.UID("mu"), Controller: &tru, BlockOwnerDeletion: &tru,
+			}},
+		},
+		Status: corev1.PodStatus{Conditions: []corev1.PodCondition{readyPodCondition()}},
+	}
+	c, _ := newTestClient(t, member, pod)
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead))}
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "m-1", Namespace: "ns"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	got := mustGet(t, c, "m-1", "ns", &lll.EtcdMember{})
+	if !got.DeletionTimestamp.IsZero() {
+		t.Fatalf("memory member with stable Pod must not be deleted; DeletionTimestamp = %v", got.DeletionTimestamp)
+	}
+}
+
+// TestUpdateStatus_MemoryMemberLeavesPVCNameEmpty: even after a full
+// reconcile pass, a memory member's Status.PVCName must stay empty so
+// downstream consumers (the EtcdCluster's Paused message in particular,
+// which refers to "PVC data-X" when describing preserved data) don't
+// claim there's a PVC to preserve.
+func TestUpdateStatus_MemoryMemberLeavesPVCNameEmpty(t *testing.T) {
+	ctx := context.Background()
+	tru := true
+
+	member := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "m-1", Namespace: "ns", UID: types.UID("mu"),
+			Labels:     memberLabels("test", "m-1"),
+			Finalizers: []string{MemberFinalizer},
+		},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName:    "test",
+			Version:        "3.5.17",
+			Storage:        quickQty(t, "1Gi"),
+			StorageMedium:  lll.StorageMediumMemory,
+			InitialCluster: "m-1=" + peerURL("m-1", "test", "ns"),
+			ClusterToken:   "ns-test-x",
+			Bootstrap:      true,
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "m-1", Namespace: "ns", UID: types.UID("pod-uid"),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "lllamnyp.su/v1alpha2", Kind: "EtcdMember",
+				Name: "m-1", UID: types.UID("mu"), Controller: &tru, BlockOwnerDeletion: &tru,
+			}},
+		},
+		Status: corev1.PodStatus{Conditions: []corev1.PodCondition{readyPodCondition()}},
+	}
+	c, _ := newTestClient(t, member, pod)
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead))}
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "m-1", Namespace: "ns"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	got := mustGet(t, c, "m-1", "ns", &lll.EtcdMember{})
+	if got.Status.PVCName != "" {
+		t.Fatalf("memory member Status.PVCName must stay empty after reconcile; got %q", got.Status.PVCName)
+	}
+	if got.Status.PodUID != "pod-uid" {
+		t.Fatalf("Status.PodUID = %q, want pod-uid (must reflect the live Pod)", got.Status.PodUID)
+	}
+}
+
+// TestIsBroken_MemoryMemberWithLostPodIsBroken pins the predicate that
+// drives EtcdCluster.status.brokenMembers. A memory member whose Pod
+// UID was recorded but whose Pod is currently absent (Status.PodName
+// cleared by updateStatus's NotFound branch — or never set) is broken.
+func TestIsBroken_MemoryMemberWithLostPodIsBroken(t *testing.T) {
+	r := &EtcdClusterReconciler{}
+	cases := []struct {
+		name string
+		m    lll.EtcdMember
+		want bool
+	}{
+		{
+			name: "memory, UID recorded, Pod missing → broken",
+			m: lll.EtcdMember{
+				Spec:   lll.EtcdMemberSpec{StorageMedium: lll.StorageMediumMemory},
+				Status: lll.EtcdMemberStatus{PodUID: "u", PodName: ""},
+			},
+			want: true,
+		},
+		{
+			name: "memory, UID recorded, Pod present → healthy",
+			m: lll.EtcdMember{
+				Spec:   lll.EtcdMemberSpec{StorageMedium: lll.StorageMediumMemory},
+				Status: lll.EtcdMemberStatus{PodUID: "u", PodName: "p"},
+			},
+			want: false,
+		},
+		{
+			name: "memory, no UID yet (first reconcile) → not broken",
+			m: lll.EtcdMember{
+				Spec:   lll.EtcdMemberSpec{StorageMedium: lll.StorageMediumMemory},
+				Status: lll.EtcdMemberStatus{},
+			},
+			want: false,
+		},
+		{
+			name: "PVC-backed, Pod missing → stub stays false",
+			m: lll.EtcdMember{
+				Spec:   lll.EtcdMemberSpec{StorageMedium: lll.StorageMediumDefault},
+				Status: lll.EtcdMemberStatus{PodUID: "u", PodName: ""},
+			},
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := r.isBroken(tc.m); got != tc.want {
+				t.Fatalf("isBroken(%s) = %v; want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+// keep errors import live in case more tests are added below.
+var _ = errors.New

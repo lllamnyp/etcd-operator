@@ -19,12 +19,13 @@ The full design rationale is in [docs/concepts.md](docs/concepts.md).
 - **Scale up / down**: cluster controller adds members one at a time as learners and promotes them; scale-down picks the most-recently-created member, runs `MemberRemove` via a finalizer, then GCs the Pod and PVC.
 - **Scale to zero (pause/resume)**: `spec.replicas: 0` parks the surviving member via `spec.dormant=true`; the Pod is deleted, the PVC stays owned by the `EtcdMember`. Scaling back up to ≥ 1 flips `spec.dormant=false` on the same member; etcd resumes from the existing data dir with the same cluster ID and member ID.
 - **Pod restart / node failure**: data PVC is preserved, the new Pod reads the existing WAL and rejoins with the same member ID.
+- **Memory-backed storage (opt-in)**: `spec.storageMedium: Memory` switches each member's data dir to a tmpfs `emptyDir` whose lifetime is bound to the Pod. Members that lose their Pod (eviction, node failure) lose their data; the operator detects this, removes the member from etcd, and replaces it via the existing scale-up path. Suits scenarios where the etcd state is reconstructable and replication absorbs single-member losses. Not safe to combine with `replicas: 0` yet (no PDB / anti-affinity / resource defaults emitted either — see [docs/concepts.md](docs/concepts.md#storage) and issue [#16](https://github.com/lllamnyp/etcd-operator/issues/16)).
 - **Locking pattern**: `status.observed` snapshots the in-flight target so mid-flight spec edits don't corrupt consensus; `progressDeadline` bounds how long the operator will spend trying to reach a target.
 - **Cluster deletion**: cascading owner refs clean up everything; finalizers detect "the whole cluster is going away" and skip etcd-side removal to avoid deadlock.
 
 ## What's not supported (yet)
 
-No TLS. No auth/RBAC inside etcd. No in-place version upgrades (changing `spec.version` only affects newly-created members). No PVC resizing — see [#2](https://github.com/lllamnyp/etcd-operator/issues/2). No automatic broken-member replacement (the predicate is stubbed; `status.brokenMembers` always reads 0). No backups, no defragmentation scheduling, no PodAntiAffinity by default. See the [issue tracker](https://github.com/lllamnyp/etcd-operator/issues) for the running follow-up list.
+No TLS. No auth/RBAC inside etcd. No in-place version upgrades (changing `spec.version` only affects newly-created members). No PVC resizing — see [#2](https://github.com/lllamnyp/etcd-operator/issues/2). No automatic broken-member replacement for PVC-backed clusters (memory-backed members do auto-replace on Pod loss; `status.brokenMembers` reads 0 in practice — see [docs/concepts.md](docs/concepts.md#storage)). No backups, no defragmentation scheduling, no PodAntiAffinity by default. See the [issue tracker](https://github.com/lllamnyp/etcd-operator/issues) for the running follow-up list.
 
 ## Quick start
 

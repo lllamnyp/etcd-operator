@@ -207,7 +207,7 @@ This pushes the cluster into the terminal-error state immediately. Recovery foll
 
 ## Broken member
 
-Recovery from a permanently broken member (e.g. PVC lost, node retired) is currently manual. The operator's `isBroken` predicate is a stub; auto-replacement is not wired up (see [concepts](concepts.md#what-is-not-in-the-design)).
+Recovery from a permanently broken **PVC-backed** member (e.g. PVC lost, node retired) is currently manual. Memory-backed members are auto-replaced on Pod loss — see [Memory-backed clusters](#memory-backed-clusters) above. For PVC-backed clusters the `isBroken` predicate stays a stub; auto-replacement is not wired up (see [concepts](concepts.md#what-is-not-in-the-design)).
 
 Manual recovery:
 
@@ -272,6 +272,127 @@ Key signals:
 | `waiting for existing members to become Ready before next scale-up step` | Scale-up is single-stepping; the previous learner isn't ready yet. |
 | `learner not yet promotable; will retry` | `MemberPromote` returned an "in sync with leader" error; benign during scale-up. |
 | `MemberList failed` ERROR with `rpc not supported for learner` | The endpoint-filtering fix (issue #12) should prevent this; if you see it, file a bug. |
+
+## Memory-backed clusters
+
+Opt-in via `spec.storageMedium: Memory`. Each member's data dir is a tmpfs `emptyDir` whose lifetime is the Pod's. Suits reconstructable workloads only — see [concepts](concepts.md#storage) for the model and trade-offs.
+
+### Create a memory-backed cluster
+
+```sh
+cat <<'EOF' | kubectl apply -f -
+apiVersion: lllamnyp.su/v1alpha2
+kind: EtcdCluster
+metadata:
+  name: my-mem-etcd
+  namespace: default
+spec:
+  replicas: 3
+  version: 3.5.17
+  storage: 256Mi
+  storageMedium: Memory
+EOF
+```
+
+`storage` now defines the tmpfs `SizeLimit`, not a PVC capacity. Pick it generously — etcd's WAL plus the keyspace plus a buffer for compaction. 256Mi is enough for sub-MB keyspaces; bump it for anything load-bearing.
+
+### Verify it's actually using tmpfs
+
+The Pod's volume tells you:
+
+```sh
+kubectl get pod -l etcd.lllamnyp.su/cluster=my-mem-etcd -n default \
+  -o jsonpath='{.items[0].spec.volumes[?(@.name=="data")]}' | jq
+# Expect: {"emptyDir": {"medium": "Memory", "sizeLimit": "256Mi"}, ...}
+```
+
+And inside the Pod:
+
+```sh
+POD=$(kubectl get pod -l etcd.lllamnyp.su/cluster=my-mem-etcd -n default \
+  -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -n default "$POD" -- mount | grep /var/lib/etcd
+# Expect: tmpfs on /var/lib/etcd type tmpfs (...)
+```
+
+No PVCs should exist for the cluster:
+
+```sh
+kubectl get pvc -l etcd.lllamnyp.su/cluster=my-mem-etcd -n default
+# No resources found.
+```
+
+### What you should configure before going to production
+
+The operator does not emit these today (tracked in [#16](https://github.com/lllamnyp/etcd-operator/issues/16)). All three matter for a memory cluster you'd actually rely on:
+
+1. **`PodDisruptionBudget`** — without it, a `kubectl drain` of two nodes carrying voters will lose quorum before the operator can react. Manual:
+
+   ```yaml
+   apiVersion: policy/v1
+   kind: PodDisruptionBudget
+   metadata:
+     name: my-mem-etcd
+     namespace: default
+   spec:
+     maxUnavailable: 1     # for a 3-member cluster; floor((N-1)/2)
+     selector:
+       matchLabels:
+         etcd.lllamnyp.su/cluster: my-mem-etcd
+   ```
+
+2. **Pod anti-affinity** — pre-deploy a mutating webhook (e.g. `pod-topology-spread` admission controller, or your own) that adds:
+
+   ```yaml
+   spec:
+     affinity:
+       podAntiAffinity:
+         requiredDuringSchedulingIgnoredDuringExecution:
+           - labelSelector:
+               matchLabels:
+                 etcd.lllamnyp.su/cluster: my-mem-etcd
+             topologyKey: kubernetes.io/hostname
+   ```
+
+3. **Container memory limit** — a `LimitRange` in the namespace covers it pending a `spec.resources` field on the CR:
+
+   ```yaml
+   apiVersion: v1
+   kind: LimitRange
+   metadata:
+     name: etcd-mem
+     namespace: default
+   spec:
+     limits:
+       - type: Container
+         default:
+           memory: 512Mi   # >= spec.storage + ~128Mi for etcd headroom
+   ```
+
+   Without this, tmpfs writes count against node memory not the pod's cgroup, the pod is in BestEffort/Burstable QoS, and it is first in line for eviction under pressure — the exact failure mode that destroys memory members.
+
+### Pod loss and auto-replacement
+
+The operator detects Pod loss via `Status.PodUID`. The two scenarios:
+
+- **Single Pod lost while quorum holds**: operator deletes the EtcdMember CR, finalizer runs `MemberRemove` against peers, cluster controller's scale-up creates a fresh replacement with a new `GenerateName` and a new etcd member ID. The cluster heals automatically.
+- **More than quorum lost simultaneously**: `MemberRemove` against the surviving peers fails (no quorum), the dying members sit in `Terminating`. The cluster is dead and the user has to recreate.
+
+**Detection latency depends on what killed the Pod.** A `kubectl delete pod` or kubelet eviction transitions the Pod to NotFound within seconds — auto-replacement starts on the next reconcile (~5 s). A node going NotReady is slower: the kubelet on a healthy node would clean up immediately, but the kube-controller-manager's `--pod-eviction-timeout` (default 5 minutes) gates the Pod's transition out of Terminating. Until then the operator's loss check sees a Pod with the same UID (status reports it as Terminating but it still exists from the API's perspective) and waits — better than racing the kubelet GC. So budget **up to 5 minutes of degraded quorum** when an etcd-hosting node fails unannounced. Tune `kube-controller-manager --pod-eviction-timeout` cluster-wide if you need it shorter; this is outside the operator's control.
+
+Watch the auto-replacement happen:
+
+```sh
+kubectl get etcdmember.lllamnyp.su -n default -w
+# Original: my-mem-etcd-abc12, my-mem-etcd-def34, my-mem-etcd-ghi56.
+# Force-delete one Pod: kubectl delete pod -n default my-mem-etcd-abc12
+# Observe the EtcdMember CR get deleted, a new one with a fresh GenerateName
+# appear, and READY=3 restore within a minute or so.
+```
+
+### Pause is not supported
+
+Do **not** set `spec.replicas: 0` on a memory cluster. The pause path flips `spec.dormant=true` and deletes the Pod; the tmpfs goes with it. On resume the controller wakes the same member as if its data were preserved, etcd refuses to start, and the cluster wedges. The combination should eventually be blocked by an admission webhook ([#15](https://github.com/lllamnyp/etcd-operator/issues/15)); until then, delete and recreate the cluster instead.
 
 ## Recipes
 
