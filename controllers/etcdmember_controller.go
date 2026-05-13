@@ -278,6 +278,15 @@ func (r *EtcdMemberReconciler) resolveMemberID(
 // ── PVC ──────────────────────────────────────────────────────────────────
 
 func (r *EtcdMemberReconciler) ensurePVC(ctx context.Context, member *lll.EtcdMember) error {
+	// Memory-backed members keep their data in a tmpfs emptyDir bound to
+	// the Pod, not in a PVC. Skip both the create and the ownership check;
+	// the Pod's volume source is the only consumer of Spec.Storage in
+	// that mode.
+	if member.Spec.StorageMedium == lll.StorageMediumMemory {
+		member.Status.PVCName = ""
+		return nil
+	}
+
 	pvcName := "data-" + member.Name
 	pvc := &corev1.PersistentVolumeClaim{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: member.Namespace, Name: pvcName}, pvc)
@@ -343,6 +352,7 @@ func (r *EtcdMemberReconciler) ensurePod(ctx context.Context, member *lll.EtcdMe
 	err := r.Get(ctx, types.NamespacedName{Namespace: member.Namespace, Name: member.Name}, pod)
 	if err == nil {
 		member.Status.PodName = pod.Name
+		member.Status.PodUID = string(pod.UID)
 		return nil
 	}
 	if !errors.IsNotFound(err) {
@@ -357,6 +367,7 @@ func (r *EtcdMemberReconciler) ensurePod(ctx context.Context, member *lll.EtcdMe
 		return err
 	}
 	member.Status.PodName = pod.Name
+	member.Status.PodUID = string(pod.UID)
 	return nil
 }
 
@@ -369,6 +380,7 @@ func (r *EtcdMemberReconciler) ensurePodAbsent(ctx context.Context, member *lll.
 	err := r.Get(ctx, types.NamespacedName{Namespace: member.Namespace, Name: member.Name}, pod)
 	if errors.IsNotFound(err) {
 		member.Status.PodName = ""
+		member.Status.PodUID = ""
 		return nil
 	}
 	if err != nil {
@@ -380,6 +392,7 @@ func (r *EtcdMemberReconciler) ensurePodAbsent(ctx context.Context, member *lll.
 		}
 	}
 	member.Status.PodName = ""
+	member.Status.PodUID = ""
 	return nil
 }
 
@@ -391,6 +404,30 @@ func (r *EtcdMemberReconciler) buildPod(member *lll.EtcdMember) *corev1.Pod {
 
 	pAddr := peerURL(member.Name, member.Spec.ClusterName, member.Namespace)
 	cAddr := clientURL(member.Name, member.Spec.ClusterName, member.Namespace)
+
+	// Data volume source: tmpfs emptyDir for memory-backed members,
+	// PVC otherwise. SizeLimit on the emptyDir caps tmpfs allocation;
+	// note that without a container memory limit covering it, tmpfs
+	// writes still count against node-level memory rather than the
+	// pod's cgroup — production memory clusters should also set
+	// resources.limits.memory (tracked in
+	// https://github.com/lllamnyp/etcd-operator/issues/16).
+	var dataVolumeSource corev1.VolumeSource
+	if member.Spec.StorageMedium == lll.StorageMediumMemory {
+		storage := member.Spec.Storage
+		dataVolumeSource = corev1.VolumeSource{
+			EmptyDir: &corev1.EmptyDirVolumeSource{
+				Medium:    corev1.StorageMediumMemory,
+				SizeLimit: &storage,
+			},
+		}
+	} else {
+		dataVolumeSource = corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+				ClaimName: "data-" + member.Name,
+			},
+		}
+	}
 
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -474,12 +511,8 @@ func (r *EtcdMemberReconciler) buildPod(member *lll.EtcdMember) *corev1.Pod {
 				},
 			}},
 			Volumes: []corev1.Volume{{
-				Name: "data",
-				VolumeSource: corev1.VolumeSource{
-					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-						ClaimName: "data-" + member.Name,
-					},
-				},
+				Name:         "data",
+				VolumeSource: dataVolumeSource,
 			}},
 		},
 	}
@@ -501,10 +534,17 @@ func (r *EtcdMemberReconciler) updateStatus(ctx context.Context, member *lll.Etc
 		member.Status.PodName = pod.Name
 		changed = true
 	}
-	wantPVC := "data-" + member.Name
-	if member.Status.PVCName != wantPVC {
-		member.Status.PVCName = wantPVC
+	if member.Status.PodUID != string(pod.UID) {
+		member.Status.PodUID = string(pod.UID)
 		changed = true
+	}
+	// Memory-backed members have no PVC; leave Status.PVCName empty.
+	if member.Spec.StorageMedium != lll.StorageMediumMemory {
+		wantPVC := "data-" + member.Name
+		if member.Status.PVCName != wantPVC {
+			member.Status.PVCName = wantPVC
+			changed = true
+		}
 	}
 
 	podReady := false
