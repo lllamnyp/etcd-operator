@@ -329,11 +329,12 @@ func (r *EtcdClusterReconciler) bootstrap(
 				Labels:       clusterLabels(cluster.Name),
 			},
 			Spec: lll.EtcdMemberSpec{
-				ClusterName:  cluster.Name,
-				Version:      cluster.Status.Observed.Version,
-				Storage:      cluster.Status.Observed.Storage,
-				Bootstrap:    true,
-				ClusterToken: cluster.Status.ClusterToken,
+				ClusterName:   cluster.Name,
+				Version:       cluster.Status.Observed.Version,
+				Storage:       cluster.Status.Observed.Storage,
+				StorageMedium: cluster.Status.Observed.StorageMedium,
+				Bootstrap:     true,
+				ClusterToken:  cluster.Status.ClusterToken,
 				// InitialCluster filled in below once apiserver assigns Name.
 			},
 		}
@@ -617,11 +618,12 @@ func (r *EtcdClusterReconciler) scaleUp(
 			Labels:       clusterLabels(cluster.Name),
 		},
 		Spec: lll.EtcdMemberSpec{
-			ClusterName:  cluster.Name,
-			Version:      cluster.Status.Observed.Version,
-			Storage:      cluster.Status.Observed.Storage,
-			Bootstrap:    false,
-			ClusterToken: cluster.Status.ClusterToken,
+			ClusterName:   cluster.Name,
+			Version:       cluster.Status.Observed.Version,
+			Storage:       cluster.Status.Observed.Storage,
+			StorageMedium: cluster.Status.Observed.StorageMedium,
+			Bootstrap:     false,
+			ClusterToken:  cluster.Status.ClusterToken,
 			// InitialCluster filled in by completePendingMember below.
 		},
 	}
@@ -1221,9 +1223,10 @@ func snapshotSpecIntoObserved(cluster *lll.EtcdCluster) {
 		replicas = *cluster.Spec.Replicas
 	}
 	cluster.Status.Observed = &lll.ObservedClusterSpec{
-		Replicas: replicas,
-		Version:  cluster.Spec.Version,
-		Storage:  cluster.Spec.Storage,
+		Replicas:      replicas,
+		Version:       cluster.Spec.Version,
+		Storage:       cluster.Spec.Storage,
+		StorageMedium: cluster.Spec.StorageMedium,
 	}
 }
 
@@ -1238,7 +1241,8 @@ func specEqualsObserved(cluster *lll.EtcdCluster) bool {
 	o := cluster.Status.Observed
 	return o.Replicas == specReplicas &&
 		o.Version == cluster.Spec.Version &&
-		o.Storage.Cmp(cluster.Spec.Storage) == 0
+		o.Storage.Cmp(cluster.Spec.Storage) == 0 &&
+		o.StorageMedium == cluster.Spec.StorageMedium
 }
 
 func reconciliationComplete(cluster *lll.EtcdCluster, members []lll.EtcdMember) bool {
