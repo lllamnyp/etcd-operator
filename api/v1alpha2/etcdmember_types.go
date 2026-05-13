@@ -40,8 +40,16 @@ type EtcdMemberSpec struct {
 	// +kubebuilder:validation:Pattern=`^\d+\.\d+\.\d+$`
 	Version string `json:"version"`
 
-	// Storage is the PVC size for this member's data directory.
+	// Storage is the requested size for this member's data directory. For
+	// StorageMedium="" this is the PVC's requested capacity; for
+	// StorageMedium="Memory" this is the tmpfs emptyDir's SizeLimit.
 	Storage resource.Quantity `json:"storage"`
+
+	// StorageMedium selects the volume backend for this member's data
+	// directory. Mirrors EtcdCluster.spec.storageMedium at the time this
+	// member was created and is not edited afterwards.
+	// +optional
+	StorageMedium StorageMedium `json:"storageMedium,omitempty"`
 
 	// Bootstrap indicates this member is part of the initial cluster formation.
 	// When true the member starts with --initial-cluster-state=new.
@@ -82,6 +90,15 @@ type EtcdMemberStatus struct {
 	// PodName is the name of the Pod running this member.
 	// +optional
 	PodName string `json:"podName,omitempty"`
+
+	// PodUID is the UID of the Pod most recently observed for this member.
+	// Set when the Pod is created or found; cleared when the Pod is gone
+	// and the member controller intentionally removed it (e.g. dormant).
+	// For memory-backed members the operator compares the live Pod's UID
+	// against this value to detect Pod loss: a stored UID with no live
+	// matching Pod means the tmpfs is gone and the member must be replaced.
+	// +optional
+	PodUID string `json:"podUID,omitempty"`
 
 	// PVCName is the name of the PersistentVolumeClaim for this member's data.
 	// +optional

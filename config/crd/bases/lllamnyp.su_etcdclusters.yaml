@@ -83,10 +83,29 @@ spec:
                 - type: string
                 default: 1Gi
                 description: |-
-                  Storage is the requested PVC size per member for the etcd data directory.
-                  Uses the default StorageClass.
+                  Storage is the requested size per member for the etcd data directory.
+                  For StorageMedium="" (PVC) this is the PVC's requested capacity backed by
+                  the default StorageClass. For StorageMedium="Memory" this is the tmpfs
+                  emptyDir's SizeLimit.
                 pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                 x-kubernetes-int-or-string: true
+              storageMedium:
+                description: |-
+                  StorageMedium selects the volume backend for each member's data
+                  directory. Empty string (the default) means a PVC; "Memory" means a
+                  tmpfs emptyDir whose lifetime is bound to the Pod. See the
+                  StorageMedium type doc for the operational trade-offs.
+
+                  Combining StorageMedium=Memory with replicas=0 currently wedges the
+                  cluster on resume (the tmpfs is gone but the cluster controller wakes
+                  the member as if its data were preserved). Until that is properly
+                  gated by an admission webhook
+                  (https://github.com/lllamnyp/etcd-operator/issues/15), do not pause a
+                  memory-backed cluster — delete and recreate instead.
+                enum:
+                - ""
+                - Memory
+                type: string
               version:
                 description: Version is the desired etcd version (e.g. "3.5.17").
                 pattern: ^\d+\.\d+\.\d+$
@@ -192,9 +211,18 @@ spec:
                     anyOf:
                     - type: integer
                     - type: string
-                    description: Storage is the locked target PVC size.
+                    description: Storage is the locked target data-directory size.
                     pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                     x-kubernetes-int-or-string: true
+                  storageMedium:
+                    description: |-
+                      StorageMedium is the locked target storage backend. The locking
+                      pattern prevents a mid-flight medium flip from being honoured until
+                      the current target is reached or its deadline expires.
+                    enum:
+                    - ""
+                    - Memory
+                    type: string
                   version:
                     description: Version is the locked target etcd version.
                     type: string
