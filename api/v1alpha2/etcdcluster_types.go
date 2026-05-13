@@ -74,7 +74,7 @@ const (
 //     point of opting into memory backing.
 //
 // +kubebuilder:validation:XValidation:rule="!(has(self.replicas) && self.replicas == 0 && has(self.storageMedium) && self.storageMedium == 'Memory')",message="spec.replicas=0 with spec.storageMedium=Memory is unsupported: pausing a memory-backed cluster wedges on resume. Delete and recreate the cluster instead."
-// +kubebuilder:validation:XValidation:rule="!(has(self.storageMedium) && self.storageMedium == 'Memory') || quantity(self.storage).isGreaterThan(quantity('0'))",message="spec.storage must be > 0 when spec.storageMedium=Memory (the tmpfs sizeLimit cannot be zero)."
+// +kubebuilder:validation:XValidation:rule="!(has(self.storageMedium) && self.storageMedium == 'Memory') || quantity(string(self.storage)).isGreaterThan(quantity('0'))",message="spec.storage must be > 0 when spec.storageMedium=Memory (the tmpfs sizeLimit cannot be zero)."
 type EtcdClusterSpec struct {
 	// Replicas is the desired number of cluster members. Should be odd.
 	// A value of 0 parks the cluster ("scale to zero"): the operator
@@ -101,7 +101,7 @@ type EtcdClusterSpec struct {
 	// Shrinking is rejected on UPDATE: PVCs cannot shrink and tmpfs SizeLimit
 	// reduction does not free already-allocated memory.
 	// +kubebuilder:default="1Gi"
-	// +kubebuilder:validation:XValidation:rule="quantity(self).compareTo(quantity(oldSelf)) >= 0",message="spec.storage cannot be shrunk"
+	// +kubebuilder:validation:XValidation:rule="quantity(string(self)).compareTo(quantity(string(oldSelf))) >= 0",message="spec.storage cannot be shrunk"
 	// +optional
 	Storage resource.Quantity `json:"storage,omitempty"`
 

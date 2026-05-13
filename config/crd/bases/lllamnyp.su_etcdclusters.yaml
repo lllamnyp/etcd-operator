@@ -106,7 +106,8 @@ spec:
                 x-kubernetes-int-or-string: true
                 x-kubernetes-validations:
                 - message: spec.storage cannot be shrunk
-                  rule: quantity(self).compareTo(quantity(oldSelf)) >= 0
+                  rule: quantity(string(self)).compareTo(quantity(string(oldSelf)))
+                    >= 0
               storageMedium:
                 default: ""
                 description: |-
@@ -150,7 +151,7 @@ spec:
             - message: spec.storage must be > 0 when spec.storageMedium=Memory (the
                 tmpfs sizeLimit cannot be zero).
               rule: '!(has(self.storageMedium) && self.storageMedium == ''Memory'')
-                || quantity(self.storage).isGreaterThan(quantity(''0''))'
+                || quantity(string(self.storage)).isGreaterThan(quantity(''0''))'
           status:
             description: EtcdClusterStatus defines the observed state of an etcd cluster.
             properties:

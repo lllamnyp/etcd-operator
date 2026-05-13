@@ -17,6 +17,8 @@ import (
 	"testing"
 
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	lll "github.com/lllamnyp/etcd-operator/api/v1alpha2"
@@ -151,6 +153,44 @@ func TestCEL_StorageShrinkRejected(t *testing.T) {
 	got.Spec.Storage = resource.MustParse("2Gi")
 	if err := k8s.Update(ctx, got); err != nil {
 		t.Fatalf("growing storage rejected unexpectedly: %v", err)
+	}
+}
+
+// TestCEL_StorageMustBeNonZero_IntegerInput exercises the kubectl-style
+// integer input path (`storage: 0` without quotes in YAML, which the
+// apiserver receives as a JSON number rather than a string). The
+// typed Go API always serializes Quantity as a string, so the
+// TestCEL_StorageMustBeNonZeroForMemoryOnCreate test above can't reach
+// this code path. CEL's `quantity()` function requires a string;
+// without explicit string() coercion, an integer input trips a
+// "no such overload" CEL runtime error instead of returning the
+// intended human-readable message.
+func TestCEL_StorageMustBeNonZero_IntegerInput(t *testing.T) {
+	skipIfNoEnvtest(t)
+	ctx := context.Background()
+
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "lllamnyp.su",
+		Version: "v1alpha2",
+		Kind:    "EtcdCluster",
+	})
+	u.SetName("memstore-zero-int")
+	u.SetNamespace("default")
+	u.Object["spec"] = map[string]any{
+		"replicas":      int64(3),
+		"version":       "3.5.17",
+		"storage":       int64(0), // <-- the case we care about
+		"storageMedium": "Memory",
+	}
+
+	err := k8s.Create(ctx, u)
+	if err == nil {
+		_ = k8s.Delete(ctx, u)
+		t.Fatalf("apiserver accepted storage=0 (integer) with medium=Memory; expected rejection")
+	}
+	if !strings.Contains(err.Error(), "spec.storage must be > 0") {
+		t.Fatalf("error did not surface the intended message (CEL coercion missing?): %v", err)
 	}
 }
 
