@@ -163,7 +163,7 @@ Three things are not yet auto-emitted and matter for production memory clusters 
 
 ### Apiserver-enforced validation
 
-Four CEL `x-kubernetes-validations` rules on `EtcdClusterSpec` are evaluated at admission time (k8s 1.28+ required for the `quantity()` library):
+Four CEL `x-kubernetes-validations` rules on `EtcdClusterSpec` are evaluated at admission time. The `quantity()` library used by two of the rules was alpha-gated in k8s 1.28 (behind `CRDValidationRatcheting`) and stable in 1.29; **k8s 1.29+ is the safe floor** for the CRD to install cleanly. On 1.28 with the feature gate off, CRD install fails — bump the apiserver before deploying.
 
 | Rule | When | Why |
 |---|---|---|
