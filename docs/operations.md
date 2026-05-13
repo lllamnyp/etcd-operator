@@ -1,0 +1,310 @@
+# Operations
+
+Runbook for an operator running an `EtcdCluster` in production. Assumes k8s fluency and a working operator deployment ([installation](installation.md) covers the deploy side). Cross-references [concepts](concepts.md) for the "why".
+
+## Daily inventory
+
+The two queries you'll use most:
+
+```sh
+# Cluster-level view: replicas, ready count, cluster ID, conditions.
+kubectl get etcdcluster.lllamnyp.su -A
+kubectl get etcdcluster.lllamnyp.su <name> -n <ns> -o yaml
+
+# Member-level view: per-member bootstrap flag, dormancy, ready state.
+kubectl get etcdmember.lllamnyp.su -n <ns> -o custom-columns=\
+'NAME:.metadata.name,BOOTSTRAP:.spec.bootstrap,DORMANT:.spec.dormant,READY:.status.conditions[?(@.type=="Ready")].status,MEMBERID:.status.memberID'
+```
+
+Member names are apiserver-assigned random suffixes (`<cluster>-<5-char>`); don't hard-code them in scripts. Always use the cluster label:
+
+```sh
+kubectl get pod -l etcd.lllamnyp.su/cluster=<cluster> -n <ns>
+kubectl get pvc -l etcd.lllamnyp.su/cluster=<cluster> -n <ns>
+```
+
+To talk to etcd directly, pick any Pod via the label and exec:
+
+```sh
+POD=$(kubectl get pod -l etcd.lllamnyp.su/cluster=<cluster> -n <ns> \
+  -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -n <ns> "$POD" -- etcdctl --endpoints=http://localhost:2379 \
+  endpoint health --cluster
+```
+
+## Scaling
+
+The operator commits to a target on the first reconcile that sees the new spec — see the locking pattern in [concepts](concepts.md#locking-pattern). Spec edits during an in-flight reconcile are noticed but not acted on until the target is reached or the deadline expires.
+
+### Scale up
+
+```sh
+kubectl patch etcdcluster.lllamnyp.su <name> -n <ns> --type=merge \
+  -p '{"spec":{"replicas":5}}'
+```
+
+The operator adds one member at a time as a learner, waits for it to report `Ready=True`, then promotes it before adding the next. Each step is gated on the previous learner reaching `Ready`. On a fresh cluster with no data each step completes in well under a second on etcd's side and the operator's reconcile cadence (~30 s requeue) dominates wall time; on clusters with non-trivial data volumes the learner-sync time can become the dominant factor (etcd has to ship the data dir before `MemberPromote` is accepted). Watch progress with:
+
+```sh
+kubectl get etcdcluster.lllamnyp.su <name> -n <ns> \
+  -o jsonpath='{.status.readyMembers}/{.status.observed.replicas}{"\n"}'
+```
+
+### Scale down
+
+```sh
+kubectl patch etcdcluster.lllamnyp.su <name> -n <ns> --type=merge \
+  -p '{"spec":{"replicas":3}}'
+```
+
+Picks the most-recently-created member as the victim (`CreationTimestamp` DESC, name DESC tiebreak). The finalizer calls `MemberRemove` against the remaining peers before the Pod and PVC are garbage-collected. No special seed-protection — the seed (the original bootstrap member) has no permanent special role and can be removed like any other member.
+
+### Pause (scale to 0)
+
+```sh
+kubectl patch etcdcluster.lllamnyp.su <name> -n <ns> --type=merge \
+  -p '{"spec":{"replicas":0}}'
+```
+
+For an N>1 cluster this is a staged descent: each intermediate step (`MemberRemove` + Pod/PVC GC) until one member remains, then a 1→0 "pause" — the surviving member's `spec.dormant` is patched to `true`. The Pod goes away; the PVC stays owned by the `EtcdMember`, which itself stays alive. `etcdctl` from outside is no longer reachable (no Pod) but the data is intact.
+
+Observable state once paused:
+
+```sh
+# One EtcdMember CR with spec.dormant=true:
+kubectl get etcdmember.lllamnyp.su -n <ns> \
+  -o custom-columns=NAME:.metadata.name,DORMANT:.spec.dormant
+
+# One PVC remaining (data-<member-name>):
+kubectl get pvc -l etcd.lllamnyp.su/cluster=<cluster> -n <ns>
+
+# No Pods:
+kubectl get pod -l etcd.lllamnyp.su/cluster=<cluster> -n <ns>
+
+# Available=False, Reason=Paused, message names the PVC:
+kubectl get etcdcluster.lllamnyp.su <name> -n <ns> \
+  -o jsonpath='{.status.conditions[?(@.type=="Available")]}{"\n"}'
+```
+
+### Resume (scale to 1+)
+
+```sh
+kubectl patch etcdcluster.lllamnyp.su <name> -n <ns> --type=merge \
+  -p '{"spec":{"replicas":3}}'
+```
+
+The cluster controller spots the dormant member, patches `spec.dormant=false`, and the member controller's next pass recreates the Pod against the existing PVC. Etcd reads the data dir and resumes with the **same cluster ID and member ID** as before the pause — verify with:
+
+```sh
+kubectl get etcdcluster.lllamnyp.su <name> -n <ns> -o jsonpath='{.status.clusterID}'
+# Should match the value you saw before the pause.
+```
+
+Further scale-up (1→3 in the example) proceeds normally from that single-member starting point.
+
+## Conditions: what they mean and what to do
+
+The full table is in [concepts](concepts.md#conditions). The actionable subset:
+
+### `Available=False/Paused`
+
+Expected when `spec.replicas=0`. Inspect the message for whether data is preserved:
+
+- "data is preserved on PVC data-`<name>`" → dormant member exists; scaling up resumes the same etcd cluster.
+- "no data has been written (cluster never bootstrapped)" → cluster was created with `replicas=0` from the start; scaling up triggers a fresh bootstrap.
+
+### `Available=False/QuorumLost`
+
+Less than half of `observed.replicas` are ready. The cluster cannot serve writes. Check:
+
+```sh
+kubectl get etcdmember.lllamnyp.su -n <ns> \
+  -o custom-columns=NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status
+kubectl get pod -l etcd.lllamnyp.su/cluster=<cluster> -n <ns> -o wide
+kubectl describe pod -n <ns> <unhealthy-pod>
+```
+
+Common causes: PVC binding stuck (no nodes match the storage class's topology), node drained without rescheduling, etcd OOM (look at `kubectl logs --previous`), DNS resolution failing inside the cluster network.
+
+If quorum is recoverable (Pods come back), the cluster heals on its own. If a member's data dir is gone, see [Broken member](#broken-member).
+
+### `Available=False/ClusterUnreachable`
+
+Bootstrap discovery couldn't dial the seed. The message comes via `stableErrorMessage(err)` which strips per-call variable portions (timestamps, port numbers), so the same root cause reads consistently across retries.
+
+```sh
+kubectl get etcdcluster.lllamnyp.su <name> -n <ns> \
+  -o jsonpath='{.status.conditions[?(@.type=="Available")].message}{"\n"}'
+kubectl get pod -l etcd.lllamnyp.su/cluster=<cluster> -n <ns>
+kubectl logs -n <ns> <seed-pod>
+```
+
+If the seed Pod is `Running 1/1` and the controller still reports `ClusterUnreachable`, suspect a Service/DNS issue:
+
+```sh
+# Headless service exists?
+kubectl get svc -n <ns> <cluster>
+# Resolves to a pod IP?
+kubectl run dns-debug --rm -it --image=busybox -n <ns> -- \
+  nslookup <seed-pod-name>.<cluster>.<ns>.svc.cluster.local
+```
+
+### `Available=False/BootstrapFailed`
+
+Terminal. The deadline expired before `clusterID` was latched. The partial seed's Pod carries an `--initial-cluster` flag baked in; the operator cannot change it in-place. Recovery is:
+
+```sh
+kubectl delete etcdcluster.lllamnyp.su <name> -n <ns>
+# Wait for all dependents to be GC'd:
+kubectl get etcdmember,pvc -l etcd.lllamnyp.su/cluster=<cluster> -n <ns>
+# Once that returns no resources, re-create.
+kubectl apply -f <your-cluster-manifest>.yaml
+```
+
+The PVC GC step is important: re-creating before the prior PVCs are gone causes the new EtcdMember to refuse to adopt them (`pvcOwnedBy` UID check fails — see [concepts](concepts.md#api-model)). The operator's check is a safety feature; the right answer is to wait.
+
+### `Available=False/DeadlineExceeded`
+
+Terminal. The deadline expired after bootstrap (the cluster itself is healthy; only the most recent operation got stuck). The operator parks and waits for a spec edit:
+
+```sh
+# Inspect what's stuck:
+kubectl get etcdcluster.lllamnyp.su <name> -n <ns> -o yaml
+# observed shows what the operator was trying to reach;
+# spec shows what you originally asked for.
+
+# Edit spec to something sane (often: revert to the previous working value):
+kubectl edit etcdcluster.lllamnyp.su <name> -n <ns>
+```
+
+The next reconcile notices `spec != observed`, treats your edit as the intervention signal, snapshots the new spec into `observed`, sets a fresh deadline, and resumes.
+
+### `Progressing=True/WaitingForSeed`
+
+The seed `EtcdMember` CR exists but the member controller hasn't yet created its Pod — this is the gap between the cluster controller creating the CR and the member controller's next reconcile pass. `kubectl describe pod` is **not** useful here: there is no Pod yet, so it returns "not found" and obscures the actual state. Inspect the CR and the namespace's events instead:
+
+```sh
+SEED=$(kubectl get etcdmember.lllamnyp.su -n <ns> \
+  -o jsonpath='{.items[?(@.spec.bootstrap==true)].metadata.name}')
+kubectl describe etcdmember.lllamnyp.su -n <ns> "$SEED"
+kubectl get events -n <ns> --field-selector involvedObject.name=$SEED
+```
+
+In normal operation this state clears within one or two reconcile cycles. If it persists, the operator controller is wedged — check its logs (see [Operator logs](#operator-logs)).
+
+Once the seed Pod is created, `WaitingForSeed` clears and any *Pod*-side problems (`StorageClass` missing, image-pull failure, `PodSecurity` admission rejection of the `restricted`-compatible spec) surface separately. At that point `kubectl describe pod -l etcd.lllamnyp.su/cluster=<cluster> -n <ns>` is the right tool.
+
+## Forcing escalation: shortening the deadline
+
+The default `progressDeadlineSeconds` is 600 (10 minutes). If a reconcile is wedged and you don't want to wait out the window, force the deadline now:
+
+```sh
+kubectl patch etcdcluster.lllamnyp.su <name> -n <ns> --subresource=status --type=merge \
+  -p "{\"status\":{\"progressDeadline\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ -d '1 second ago')\"}}"
+```
+
+This pushes the cluster into the terminal-error state immediately. Recovery follows the relevant condition arm above (delete-and-recreate for pre-bootstrap, spec-edit for post-bootstrap).
+
+## Broken member
+
+Recovery from a permanently broken member (e.g. PVC lost, node retired) is currently manual. The operator's `isBroken` predicate is a stub; auto-replacement is not wired up (see [concepts](concepts.md#what-is-not-in-the-design)).
+
+Manual recovery:
+
+```sh
+# 1. Identify the broken member.
+kubectl get etcdmember.lllamnyp.su -n <ns>
+# 2. Delete it — the finalizer runs MemberRemove against peers, then GC takes
+#    the Pod and PVC. Quorum holds because we remove before adding.
+kubectl delete etcdmember.lllamnyp.su <broken-member> -n <ns>
+# 3. The cluster controller's next reconcile observes current < desired and
+#    scales up automatically — a new member is added with GenerateName and
+#    fresh storage.
+```
+
+This sequence preserves quorum if you have an odd number of voters and only one is broken. If multiple voters are broken simultaneously, quorum is lost and you can't `MemberRemove` cleanly. In that case the recovery is to delete the EtcdCluster, recreate, and restore from backup (which the operator doesn't take — see [What's not supported](../README.md#whats-not-supported-yet)).
+
+## Reading etcd state directly
+
+The operator only surfaces what it needs for its own decisions. For deeper inspection talk to etcd:
+
+```sh
+POD=$(kubectl get pod -l etcd.lllamnyp.su/cluster=<cluster> -n <ns> \
+  -o jsonpath='{.items[0].metadata.name}')
+
+# Cluster ID, leader, members:
+kubectl exec -n <ns> "$POD" -- etcdctl --endpoints=http://localhost:2379 \
+  member list -w table
+kubectl exec -n <ns> "$POD" -- etcdctl --endpoints=http://localhost:2379 \
+  endpoint status -w table --cluster
+
+# Health (per-member):
+kubectl exec -n <ns> "$POD" -- etcdctl --endpoints=http://localhost:2379 \
+  endpoint health --cluster
+
+# Database size, last revision, raft term:
+kubectl exec -n <ns> "$POD" -- etcdctl --endpoints=http://localhost:2379 \
+  endpoint status --cluster -w json | jq
+```
+
+`IS LEARNER=true` in `member list` indicates a member that hasn't been promoted yet — expected during a scale-up step, abnormal in steady state. The operator's `promotePendingLearner` runs from both `scaleUp` and the `current == desired` branch of `Reconcile`, so a learner that stays as a learner for more than a few reconcile cycles either has a sync problem (check the etcd pod logs) or the operator is wedged (check the operator pod logs).
+
+## Operator logs
+
+The operator runs in `etcd-operator-system` by default. Log lines you'll see most often:
+
+```sh
+kubectl logs -n etcd-operator-system deploy/etcd-operator-controller-manager \
+  -c manager --tail=200
+```
+
+Key signals:
+
+| Log message | Meaning |
+|---|---|
+| `bootstrapping single-node cluster` | First-reconcile bootstrap is creating the seed. |
+| `waiting for bootstrap member to form cluster` | Seed created, waiting for its Pod + etcd discovery. |
+| `cluster declared paused from the start; not bootstrapping` | `spec.replicas=0` on a never-bootstrapped cluster. |
+| `completing pending scale-up member before further action` | Crash recovery: a previous reconcile left a CR with empty `spec.initialCluster`. |
+| `added member as learner` | `MemberAddAsLearner` succeeded; next reconcile will Patch `spec.initialCluster`. |
+| `promoted learner` | `MemberPromote` succeeded; the member is now a voter. |
+| `waking dormant member` | Resume: Patching `spec.dormant=false`. |
+| `waiting for existing members to become Ready before next scale-up step` | Scale-up is single-stepping; the previous learner isn't ready yet. |
+| `learner not yet promotable; will retry` | `MemberPromote` returned an "in sync with leader" error; benign during scale-up. |
+| `MemberList failed` ERROR with `rpc not supported for learner` | The endpoint-filtering fix (issue #12) should prevent this; if you see it, file a bug. |
+
+## Recipes
+
+### Find the dormant member
+
+```sh
+kubectl get etcdmember.lllamnyp.su -n <ns> \
+  -o jsonpath='{range .items[?(@.spec.dormant==true)]}{.metadata.name}{"\n"}{end}'
+```
+
+### Find the seed of a running cluster
+
+```sh
+kubectl get etcdmember.lllamnyp.su -n <ns> \
+  -o jsonpath='{range .items[?(@.spec.bootstrap==true)]}{.metadata.name}{"\n"}{end}'
+```
+
+Note: the seed has no special operational role post-bootstrap — see [concepts](concepts.md#member-naming). This is for historical lookup, not for routing.
+
+### Tail logs from the etcd leader
+
+```sh
+POD=$(kubectl get pod -l etcd.lllamnyp.su/cluster=<cluster> -n <ns> \
+  -o jsonpath='{.items[0].metadata.name}')
+LEADER=$(kubectl exec -n <ns> "$POD" -- etcdctl \
+  --endpoints=http://localhost:2379 endpoint status --cluster -w json \
+  | jq -r '.[] | select(.Status.leader == .Status.header.member_id) | .Endpoint' \
+  | sed 's|http://||;s|:.*||;s|\..*||')
+kubectl logs -n <ns> "$LEADER" --tail=200
+```
+
+### Drain a node holding an etcd member
+
+Just `kubectl cordon` + `kubectl drain` works. The Pod gets evicted, reschedules onto another node, the PVC reattaches (if storage class supports relocation) or stays put (if not — then the Pod stays Pending until the node is back). Etcd is fine with this — `MemberAddAsLearner` isn't involved because the member ID and data dir are preserved in the PVC.
+
+PodAntiAffinity is not configured by default (see [What's not supported](../README.md#whats-not-supported-yet)). Two etcd pods can land on the same node, which means a single node drain can take out two voters simultaneously and lose quorum on a 3-member cluster. Recommended workaround: add a PodAntiAffinity rule via a `PodTopologySpread` mutating webhook or pre-deploy a `Deployment`-level affinity wrapper. (A native operator option is a future feature.)
