@@ -155,11 +155,12 @@ If quorum is already lost across multiple simultaneous failures, `MemberRemove` 
 
 ### What is missing from memory clusters today
 
-Three things are not yet auto-emitted and matter for production memory clusters — all tracked in [issue #16](https://github.com/lllamnyp/etcd-operator/issues/16):
+Two things are not yet auto-emitted and matter for production memory clusters — both tracked in [issue #16](https://github.com/lllamnyp/etcd-operator/issues/16):
 
-- **`PodDisruptionBudget`**. A `kubectl drain` will happily evict more than the quorum can survive. Recommended manual: `maxUnavailable: floor((replicas-1)/2)`.
 - **Pod anti-affinity**. Without it, scheduling can co-locate voters on one node; a single node failure then loses quorum on a 3-member cluster.
 - **Container memory limits**. Without `limits.memory`, tmpfs writes count against node memory rather than the pod's cgroup and the etcd container ends up in BestEffort/Burstable QoS — first to be evicted under pressure. Workaround: deploy a `LimitRange` in the cluster's namespace until a `spec.resources` field exists.
+
+The `PodDisruptionBudget` *is* auto-emitted now — see the [PodDisruptionBudget section](#poddisruptionbudget) below.
 
 ### Apiserver-enforced validation
 
@@ -173,6 +174,34 @@ Four CEL `x-kubernetes-validations` rules on `EtcdClusterSpec` are evaluated at 
 | `storage` cannot shrink | UPDATE | PVCs cannot shrink and tmpfs `SizeLimit` reduction does not free allocated memory. |
 
 These rules live in the CRD itself; the apiserver enforces them with no separate webhook, no cert-manager, no extra Deployment. Errors come back as standard apiserver admission rejections (`kubectl apply` prints the rule's `message` field).
+
+## PodDisruptionBudget
+
+Every `EtcdCluster` gets a per-cluster `PodDisruptionBudget` (`policy/v1`) named after the cluster. The PDB is what makes `kubectl drain` safe: it tells the apiserver "this many of my Pods may be voluntarily unavailable at once". Without it, a drain can evict more-than-quorum voters before the operator can react and the cluster loses consensus.
+
+### Selector and budget
+
+- **Selector**: `etcd.lllamnyp.su/cluster=<name>, etcd.lllamnyp.su/role=voter`. Only voting members are protected; learners can be evicted freely (a learner-only loss does not affect quorum, and the operator's existing scale-up flow will re-add a learner if the cluster was mid-promotion).
+- **MaxUnavailable**: `(votingMembers - 1) / 2`, integer-divided so the result floors automatically. For 1 voter → 0 (any disruption is quorum loss). For 3 → 1, 4 → 1, 5 → 2, 7 → 3.
+
+### Where the `role=voter` label comes from
+
+The cluster controller is the source of truth for whether a member is a voter; it learns this from etcd's `MemberList` (specifically `IsLearner=false`). It writes `Status.IsVoter` onto each `EtcdMember`. The member controller reads `Status.IsVoter` and patches its Pod's `etcd.lllamnyp.su/role=voter` label accordingly. Two reconcile hops, but the controller boundaries stay clean: the cluster controller never patches a Pod directly.
+
+The seed is **pre-stamped** with `Status.IsVoter=true` at creation — it's never a learner, so the operator skips the round-trip and the Pod gets the role label on the very first reconcile, closing the bootstrap-window protection gap.
+
+### Transient races
+
+Two windows exist; both are safe:
+
+- **Scale-up (after promote).** Etcd's `MemberList` reports N+1 voters but `Status.IsVoter` for the freshly-promoted member hasn't been patched yet. The PDB therefore protects N voter Pods. A drain in this window could evict the unlabelled new voter (no PDB protection) — etcd is left with N voters running of N+1 registered. Quorum (`⌈(N+1)/2⌉+1` available needed for writes) still holds for N ≥ 1.
+- **Scale-down (after `MemberRemove`).** Etcd has N-1 voters but the victim's Pod is briefly Terminating. The PDB's own selector still matches the Terminating Pod, but the k8s PDB controller counts `DeletionTimestamp != nil` Pods as already unavailable — so the in-flight removal is naturally accounted for and the budget shrinks accordingly.
+
+Both windows are one reconcile cycle wide.
+
+### What happens with zero voters
+
+Pre-bootstrap, paused (PVC clusters at `replicas: 0`), or wedged: voter count is 0 and the operator **deletes** the PDB entirely. A PDB with zero matching Pods and a stale `MaxUnavailable` from a prior state would mislead `kubectl get pdb`; better to leave nothing than to leave noise.
 
 ## Conditions
 

@@ -45,10 +45,11 @@ const (
 // across the loss, so a single-replica memory cluster cannot survive a
 // Pod eviction.
 //
-// Production memory clusters should also have a PodDisruptionBudget, hard
-// pod-anti-affinity, and a container memory limit covering the tmpfs size
-// plus etcd's own headroom. None of that is auto-emitted by the operator
-// yet — see https://github.com/lllamnyp/etcd-operator/issues/16.
+// Production memory clusters also want hard pod-anti-affinity and a
+// container memory limit covering the tmpfs size plus etcd's own
+// headroom. Those two are not auto-emitted by the operator yet — see
+// https://github.com/lllamnyp/etcd-operator/issues/16. The
+// PodDisruptionBudget is auto-emitted on every cluster.
 //
 // +kubebuilder:validation:Enum="";Memory
 type StorageMedium string
