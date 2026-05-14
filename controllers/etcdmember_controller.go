@@ -630,6 +630,19 @@ func (r *EtcdMemberReconciler) updateStatus(ctx context.Context, member *lll.Etc
 		}
 	}
 
+	// /scale fields: Replicas reflects "Pod exists" (1) or not (0).
+	// Selector matches this member's single Pod. Consumed by the PDB
+	// controller during expectedPods derivation; not user-facing.
+	if member.Status.Replicas != 1 {
+		member.Status.Replicas = 1
+		changed = true
+	}
+	wantSelector := fmt.Sprintf("%s=%s,app.kubernetes.io/component=%s", LabelCluster, member.Spec.ClusterName, member.Name)
+	if member.Status.Selector != wantSelector {
+		member.Status.Selector = wantSelector
+		changed = true
+	}
+
 	podReady := false
 	for _, c := range pod.Status.Conditions {
 		if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {

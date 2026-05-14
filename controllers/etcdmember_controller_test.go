@@ -816,6 +816,8 @@ func TestUpdateStatus_NoChurnInSteadyState(t *testing.T) {
 			PodName:  "test-0",
 			PVCName:  "data-test-0",
 			MemberID: "0000000000000001",
+			Replicas: 1,
+			Selector: "etcd.lllamnyp.su/cluster=test,app.kubernetes.io/component=test-0",
 			Conditions: []metav1.Condition{{
 				Type: lll.MemberReady, Status: metav1.ConditionTrue, Reason: "PodReady",
 				Message: "etcd member is ready", LastTransitionTime: now,
