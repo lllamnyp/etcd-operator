@@ -100,6 +100,17 @@ type EtcdMemberStatus struct {
 	// +optional
 	PodUID string `json:"podUID,omitempty"`
 
+	// IsVoter is true when etcd's MemberList reports this member with
+	// IsLearner=false — i.e. it counts toward quorum. Written by the
+	// cluster controller during its MemberList processing and pre-stamped
+	// true at seed creation (the seed is never a learner). Read by the
+	// member controller to apply the role=voter Pod label that the
+	// per-cluster PodDisruptionBudget selects on. Default value false is
+	// the safe-but-temporary state for a freshly-added learner before
+	// MemberPromote runs.
+	// +optional
+	IsVoter bool `json:"isVoter,omitempty"`
+
 	// PVCName is the name of the PersistentVolumeClaim for this member's data.
 	// +optional
 	PVCName string `json:"pvcName,omitempty"`

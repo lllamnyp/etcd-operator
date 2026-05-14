@@ -182,6 +182,17 @@ spec:
                   - type
                   type: object
                 type: array
+              isVoter:
+                description: |-
+                  IsVoter is true when etcd's MemberList reports this member with
+                  IsLearner=false — i.e. it counts toward quorum. Written by the
+                  cluster controller during its MemberList processing and pre-stamped
+                  true at seed creation (the seed is never a learner). Read by the
+                  member controller to apply the role=voter Pod label that the
+                  per-cluster PodDisruptionBudget selects on. Default value false is
+                  the safe-but-temporary state for a freshly-added learner before
+                  MemberPromote runs.
+                type: boolean
               memberID:
                 description: |-
                   MemberID is the etcd-assigned member ID in hex (e.g. "ae36f238164a08ad"),
