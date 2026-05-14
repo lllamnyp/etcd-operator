@@ -14,13 +14,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
 
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -2454,5 +2457,207 @@ func TestSpecEqualsObserved_StorageMediumMatters(t *testing.T) {
 	cluster.Status.Observed.StorageMedium = lll.StorageMediumMemory
 	if !specEqualsObserved(cluster) {
 		t.Fatalf("specEqualsObserved must return true when all fields including StorageMedium match")
+	}
+}
+
+// TestPDBMaxUnavailable pins the disruption budget formula. The
+// PodDisruptionBudget protects voting members; this is the single
+// place where the (n-1)/2 floor is computed.
+func TestPDBMaxUnavailable(t *testing.T) {
+	cases := []struct {
+		voters int32
+		want   int32
+	}{
+		{voters: 0, want: 0},
+		{voters: 1, want: 0},
+		{voters: 2, want: 0},
+		{voters: 3, want: 1},
+		{voters: 4, want: 1},
+		{voters: 5, want: 2},
+		{voters: 6, want: 2},
+		{voters: 7, want: 3},
+	}
+	for _, tc := range cases {
+		got := pdbMaxUnavailable(tc.voters)
+		if got != tc.want {
+			t.Fatalf("pdbMaxUnavailable(%d) = %d, want %d", tc.voters, got, tc.want)
+		}
+	}
+}
+
+// TestReconcilePDB_CreatesWithVoterSelector verifies that a cluster
+// with voters gets a PDB whose selector restricts to LabelRole=
+// RoleVoter (not just LabelCluster). Without this restriction, a
+// learner Pod's eviction would consume budget and a voter would be
+// over-protected during scale-up windows.
+func TestReconcilePDB_CreatesWithVoterSelector(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+	}
+	c, _ := newTestClient(t, cluster)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t)}
+
+	if err := r.reconcilePDB(ctx, cluster, 3); err != nil {
+		t.Fatalf("reconcilePDB: %v", err)
+	}
+
+	pdb := &policyv1.PodDisruptionBudget{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "test"}, pdb); err != nil {
+		t.Fatalf("Get PDB: %v", err)
+	}
+	if pdb.Spec.MaxUnavailable == nil || pdb.Spec.MaxUnavailable.IntValue() != 1 {
+		t.Fatalf("MaxUnavailable = %v, want 1", pdb.Spec.MaxUnavailable)
+	}
+	want := map[string]string{LabelCluster: "test", LabelRole: RoleVoter}
+	if !reflect.DeepEqual(pdb.Spec.Selector.MatchLabels, want) {
+		t.Fatalf("PDB selector MatchLabels = %v, want %v", pdb.Spec.Selector.MatchLabels, want)
+	}
+}
+
+// TestReconcilePDB_UpdatesOnVoterCountChange verifies the in-place
+// Patch path: existing PDB's MaxUnavailable is updated rather than the
+// PDB being deleted+recreated. PDB Selector is immutable on the
+// apiserver side; the test also implicitly guards against an
+// accidental Selector change attempting that path.
+func TestReconcilePDB_UpdatesOnVoterCountChange(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+	}
+	c, _ := newTestClient(t, cluster)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t)}
+
+	if err := r.reconcilePDB(ctx, cluster, 3); err != nil {
+		t.Fatalf("reconcilePDB(3): %v", err)
+	}
+	if err := r.reconcilePDB(ctx, cluster, 5); err != nil {
+		t.Fatalf("reconcilePDB(5): %v", err)
+	}
+
+	pdb := &policyv1.PodDisruptionBudget{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "test"}, pdb); err != nil {
+		t.Fatalf("Get PDB: %v", err)
+	}
+	if pdb.Spec.MaxUnavailable.IntValue() != 2 {
+		t.Fatalf("MaxUnavailable after 3→5 transition = %d, want 2", pdb.Spec.MaxUnavailable.IntValue())
+	}
+}
+
+// TestReconcilePDB_DeletesWhenNoVoters covers pre-bootstrap, paused,
+// and wedged states: a PDB with zero matching Pods (because the
+// label-bearing voters don't exist) would be inert anyway, but its
+// staleness — particularly with a non-zero MaxUnavailable from a
+// prior state — would mislead operators reading kubectl get pdb.
+func TestReconcilePDB_DeletesWhenNoVoters(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+	}
+	c, _ := newTestClient(t, cluster)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t)}
+
+	if err := r.reconcilePDB(ctx, cluster, 3); err != nil {
+		t.Fatalf("reconcilePDB(3): %v", err)
+	}
+	if err := r.reconcilePDB(ctx, cluster, 0); err != nil {
+		t.Fatalf("reconcilePDB(0): %v", err)
+	}
+
+	err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "test"}, &policyv1.PodDisruptionBudget{})
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("PDB must be deleted when voterCount=0; got err=%v", err)
+	}
+
+	// Idempotent: reconcilePDB(0) on a not-found PDB is a no-op.
+	if err := r.reconcilePDB(ctx, cluster, 0); err != nil {
+		t.Fatalf("reconcilePDB(0) on absent PDB must be a no-op; got %v", err)
+	}
+}
+
+// TestSyncIsVoter_PatchesFromMemberList verifies the bridge between
+// etcd's MemberList view and CR-side Status.IsVoter. Matching is by
+// peer URL — etcd Member.Name is empty during the post-MemberAdd
+// pre-Pod-running window and would mis-match. Idempotent: members
+// already in the desired state must not get re-patched.
+func TestSyncIsVoter_PatchesFromMemberList(t *testing.T) {
+	ctx := context.Background()
+
+	cluster := &lll.EtcdCluster{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"}}
+
+	mkMember := func(name string, currentIsVoter bool) *lll.EtcdMember {
+		return &lll.EtcdMember{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "ns", Labels: memberLabels("test", name)},
+			Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
+			Status:     lll.EtcdMemberStatus{IsVoter: currentIsVoter},
+		}
+	}
+	voter := mkMember("test-v", false)    // etcd says voter; CR says false → expect patch to true
+	learner := mkMember("test-l", true)   // etcd says learner; CR says true → expect patch to false
+	stable := mkMember("test-s", true)    // etcd says voter; CR says true → no patch
+	unknown := mkMember("test-u", false)  // not in etcd's list yet → no patch
+
+	c, _ := newTestClient(t, cluster, voter, learner, stable, unknown)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t)}
+
+	listResp := &clientv3.MemberListResponse{
+		Members: []*etcdserverpb.Member{
+			{ID: 0x1, PeerURLs: []string{peerURL("test-v", "test", "ns")}, IsLearner: false},
+			{ID: 0x2, PeerURLs: []string{peerURL("test-l", "test", "ns")}, IsLearner: true},
+			{ID: 0x3, PeerURLs: []string{peerURL("test-s", "test", "ns")}, IsLearner: false},
+		},
+	}
+
+	members := []lll.EtcdMember{*voter, *learner, *stable, *unknown}
+	if err := r.syncIsVoter(ctx, cluster, members, listResp); err != nil {
+		t.Fatalf("syncIsVoter: %v", err)
+	}
+
+	check := func(name string, want bool) {
+		t.Helper()
+		got := &lll.EtcdMember{}
+		if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: name}, got); err != nil {
+			t.Fatalf("Get %s: %v", name, err)
+		}
+		if got.Status.IsVoter != want {
+			t.Fatalf("%s.Status.IsVoter = %v, want %v", name, got.Status.IsVoter, want)
+		}
+	}
+	check("test-v", true)  // patched up
+	check("test-l", false) // patched down
+	check("test-s", true)  // unchanged (already true)
+	check("test-u", false) // unchanged (not in etcd list yet)
+}
+
+// TestBootstrap_PreStampsSeedIsVoter verifies the seed's IsVoter is
+// set to true at create time (rather than waiting for the first
+// MemberList round). This closes the bootstrap-window protection
+// gap: the member controller can apply role=voter on the first Pod
+// reconcile and the PDB sees the labelled Pod on the next cluster
+// reconcile.
+func TestBootstrap_PreStampsSeedIsVoter(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(3),
+			Version:  "3.5.17",
+			Storage:  quickQty(t, "1Gi"),
+		},
+	}
+	c, _ := newTestClient(t, cluster)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdeadbeef))}
+
+	reconcileUntilStable(t, r, c, "test", "ns", 8)
+
+	members := &lll.EtcdMemberList{}
+	if err := c.List(ctx, members, client.InNamespace("ns")); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(members.Items) != 1 {
+		t.Fatalf("expected one seed; got %d", len(members.Items))
+	}
+	if !members.Items[0].Status.IsVoter {
+		t.Fatalf("seed Status.IsVoter must be true after bootstrap; got %v", members.Items[0].Status.IsVoter)
 	}
 }

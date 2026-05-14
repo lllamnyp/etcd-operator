@@ -1461,3 +1461,117 @@ func TestIsBroken_MemoryMemberWithLostPodIsBroken(t *testing.T) {
 
 // keep errors import live in case more tests are added below.
 var _ = errors.New
+
+// TestEnsurePod_AppliesRoleLabelWhenIsVoter verifies the member
+// controller propagates Status.IsVoter onto the Pod's LabelRole label
+// during ensurePod's existing-Pod path. The PDB's selector keys on
+// this label; without propagation the PDB would never match the Pod.
+func TestEnsurePod_AppliesRoleLabelWhenIsVoter(t *testing.T) {
+	ctx := context.Background()
+	tru := true
+
+	member := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "m-1", Namespace: "ns", UID: types.UID("mu")},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName:    "test",
+			Version:        "3.5.17",
+			Storage:        quickQty(t, "1Gi"),
+			InitialCluster: "m-1=" + peerURL("m-1", "test", "ns"),
+			ClusterToken:   "ns-test-x",
+			Bootstrap:      true,
+		},
+		Status: lll.EtcdMemberStatus{IsVoter: true},
+	}
+	// Pod exists without the role label — the steady-state case where
+	// Status.IsVoter was flipped after the Pod was created.
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "m-1", Namespace: "ns", UID: types.UID("pod-uid"),
+			Labels: memberLabels("test", "m-1"),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "lllamnyp.su/v1alpha2", Kind: "EtcdMember",
+				Name: "m-1", UID: types.UID("mu"), Controller: &tru, BlockOwnerDeletion: &tru,
+			}},
+		},
+	}
+	c, _ := newTestClient(t, member, pod)
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t)}
+
+	if err := r.ensurePod(ctx, member); err != nil {
+		t.Fatalf("ensurePod: %v", err)
+	}
+	got := mustGet(t, c, "m-1", "ns", &corev1.Pod{})
+	if got.Labels[LabelRole] != RoleVoter {
+		t.Fatalf("Pod label %s = %q, want %q", LabelRole, got.Labels[LabelRole], RoleVoter)
+	}
+}
+
+// TestEnsurePod_StripsRoleLabelWhenNotVoter is the inverse: when the
+// cluster controller flips Status.IsVoter from true to false (member
+// demoted, or stale CR state being corrected), the member controller
+// must remove the label. Otherwise the PDB would over-protect a
+// non-voter Pod and a learner-only eviction would consume budget.
+func TestEnsurePod_StripsRoleLabelWhenNotVoter(t *testing.T) {
+	ctx := context.Background()
+	tru := true
+
+	member := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "m-1", Namespace: "ns", UID: types.UID("mu")},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			InitialCluster: "x", ClusterToken: "ns-test-x", Bootstrap: true,
+		},
+		Status: lll.EtcdMemberStatus{IsVoter: false},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "m-1", Namespace: "ns", UID: types.UID("pod-uid"),
+			Labels: map[string]string{
+				LabelCluster: "test",
+				LabelRole:    RoleVoter, // stale label from a prior voter state
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "lllamnyp.su/v1alpha2", Kind: "EtcdMember",
+				Name: "m-1", UID: types.UID("mu"), Controller: &tru, BlockOwnerDeletion: &tru,
+			}},
+		},
+	}
+	c, _ := newTestClient(t, member, pod)
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t)}
+
+	if err := r.ensurePod(ctx, member); err != nil {
+		t.Fatalf("ensurePod: %v", err)
+	}
+	got := mustGet(t, c, "m-1", "ns", &corev1.Pod{})
+	if _, present := got.Labels[LabelRole]; present {
+		t.Fatalf("Pod label %s must be stripped when Status.IsVoter=false; got %q", LabelRole, got.Labels[LabelRole])
+	}
+}
+
+// TestBuildPod_RoleLabelAtCreateForVoter verifies the create-time
+// optimization for the seed: when the cluster controller pre-stamps
+// Status.IsVoter=true before the first ensurePod, buildPod emits the
+// Pod with LabelRole=RoleVoter already set, saving one reconcile
+// cycle of unprotected-Pod window during bootstrap.
+func TestBuildPod_RoleLabelAtCreateForVoter(t *testing.T) {
+	r := &EtcdMemberReconciler{}
+	pod := r.buildPod(&lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "m-1", Namespace: "ns"},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17"},
+		Status:     lll.EtcdMemberStatus{IsVoter: true},
+	})
+	if pod.Labels[LabelRole] != RoleVoter {
+		t.Fatalf("buildPod with IsVoter=true must emit %s=%q; got %q", LabelRole, RoleVoter, pod.Labels[LabelRole])
+	}
+
+	// Negative side: IsVoter=false omits the label entirely (not "" — we
+	// don't want the empty string to match a permissive selector).
+	pod2 := r.buildPod(&lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "m-2", Namespace: "ns"},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17"},
+		Status:     lll.EtcdMemberStatus{IsVoter: false},
+	})
+	if _, present := pod2.Labels[LabelRole]; present {
+		t.Fatalf("buildPod with IsVoter=false must not set %s; got %q", LabelRole, pod2.Labels[LabelRole])
+	}
+}
