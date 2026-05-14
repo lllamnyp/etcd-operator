@@ -2592,10 +2592,10 @@ func TestSyncIsVoter_PatchesFromMemberList(t *testing.T) {
 			Status:     lll.EtcdMemberStatus{IsVoter: currentIsVoter},
 		}
 	}
-	voter := mkMember("test-v", false)    // etcd says voter; CR says false → expect patch to true
-	learner := mkMember("test-l", true)   // etcd says learner; CR says true → expect patch to false
-	stable := mkMember("test-s", true)    // etcd says voter; CR says true → no patch
-	unknown := mkMember("test-u", false)  // not in etcd's list yet → no patch
+	voter := mkMember("test-v", false)   // etcd says voter; CR says false → expect patch to true
+	learner := mkMember("test-l", true)  // etcd says learner; CR says true → expect patch to false
+	stable := mkMember("test-s", true)   // etcd says voter; CR says true → no patch
+	unknown := mkMember("test-u", false) // not in etcd's list yet → no patch
 
 	c, _ := newTestClient(t, cluster, voter, learner, stable, unknown)
 	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t)}

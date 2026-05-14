@@ -49,7 +49,7 @@ type EtcdMemberReconciler struct {
 //+kubebuilder:rbac:groups=lllamnyp.su,resources=etcdmembers/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=lllamnyp.su,resources=etcdmembers/finalizers,verbs=update
 //+kubebuilder:rbac:groups=lllamnyp.su,resources=etcdclusters,verbs=get
-//+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;delete
+//+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;patch;delete
 //+kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 
 func (r *EtcdMemberReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
