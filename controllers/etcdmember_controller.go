@@ -397,6 +397,9 @@ func (r *EtcdMemberReconciler) ensurePod(ctx context.Context, member *lll.EtcdMe
 	if err == nil {
 		member.Status.PodName = pod.Name
 		member.Status.PodUID = string(pod.UID)
+		if err := r.reconcileRoleLabel(ctx, pod, member); err != nil {
+			return err
+		}
 		return nil
 	}
 	if !errors.IsNotFound(err) {
@@ -413,6 +416,33 @@ func (r *EtcdMemberReconciler) ensurePod(ctx context.Context, member *lll.EtcdMe
 	member.Status.PodName = pod.Name
 	member.Status.PodUID = string(pod.UID)
 	return nil
+}
+
+// reconcileRoleLabel keeps the Pod's role label in sync with the
+// member's Status.IsVoter. The cluster controller is the source of
+// truth for IsVoter (written from etcd's MemberList); the member
+// controller propagates that single bit to the Pod label so the
+// per-cluster PodDisruptionBudget's selector — which keys on
+// LabelRole=RoleVoter — protects voters and not learners.
+//
+// Idempotent: returns nil without a Patch when the label already
+// matches the desired state.
+func (r *EtcdMemberReconciler) reconcileRoleLabel(ctx context.Context, pod *corev1.Pod, member *lll.EtcdMember) error {
+	hasLabel := pod.Labels[LabelRole] == RoleVoter
+	want := member.Status.IsVoter
+	if hasLabel == want {
+		return nil
+	}
+	orig := pod.DeepCopy()
+	if pod.Labels == nil {
+		pod.Labels = map[string]string{}
+	}
+	if want {
+		pod.Labels[LabelRole] = RoleVoter
+	} else {
+		delete(pod.Labels, LabelRole)
+	}
+	return r.Patch(ctx, pod, client.MergeFrom(orig))
 }
 
 // ensurePodAbsent is the dormant-state counterpart of ensurePod. It
@@ -473,11 +503,20 @@ func (r *EtcdMemberReconciler) buildPod(member *lll.EtcdMember) *corev1.Pod {
 		}
 	}
 
+	labels := memberLabels(member.Spec.ClusterName, member.Name)
+	if member.Status.IsVoter {
+		// The per-cluster PodDisruptionBudget selects on this label; the
+		// cluster controller's reconcilePDB only counts members with
+		// Status.IsVoter=true, so labelling at create time keeps the PDB
+		// and Pod state consistent in one reconcile rather than two.
+		labels[LabelRole] = RoleVoter
+	}
+
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      member.Name,
 			Namespace: member.Namespace,
-			Labels:    memberLabels(member.Spec.ClusterName, member.Name),
+			Labels:    labels,
 		},
 		Spec: corev1.PodSpec{
 			Hostname:  member.Name,
