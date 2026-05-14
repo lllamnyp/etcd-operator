@@ -62,7 +62,9 @@ const (
 
 // EtcdClusterSpec defines the desired state of an etcd cluster.
 //
-// CEL validation rules (k8s 1.28+ apiserver-enforced):
+// CEL validation rules (k8s 1.29+ apiserver-enforced; both
+// CustomResourceValidationExpressions and the quantity() extension
+// are GA in 1.29):
 //
 //   - StorageMedium=Memory + Replicas=0 wedges the cluster on resume
 //     (the dormant flip deletes the Pod and the tmpfs goes with it but

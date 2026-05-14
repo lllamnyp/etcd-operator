@@ -8,7 +8,7 @@ For the operator's runtime behaviour see [concepts](concepts.md); for day-2 oper
 
 | Requirement | Note |
 |---|---|
-| Kubernetes | 1.29+ required for the CRD's CEL validation rules (`quantity()` library stable in 1.29). 1.28 may work if `CRDValidationRatcheting` is enabled. |
+| Kubernetes | 1.29+ recommended: CEL CRD validation went GA in 1.29 and the `quantity()` CEL extension (used by two of the operator's validation rules) was added in 1.28. 1.28 *may* work in practice because the CEL gate was beta-on-by-default from 1.25, but is not covered by CI. |
 | Default `StorageClass` | The sample manifests omit `storageClassName` and rely on the namespace's default. Override per-cluster if you need a specific class. |
 | Go (build-from-source only) | 1.25+, matches `go.mod`'s `toolchain` directive. |
 | Docker / buildx (build-from-source only) | For producing the operator image. The Dockerfile uses `golang:1.25.10` for the builder and `gcr.io/distroless/static:nonroot` for runtime. |
