@@ -186,7 +186,7 @@ Every `EtcdCluster` gets a per-cluster `PodDisruptionBudget` (`policy/v1`) named
 
 ### Where the `role=voter` label comes from
 
-The cluster controller is the source of truth for whether a member is a voter; it learns this from etcd's `MemberList` (specifically `IsLearner=false`). It writes `Status.IsVoter` onto each `EtcdMember`. The member controller reads `Status.IsVoter` and patches its Pod's `etcd.lllamnyp.su/role=voter` label accordingly. Two reconcile hops, but the controller boundaries stay clean: the cluster controller never patches a Pod directly.
+The cluster controller is the source of truth for whether a member is a voter; it learns this from etcd's `MemberList` (specifically `IsLearner=false`). It writes `Status.IsVoter` onto each `EtcdMember`. The member controller reads `Status.IsVoter` and patches its Pod's `etcd.lllamnyp.su/role=voter` label accordingly. The new label is visible to the PDB by the next cluster-controller reconcile after promotion — three reconcile cycles end-to-end (cluster writes `IsVoter` → member patches Pod label → cluster's next pass picks up the new voter Pod via `reconcilePDB`). The controller boundaries stay clean: the cluster controller never patches a Pod directly.
 
 The seed is **pre-stamped** with `Status.IsVoter=true` at creation — it's never a learner, so the operator skips the round-trip and the Pod gets the role label on the very first reconcile, closing the bootstrap-window protection gap.
 
@@ -194,8 +194,8 @@ The seed is **pre-stamped** with `Status.IsVoter=true` at creation — it's neve
 
 Two windows exist; both are safe:
 
-- **Scale-up (after promote).** Etcd's `MemberList` reports N+1 voters but `Status.IsVoter` for the freshly-promoted member hasn't been patched yet. The PDB therefore protects N voter Pods. A drain in this window could evict the unlabelled new voter (no PDB protection) — etcd is left with N voters running of N+1 registered. Quorum (`⌈(N+1)/2⌉+1` available needed for writes) still holds for N ≥ 1.
-- **Scale-down (after `MemberRemove`).** Etcd has N-1 voters but the victim's Pod is briefly Terminating. The PDB's own selector still matches the Terminating Pod, but the k8s PDB controller counts `DeletionTimestamp != nil` Pods as already unavailable — so the in-flight removal is naturally accounted for and the budget shrinks accordingly.
+- **Scale-up (after promote).** Etcd's `MemberList` reports N+1 voters but `Status.IsVoter` for the freshly-promoted member hasn't been patched yet. The PDB therefore protects N voter Pods. A drain in this window could evict the unlabelled new voter (no PDB protection) — etcd is left with N voters running of N+1 registered. Etcd's write quorum for an M-voter cluster is `⌊M/2⌋+1`, so for M=N+1 the cluster still tolerates one missing voter as long as N ≥ 1.
+- **Scale-down (after `MemberRemove`).** Etcd has N-1 voters but the victim's Pod is briefly Terminating. The PDB's own selector still matches the Terminating Pod, but the k8s PDB controller's `currentHealthy` counts only Pods whose `Ready` condition is `True` — once kubelet flips the Terminating Pod's `Ready` to `False` (which happens at the start of graceful shutdown, before the Pod is gone), it stops counting toward the budget's healthy total. The in-flight removal is naturally accounted for and the budget shrinks accordingly.
 
 Both windows are one reconcile cycle wide.
 

@@ -419,7 +419,7 @@ Cross-reference against `kubectl get etcdmember.lllamnyp.su -n <ns>` — voters 
 
 ### Why drains might block during scale events
 
-The PDB updates **one reconcile after** etcd's view changes (cluster controller's next pass picks up the new voter count from `MemberList`). This is intentional — see [concepts](concepts.md#transient-races) for the safety analysis. In practice, a drain attempted in the millisecond-wide race window will fail closed (refuse the eviction) rather than open, which is the correct direction.
+The PDB updates **one reconcile after** etcd's view changes (cluster controller's next pass picks up the new voter count from `MemberList`). This is intentional — see [concepts](concepts.md#transient-races) for the safety analysis. The race window is one reconcile cycle wide (steady-state `RequeueAfter` is 30 s, so up to ~30 s in the worst case); a drain attempted in that window fails closed (refuses the eviction) rather than open, which is the correct direction.
 
 If you're doing a planned rolling node maintenance, scale down to the resilient quorum size first, drain, scale back up.
 

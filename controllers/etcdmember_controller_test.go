@@ -702,16 +702,18 @@ func TestDiscoverMemberID_FallsBackToPeers(t *testing.T) {
 	}
 }
 
-// TestDiscoverMemberID_ExcludesNonReadyPeers pins the fix for issue #12:
-// when one peer is Ready (a voter) and another is still a learner (not
-// yet Ready), the endpoint list passed to clientv3 must include ONLY
-// the Ready peer. Including the learner lets clientv3 round-robin
-// MemberList to it and get back "rpc not supported for learner", which
-// wedges discovery during scale-up.
+// TestDiscoverMemberID_ExcludesNonVoterPeers pins the fix for issue #12,
+// tightened in the PDB PR: when one peer is a voter (Status.IsVoter=true)
+// and another is still a learner (IsVoter=false), the endpoint list
+// passed to clientv3 must include ONLY the voter. Including the learner
+// lets clientv3 round-robin MemberList to it and get back "rpc not
+// supported for learner", which wedges discovery during scale-up. The
+// original filter keyed on the Ready condition, which a learner can
+// also satisfy once its Pod is up; Status.IsVoter is the precise signal.
 //
 // Without the filter, this test sees both peers' URLs in the endpoint
 // list (and the operator wedges in production).
-func TestDiscoverMemberID_ExcludesNonReadyPeers(t *testing.T) {
+func TestDiscoverMemberID_ExcludesNonVoterPeers(t *testing.T) {
 	ctx := context.Background()
 	now := metav1.Now()
 
