@@ -389,12 +389,31 @@ func pvcOwnedBy(pvc *corev1.PersistentVolumeClaim, member *lll.EtcdMember) bool 
 	return false
 }
 
+// podOwnedBy mirrors pvcOwnedBy: true only when the Pod's owner refs
+// point at this EtcdMember by UID. Less load-bearing than the PVC
+// check (Pod corruption is recoverable; replacing one is cheap), but
+// adopting a leftover Pod from a prior cluster generation would leave
+// the operator reconciling against a Pod whose spec was written by a
+// different controller incarnation. Refuse silent adoption — wait for
+// GC and re-create the Pod ourselves.
+func podOwnedBy(pod *corev1.Pod, member *lll.EtcdMember) bool {
+	for _, o := range pod.OwnerReferences {
+		if o.Kind == "EtcdMember" && o.UID == member.UID {
+			return true
+		}
+	}
+	return false
+}
+
 // ── Pod ──────────────────────────────────────────────────────────────────
 
 func (r *EtcdMemberReconciler) ensurePod(ctx context.Context, member *lll.EtcdMember) error {
 	pod := &corev1.Pod{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: member.Namespace, Name: member.Name}, pod)
 	if err == nil {
+		if !podOwnedBy(pod, member) {
+			return fmt.Errorf("Pod %q is owned by a different EtcdMember; awaiting GC before reuse", member.Name)
+		}
 		member.Status.PodName = pod.Name
 		member.Status.PodUID = string(pod.UID)
 		if err := r.reconcileRoleLabel(ctx, pod, member); err != nil {

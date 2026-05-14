@@ -355,6 +355,124 @@ func TestEnsurePVC_AcceptsOwnPVC(t *testing.T) {
 	}
 }
 
+// TestEnsurePod_RefusesStaleOwner mirrors TestEnsurePVC_RefusesStaleOwner:
+// a same-named Pod owned by a now-deleted EtcdMember (pending GC) must
+// not be adopted by the fresh EtcdMember of the same name. Less severe
+// than the PVC case (Pod state is replaceable), but the operator-managed
+// lifecycle would otherwise reconcile a Pod whose spec was written by a
+// different controller generation.
+func TestEnsurePod_RefusesStaleOwner(t *testing.T) {
+	ctx := context.Background()
+	stalePod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-1", Namespace: "ns",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "lllamnyp.su/v1alpha2",
+				Kind:       "EtcdMember",
+				Name:       "test-1",
+				UID:        types.UID("old-uid"),
+			}},
+		},
+	}
+	freshMember := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-1", Namespace: "ns", UID: types.UID("fresh-uid"), Labels: memberLabels("test", "test-1")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"), InitialCluster: "x", ClusterToken: "test"},
+	}
+	c, _ := newTestClient(t, freshMember, stalePod)
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t)}
+
+	if err := r.ensurePod(ctx, freshMember); err == nil {
+		t.Fatalf("ensurePod should refuse to adopt a Pod owned by a stale EtcdMember UID")
+	}
+}
+
+// TestEnsurePod_RefusesPodWithNoOwnerRefs: a same-named Pod with no
+// owner refs (manually created, leaked from a previous incarnation
+// without GC catching the dependent) is refused — the operator's
+// reconcile flow assumes it created and controls the Pod, and adoption
+// would silently bind unowned state.
+func TestEnsurePod_RefusesPodWithNoOwnerRefs(t *testing.T) {
+	ctx := context.Background()
+	prePod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns"},
+	}
+	member := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", UID: types.UID("uid"), Labels: memberLabels("test", "test-0")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"), InitialCluster: "x", ClusterToken: "test"},
+	}
+	c, _ := newTestClient(t, member, prePod)
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t)}
+
+	if err := r.ensurePod(ctx, member); err == nil {
+		t.Fatalf("ensurePod should refuse to adopt a Pod with no owner references")
+	}
+}
+
+// TestEnsurePod_RefusesPodOwnedByOther: a Pod owned by some other
+// resource (different Kind, different operator's CR, a deployment-
+// style controller) must not be adopted. Symmetric with the PVC
+// other-owner refusal.
+func TestEnsurePod_RefusesPodOwnedByOther(t *testing.T) {
+	ctx := context.Background()
+	otherPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-0", Namespace: "ns",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "ReplicaSet",
+				Name:       "some-rs",
+				UID:        types.UID("other-uid"),
+			}},
+		},
+	}
+	member := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", UID: types.UID("uid"), Labels: memberLabels("test", "test-0")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"), InitialCluster: "x", ClusterToken: "test"},
+	}
+	c, _ := newTestClient(t, member, otherPod)
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t)}
+
+	if err := r.ensurePod(ctx, member); err == nil {
+		t.Fatalf("ensurePod should refuse to adopt a Pod owned by something other than this EtcdMember")
+	}
+}
+
+// TestEnsurePod_AcceptsOwnPod: when the existing Pod's owner ref UID
+// matches the current EtcdMember (the normal post-create steady-state
+// case), reuse is fine and Status.PodName / Status.PodUID get recorded.
+func TestEnsurePod_AcceptsOwnPod(t *testing.T) {
+	ctx := context.Background()
+
+	uid := types.UID("same-uid")
+	ownPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-0", Namespace: "ns", UID: types.UID("pod-uid"),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "lllamnyp.su/v1alpha2",
+				Kind:       "EtcdMember",
+				Name:       "test-0",
+				UID:        uid,
+			}},
+		},
+	}
+	member := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", UID: uid, Labels: memberLabels("test", "test-0")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"), InitialCluster: "x", ClusterToken: "test"},
+	}
+	c, _ := newTestClient(t, member, ownPod)
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t)}
+
+	if err := r.ensurePod(ctx, member); err != nil {
+		t.Fatalf("ensurePod for own Pod: %v", err)
+	}
+	if member.Status.PodName != "test-0" {
+		t.Fatalf("PodName not recorded: %q", member.Status.PodName)
+	}
+	if member.Status.PodUID != "pod-uid" {
+		t.Fatalf("PodUID not recorded: %q", member.Status.PodUID)
+	}
+}
+
 // TestUpdateStatus_NoMemberIDKeepsReadyFalse covers reviewer issue #3: a pod
 // that's PodReady but without a populated MemberID must not be reported as
 // MemberReady=True. Otherwise the cluster controller can count it toward
