@@ -24,10 +24,12 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -55,7 +57,9 @@ type EtcdClusterReconciler struct {
 //+kubebuilder:rbac:groups=lllamnyp.su,resources=etcdclusters/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=lllamnyp.su,resources=etcdclusters/finalizers,verbs=update
 //+kubebuilder:rbac:groups=lllamnyp.su,resources=etcdmembers,verbs=get;list;watch;create;delete
+//+kubebuilder:rbac:groups=lllamnyp.su,resources=etcdmembers/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch
+//+kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 
 func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
@@ -264,7 +268,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		etcdClient, err := r.EtcdClientFactory(ctx, endpoints)
 		if err == nil {
 			defer etcdClient.Close()
-			res, perr := r.promotePendingLearner(ctx, etcdClient, endpoints)
+			res, perr := r.promotePendingLearner(ctx, cluster, running, etcdClient, endpoints)
 			if perr != nil {
 				return ctrl.Result{}, perr
 			}
@@ -342,6 +346,16 @@ func (r *EtcdClusterReconciler) bootstrap(
 			return ctrl.Result{}, err
 		}
 		if err := r.Create(ctx, seed); err != nil {
+			return ctrl.Result{}, err
+		}
+		// Pre-stamp IsVoter=true. The seed is never a learner — it forms
+		// the cluster on its own with --initial-cluster-state=new. Setting
+		// this here means the member controller applies the role=voter
+		// Pod label on the first reconcile of the seed Pod, so the PDB
+		// selects it from creation rather than only after MemberList runs
+		// a few reconciles later.
+		seed.Status.IsVoter = true
+		if err := r.Status().Update(ctx, seed); err != nil {
 			return ctrl.Result{}, err
 		}
 	} else if !metav1.IsControlledBy(seed, cluster) {
@@ -766,12 +780,15 @@ func hasPendingMember(members []lll.EtcdMember) bool {
 }
 
 // promotePendingLearner is the steady-state wrapper around tryPromoteLearner:
-// fetches etcd's MemberList and delegates the promotion decision. Only
+// fetches etcd's MemberList, syncs IsVoter status onto each EtcdMember
+// CR from that snapshot, and delegates the promotion decision. Only
 // the Reconcile loop's current==desired branch uses this — scaleUp shares
 // its MemberList snapshot with completePendingMember and calls
 // tryPromoteLearner directly.
 func (r *EtcdClusterReconciler) promotePendingLearner(
 	ctx context.Context,
+	cluster *lll.EtcdCluster,
+	members []lll.EtcdMember,
 	etcdClient EtcdClusterClient,
 	endpoints []string,
 ) (*ctrl.Result, error) {
@@ -783,7 +800,73 @@ func (r *EtcdClusterReconciler) promotePendingLearner(
 		log.Error(err, "MemberList failed", "endpoints", endpoints)
 		return &ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
+	if err := r.syncIsVoter(ctx, cluster, members, listResp); err != nil {
+		// Non-fatal: continue toward promotion. Next reconcile retries
+		// the sync. The IsVoter writes drive PDB selector membership;
+		// stale-by-one-reconcile is bounded and safe.
+		log.Error(err, "failed to sync IsVoter status; will retry")
+	}
 	return tryPromoteLearner(ctx, etcdClient, listResp)
+}
+
+// syncIsVoter patches each EtcdMember's Status.IsVoter to match etcd's
+// MemberList view (IsLearner=false → IsVoter=true). Idempotent — only
+// writes when the value differs. Members not yet visible in etcd's
+// snapshot (e.g. a brand-new CR awaiting MemberAddAsLearner) are left
+// unchanged. Members in the etcd-side list but with a deletion
+// timestamp on the CR side are also skipped — their IsVoter no longer
+// matters once the finalizer runs.
+//
+// Matching is by peer URL rather than etcd Member.Name, because Name is
+// only populated by the etcd process after its Pod starts; during the
+// post-MemberAdd-pre-Pod-running window, Name is empty but PeerURLs is
+// not.
+func (r *EtcdClusterReconciler) syncIsVoter(
+	ctx context.Context,
+	cluster *lll.EtcdCluster,
+	members []lll.EtcdMember,
+	listResp *clientv3.MemberListResponse,
+) error {
+	if listResp == nil {
+		return nil
+	}
+	voterByURL := map[string]bool{}
+	learnerByURL := map[string]bool{}
+	for _, em := range listResp.Members {
+		for _, u := range em.PeerURLs {
+			if em.IsLearner {
+				learnerByURL[u] = true
+			} else {
+				voterByURL[u] = true
+			}
+		}
+	}
+
+	for i := range members {
+		m := &members[i]
+		if !m.DeletionTimestamp.IsZero() {
+			continue
+		}
+		url := peerURL(m.Name, cluster.Name, cluster.Namespace)
+		var wantVoter bool
+		switch {
+		case voterByURL[url]:
+			wantVoter = true
+		case learnerByURL[url]:
+			wantVoter = false
+		default:
+			continue
+		}
+		if m.Status.IsVoter == wantVoter {
+			continue
+		}
+		orig := m.DeepCopy()
+		m.Status.IsVoter = wantVoter
+		if err := r.Status().Patch(ctx, m, client.MergeFrom(orig)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func resultOrZero(r *ctrl.Result) ctrl.Result {
@@ -1010,6 +1093,22 @@ func (r *EtcdClusterReconciler) updateStatus(
 		changed = true
 	}
 
+	// Reconcile PDB. Voter count comes from members' Status.IsVoter
+	// (written by this controller from etcd's MemberList in
+	// promotePendingLearner). On a brand-new cluster pre-bootstrap, no
+	// member has IsVoter=true yet — voterCount=0 and no PDB is emitted
+	// until the seed reaches its Status.IsVoter=true pre-stamp.
+	voterCount := int32(0)
+	for _, m := range running {
+		if m.Status.IsVoter {
+			voterCount++
+		}
+	}
+	if err := r.reconcilePDB(ctx, cluster, voterCount); err != nil {
+		log.FromContext(ctx).Error(err, "failed to reconcile PodDisruptionBudget")
+		// Non-fatal: status update still runs; next reconcile retries.
+	}
+
 	if changed {
 		if err := r.Status().Update(ctx, cluster); err != nil {
 			return ctrl.Result{}, err
@@ -1017,6 +1116,91 @@ func (r *EtcdClusterReconciler) updateStatus(
 	}
 
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+}
+
+// pdbMaxUnavailable returns the disruption budget for a cluster with
+// the given voting-member count. The formula is (voters-1)/2, Go
+// integer-divided so the result auto-floors. Equivalently: at most
+// fewer-than-quorum voters may be unavailable. For 1 voter the budget
+// is 0 (any disruption is quorum loss); for 3 → 1, 4 → 1, 5 → 2.
+func pdbMaxUnavailable(voterCount int32) int32 {
+	if voterCount < 1 {
+		return 0
+	}
+	return (voterCount - 1) / 2
+}
+
+// reconcilePDB ensures a per-cluster PodDisruptionBudget exists that
+// protects voting members. Selector keys on LabelCluster + LabelRole=
+// RoleVoter; the member controller stamps that role label onto Pods
+// whose owning EtcdMember has Status.IsVoter=true.
+//
+// When voterCount is 0 (pre-bootstrap, paused, or wedged), the PDB is
+// deleted: there are no Pods to protect and a stale PDB selector
+// against missing labels is at best confusing, at worst (with a
+// non-zero MaxUnavailable from a prior state) misleading.
+func (r *EtcdClusterReconciler) reconcilePDB(
+	ctx context.Context,
+	cluster *lll.EtcdCluster,
+	voterCount int32,
+) error {
+	nsName := types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name}
+	pdb := &policyv1.PodDisruptionBudget{}
+	getErr := r.Get(ctx, nsName, pdb)
+
+	if voterCount == 0 {
+		if errors.IsNotFound(getErr) {
+			return nil
+		}
+		if getErr != nil {
+			return getErr
+		}
+		return r.Delete(ctx, pdb)
+	}
+
+	max := intstr.FromInt32(pdbMaxUnavailable(voterCount))
+	wantSelector := &metav1.LabelSelector{
+		MatchLabels: map[string]string{
+			LabelCluster: cluster.Name,
+			LabelRole:    RoleVoter,
+		},
+	}
+
+	if errors.IsNotFound(getErr) {
+		fresh := &policyv1.PodDisruptionBudget{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      cluster.Name,
+				Namespace: cluster.Namespace,
+				Labels:    clusterLabels(cluster.Name),
+			},
+			Spec: policyv1.PodDisruptionBudgetSpec{
+				MaxUnavailable: &max,
+				Selector:       wantSelector,
+			},
+		}
+		if err := controllerutil.SetControllerReference(cluster, fresh, r.Scheme); err != nil {
+			return err
+		}
+		return r.Create(ctx, fresh)
+	}
+	if getErr != nil {
+		return getErr
+	}
+
+	// Patch only if maxUnavailable diverged. Selector is invariant by
+	// construction; if a future change wanted a different selector,
+	// PDB Selector is immutable on the apiserver side anyway, so the
+	// correct path would be Delete+Create rather than Patch.
+	currentMax := int32(-1)
+	if pdb.Spec.MaxUnavailable != nil {
+		currentMax = int32(pdb.Spec.MaxUnavailable.IntValue())
+	}
+	if currentMax == pdbMaxUnavailable(voterCount) {
+		return nil
+	}
+	orig := pdb.DeepCopy()
+	pdb.Spec.MaxUnavailable = &max
+	return r.Patch(ctx, pdb, client.MergeFrom(orig))
 }
 
 // ── Services ─────────────────────────────────────────────────────────────
@@ -1140,6 +1324,7 @@ func (r *EtcdClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&lll.EtcdCluster{}).
 		Owns(&lll.EtcdMember{}).
 		Owns(&corev1.Service{}).
+		Owns(&policyv1.PodDisruptionBudget{}).
 		Complete(r)
 }
 

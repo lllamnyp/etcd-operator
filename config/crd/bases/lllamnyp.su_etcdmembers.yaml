@@ -90,6 +90,18 @@ spec:
                   InitialCluster is the value passed to etcd's --initial-cluster flag.
                   Set by the cluster controller at creation time.
                 type: string
+              replicas:
+                default: 1
+                description: |-
+                  Replicas exists only because the PodDisruptionBudget controller
+                  traverses Pods' controllerRef looking for /scale on the parent and
+                  fails closed ("does not implement the scale subresource") if it
+                  isn't there. Each EtcdMember represents exactly one Pod; this field
+                  is locked to 1 by validation and cannot be tuned.
+                format: int32
+                maximum: 1
+                minimum: 1
+                type: integer
               storage:
                 anyOf:
                 - type: integer
@@ -182,6 +194,17 @@ spec:
                   - type
                   type: object
                 type: array
+              isVoter:
+                description: |-
+                  IsVoter is true when etcd's MemberList reports this member with
+                  IsLearner=false — i.e. it counts toward quorum. Written by the
+                  cluster controller during its MemberList processing and pre-stamped
+                  true at seed creation (the seed is never a learner). Read by the
+                  member controller to apply the role=voter Pod label that the
+                  per-cluster PodDisruptionBudget selects on. Default value false is
+                  the safe-but-temporary state for a freshly-added learner before
+                  MemberPromote runs.
+                type: boolean
               memberID:
                 description: |-
                   MemberID is the etcd-assigned member ID in hex (e.g. "ae36f238164a08ad"),
@@ -204,9 +227,26 @@ spec:
                 description: PVCName is the name of the PersistentVolumeClaim for
                   this member's data.
                 type: string
+              replicas:
+                description: |-
+                  Replicas exposes via /scale "this EtcdMember owns 1 Pod if it has
+                  a PodName, 0 otherwise". Required by the PodDisruptionBudget
+                  controller to derive expectedPods for the cluster's PDB — without
+                  /scale on the Pod controller-ref it sets the PDB to SyncFailed.
+                format: int32
+                type: integer
+              selector:
+                description: |-
+                  Selector exposes the label-selector that matches this member's Pod
+                  via /scale (consumed by the PDB controller; not user-facing).
+                type: string
             type: object
         type: object
     served: true
     storage: true
     subresources:
+      scale:
+        labelSelectorPath: .status.selector
+        specReplicasPath: .spec.replicas
+        statusReplicasPath: .status.replicas
       status: {}

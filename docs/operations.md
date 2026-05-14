@@ -324,24 +324,9 @@ kubectl get pvc -l etcd.lllamnyp.su/cluster=my-mem-etcd -n default
 
 ### What you should configure before going to production
 
-The operator does not emit these today (tracked in [#16](https://github.com/lllamnyp/etcd-operator/issues/16)). All three matter for a memory cluster you'd actually rely on:
+The `PodDisruptionBudget` is auto-emitted now (see [Draining nodes](#draining-nodes-poddisruptionbudget) for the day-to-day picture). The remaining production gaps are tracked in [#16](https://github.com/lllamnyp/etcd-operator/issues/16):
 
-1. **`PodDisruptionBudget`** — without it, a `kubectl drain` of two nodes carrying voters will lose quorum before the operator can react. Manual:
-
-   ```yaml
-   apiVersion: policy/v1
-   kind: PodDisruptionBudget
-   metadata:
-     name: my-mem-etcd
-     namespace: default
-   spec:
-     maxUnavailable: 1     # for a 3-member cluster; floor((N-1)/2)
-     selector:
-       matchLabels:
-         etcd.lllamnyp.su/cluster: my-mem-etcd
-   ```
-
-2. **Pod anti-affinity** — pre-deploy a mutating webhook (e.g. `pod-topology-spread` admission controller, or your own) that adds:
+1. **Pod anti-affinity** — pre-deploy a mutating webhook (e.g. `pod-topology-spread` admission controller, or your own) that adds:
 
    ```yaml
    spec:
@@ -354,7 +339,7 @@ The operator does not emit these today (tracked in [#16](https://github.com/llla
              topologyKey: kubernetes.io/hostname
    ```
 
-3. **Container memory limit** — a `LimitRange` in the namespace covers it pending a `spec.resources` field on the CR:
+2. **Container memory limit** — a `LimitRange` in the namespace covers it pending a `spec.resources` field on the CR:
 
    ```yaml
    apiVersion: v1
@@ -402,6 +387,41 @@ kubectl patch etcdcluster.lllamnyp.su my-mem-etcd -n default --type=merge \
 ```
 
 Pausing a memory cluster would wedge it on resume (Pod deleted → tmpfs gone → wake path treats the empty data dir as preserved → etcd refuses to start). To tear a memory cluster down, delete the `EtcdCluster` and recreate it.
+
+## Draining nodes (PodDisruptionBudget)
+
+Every `EtcdCluster` carries a per-cluster `PodDisruptionBudget` named after the cluster. The full design is in [concepts](concepts.md#poddisruptionbudget); the day-to-day picture:
+
+```sh
+kubectl get pdb -n <ns> <cluster>
+# NAME       MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   AGE
+# my-etcd    N/A             1                 1                     12m
+```
+
+`MAX UNAVAILABLE` is the budget. `ALLOWED DISRUPTIONS` is how many voter evictions are still in budget right now (= max unavailable − currently unavailable). When it reaches 0, `kubectl drain` of any node hosting a voter Pod blocks:
+
+```
+error when evicting pods/"my-etcd-7xq2k" -n my-ns:
+  Cannot evict pod as it would violate the pod's disruption budget.
+```
+
+That's the intended behaviour — your drain just refused to break quorum. Resolve by waiting for the unavailable voter to come back, or by understanding that more nodes need to be ready before this drain can proceed.
+
+### Which Pods are voters
+
+Voter Pods carry the label `etcd.lllamnyp.su/role=voter`. Learners do not. To find them:
+
+```sh
+kubectl get pod -l etcd.lllamnyp.su/cluster=<cluster>,etcd.lllamnyp.su/role=voter -n <ns>
+```
+
+Cross-reference against `kubectl get etcdmember.lllamnyp.su -n <ns>` — voters there have `Status.IsVoter: true` (written by the cluster controller from etcd's `MemberList`).
+
+### Why drains might block during scale events
+
+The PDB updates **one reconcile after** etcd's view changes (cluster controller's next pass picks up the new voter count from `MemberList`). This is intentional — see [concepts](concepts.md#transient-races) for the safety analysis. The race window is one reconcile cycle wide (steady-state `RequeueAfter` is 30 s, so up to ~30 s in the worst case); a drain attempted in that window fails closed (refuses the eviction) rather than open, which is the correct direction.
+
+If you're doing a planned rolling node maintenance, scale down to the resilient quorum size first, drain, scale back up.
 
 ## Recipes
 

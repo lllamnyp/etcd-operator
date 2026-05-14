@@ -13,6 +13,13 @@ const (
 	// LabelCluster is the label key used to associate resources with an EtcdCluster.
 	LabelCluster = "etcd.lllamnyp.su/cluster"
 
+	// LabelRole identifies the etcd-side raft role of a member's Pod. The
+	// only value the operator emits today is RoleVoter; learners carry no
+	// LabelRole at all so the per-cluster PodDisruptionBudget can select
+	// voters exclusively (its selector requires LabelRole=RoleVoter).
+	LabelRole = "etcd.lllamnyp.su/role"
+	RoleVoter = "voter"
+
 	// EtcdImage is the container image repository for etcd.
 	EtcdImage = "quay.io/coreos/etcd"
 
@@ -70,7 +77,7 @@ func buildInitialCluster(names []string, cluster, namespace string) string {
 func memberEndpoints(members []lll.EtcdMember, cluster, namespace string) []string {
 	voters := make([]string, 0, len(members))
 	for _, m := range members {
-		if isMemberReady(m) {
+		if m.Status.IsVoter {
 			voters = append(voters, clientURL(m.Name, cluster, namespace))
 		}
 	}
@@ -82,17 +89,6 @@ func memberEndpoints(members []lll.EtcdMember, cluster, namespace string) []stri
 		eps[i] = clientURL(m.Name, cluster, namespace)
 	}
 	return eps
-}
-
-// isMemberReady reports whether the EtcdMember's Ready condition is True.
-// Used as a proxy for "etcd-side voter" — see memberEndpoints.
-func isMemberReady(m lll.EtcdMember) bool {
-	for _, c := range m.Status.Conditions {
-		if c.Type == lll.MemberReady && c.Status == metav1.ConditionTrue {
-			return true
-		}
-	}
-	return false
 }
 
 // clusterLabels returns the standard labels for cluster-level resources.

@@ -66,6 +66,17 @@ type EtcdMemberSpec struct {
 	// affect already-running members.
 	ClusterToken string `json:"clusterToken"`
 
+	// Replicas exists only because the PodDisruptionBudget controller
+	// traverses Pods' controllerRef looking for /scale on the parent and
+	// fails closed ("does not implement the scale subresource") if it
+	// isn't there. Each EtcdMember represents exactly one Pod; this field
+	// is locked to 1 by validation and cannot be tuned.
+	// +kubebuilder:default=1
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=1
+	// +optional
+	Replicas int32 `json:"replicas,omitempty"`
+
 	// Dormant marks the member as paused. While dormant, the member
 	// controller deletes the member's Pod but leaves the PVC in place
 	// (the PVC stays owned by this EtcdMember). The cluster controller
@@ -100,6 +111,29 @@ type EtcdMemberStatus struct {
 	// +optional
 	PodUID string `json:"podUID,omitempty"`
 
+	// IsVoter is true when etcd's MemberList reports this member with
+	// IsLearner=false — i.e. it counts toward quorum. Written by the
+	// cluster controller during its MemberList processing and pre-stamped
+	// true at seed creation (the seed is never a learner). Read by the
+	// member controller to apply the role=voter Pod label that the
+	// per-cluster PodDisruptionBudget selects on. Default value false is
+	// the safe-but-temporary state for a freshly-added learner before
+	// MemberPromote runs.
+	// +optional
+	IsVoter bool `json:"isVoter,omitempty"`
+
+	// Replicas exposes via /scale "this EtcdMember owns 1 Pod if it has
+	// a PodName, 0 otherwise". Required by the PodDisruptionBudget
+	// controller to derive expectedPods for the cluster's PDB — without
+	// /scale on the Pod controller-ref it sets the PDB to SyncFailed.
+	// +optional
+	Replicas int32 `json:"replicas,omitempty"`
+
+	// Selector exposes the label-selector that matches this member's Pod
+	// via /scale (consumed by the PDB controller; not user-facing).
+	// +optional
+	Selector string `json:"selector,omitempty"`
+
 	// PVCName is the name of the PersistentVolumeClaim for this member's data.
 	// +optional
 	PVCName string `json:"pvcName,omitempty"`
@@ -111,6 +145,7 @@ type EtcdMemberStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.replicas,selectorpath=.status.selector
 // +kubebuilder:printcolumn:name="Cluster",type=string,JSONPath=`.spec.clusterName`
 // +kubebuilder:printcolumn:name="Version",type=string,JSONPath=`.spec.version`
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
