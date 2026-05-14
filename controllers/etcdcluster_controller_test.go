@@ -1065,10 +1065,12 @@ func TestUpdateStatus_PausedFreshZeroMessageDifferentiates(t *testing.T) {
 // TestUpdateStatus_PausedMessageHonestForMemoryMember verifies the
 // Paused condition does not claim "data is preserved on PVC data-X"
 // when the dormant member is memory-backed (no PVC ever existed; the
-// tmpfs evaporated with the Pod). Until admission gates the
-// replicas=0+memory combination (issue #15), the operator allows this
-// wedge to be entered — but the condition message must not mislead
-// runbooks or dashboards about durability.
+// tmpfs evaporated with the Pod). The CRD's CEL admission rule now
+// rejects replicas=0+memory at Create/Update, but an operator upgrade
+// landing on a pre-existing dormant memory cluster (which slipped in
+// before the rule was installed) still reaches this branch — defence
+// in depth. The condition message must not mislead runbooks or
+// dashboards about durability in that case.
 func TestUpdateStatus_PausedMessageHonestForMemoryMember(t *testing.T) {
 	ctx := context.Background()
 	cluster := &lll.EtcdCluster{

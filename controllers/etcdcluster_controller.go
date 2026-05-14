@@ -923,12 +923,14 @@ func (r *EtcdClusterReconciler) updateStatus(
 		// Three flavours of paused:
 		//   - dormant + PVC-backed: a member existed, was paused, its PVC
 		//     is preserved; scale-up resumes the same etcd cluster.
-		//   - dormant + memory-backed: the user paused a memory cluster
-		//     despite docs saying not to (admission webhook in #15 will
-		//     reject this combination). The tmpfs went with the Pod and
-		//     there is no PVC; the cluster cannot be resumed. The condition
-		//     is still Paused (the cluster is paused) but the message
-		//     must not claim durability the cluster doesn't have.
+		//   - dormant + memory-backed: the CRD's CEL admission rule now
+		//     rejects replicas=0 + storageMedium=Memory on Create/Update,
+		//     but a cluster paused before the rule was installed (operator
+		//     upgrade on a pre-existing dormant memory cluster) still
+		//     reaches this branch. The tmpfs went with the Pod and there
+		//     is no PVC; the cluster cannot be resumed. The condition is
+		//     still Paused (the cluster is paused) but the message must
+		//     not claim durability the cluster doesn't have.
 		//   - fresh-zero: the user created the cluster with replicas=0
 		//     from the start; no member was ever created and there is no
 		//     PVC. Don't claim "data is preserved" — there is no data to

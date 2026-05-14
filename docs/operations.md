@@ -392,7 +392,16 @@ kubectl get etcdmember.lllamnyp.su -n default -w
 
 ### Pause is not supported
 
-Do **not** set `spec.replicas: 0` on a memory cluster. The pause path flips `spec.dormant=true` and deletes the Pod; the tmpfs goes with it. On resume the controller wakes the same member as if its data were preserved, etcd refuses to start, and the cluster wedges. The combination should eventually be blocked by an admission webhook ([#15](https://github.com/lllamnyp/etcd-operator/issues/15)); until then, delete and recreate the cluster instead.
+Setting `spec.replicas: 0` on a memory cluster is **rejected by the apiserver** (CEL validation rule on `EtcdClusterSpec`):
+
+```
+kubectl patch etcdcluster.lllamnyp.su my-mem-etcd -n default --type=merge \
+  -p '{"spec":{"replicas":0}}'
+# The EtcdCluster "my-mem-etcd" is invalid: spec: Invalid value: ...:
+#   spec.replicas=0 with spec.storageMedium=Memory is unsupported: ...
+```
+
+Pausing a memory cluster would wedge it on resume (Pod deleted → tmpfs gone → wake path treats the empty data dir as preserved → etcd refuses to start). To tear a memory cluster down, delete the `EtcdCluster` and recreate it.
 
 ## Recipes
 
