@@ -705,7 +705,10 @@ func (r *EtcdMemberReconciler) discoverMemberID(ctx context.Context, member *lll
 		if m.Status.PodName == "" {
 			continue
 		}
-		if !isMemberReady(m) {
+		if !m.Status.IsVoter {
+			// Learners reject MemberList with "rpc not supported for
+			// learner"; routing through them would just consume our
+			// context budget.
 			continue
 		}
 		endpoints = append(endpoints, clientURL(m.Name, member.Spec.ClusterName, member.Namespace))

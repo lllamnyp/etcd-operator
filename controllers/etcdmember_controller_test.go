@@ -656,6 +656,7 @@ func TestDiscoverMemberID_FallsBackToPeers(t *testing.T) {
 		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
 		Status: lll.EtcdMemberStatus{
 			PodName: "test-0", MemberID: "0000000000000001",
+			IsVoter:    true,
 			Conditions: []metav1.Condition{{Type: lll.MemberReady, Status: metav1.ConditionTrue, Reason: "PodReady", LastTransitionTime: now}},
 		},
 	}
@@ -720,6 +721,7 @@ func TestDiscoverMemberID_ExcludesNonReadyPeers(t *testing.T) {
 		Spec:       lll.EtcdMemberSpec{ClusterName: "test"},
 		Status: lll.EtcdMemberStatus{
 			PodName: "test-voter", MemberID: "0000000000000001",
+			IsVoter:    true,
 			Conditions: []metav1.Condition{{Type: lll.MemberReady, Status: metav1.ConditionTrue, Reason: "PodReady", LastTransitionTime: now}},
 		},
 	}

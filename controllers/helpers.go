@@ -77,7 +77,7 @@ func buildInitialCluster(names []string, cluster, namespace string) string {
 func memberEndpoints(members []lll.EtcdMember, cluster, namespace string) []string {
 	voters := make([]string, 0, len(members))
 	for _, m := range members {
-		if isMemberReady(m) {
+		if m.Status.IsVoter {
 			voters = append(voters, clientURL(m.Name, cluster, namespace))
 		}
 	}
@@ -89,17 +89,6 @@ func memberEndpoints(members []lll.EtcdMember, cluster, namespace string) []stri
 		eps[i] = clientURL(m.Name, cluster, namespace)
 	}
 	return eps
-}
-
-// isMemberReady reports whether the EtcdMember's Ready condition is True.
-// Used as a proxy for "etcd-side voter" — see memberEndpoints.
-func isMemberReady(m lll.EtcdMember) bool {
-	for _, c := range m.Status.Conditions {
-		if c.Type == lll.MemberReady && c.Status == metav1.ConditionTrue {
-			return true
-		}
-	}
-	return false
 }
 
 // clusterLabels returns the standard labels for cluster-level resources.
