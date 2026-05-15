@@ -12,6 +12,7 @@ package controllers
 
 import (
 	"context"
+	"crypto/tls"
 	"testing"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
@@ -130,13 +131,13 @@ func (f *fakeEtcd) MemberRemove(_ context.Context, id uint64) (*clientv3.MemberR
 func (f *fakeEtcd) Close() error { f.closed = true; return nil }
 
 func factoryReturning(c EtcdClusterClient) EtcdClientFactory {
-	return func(_ context.Context, _ []string) (EtcdClusterClient, error) { return c, nil }
+	return func(_ context.Context, _ []string, _ *tls.Config) (EtcdClusterClient, error) { return c, nil }
 }
 
 // failingFactory returns an error from every Build call, simulating an
 // unreachable etcd cluster.
 func failingFactory(err error) EtcdClientFactory {
-	return func(_ context.Context, _ []string) (EtcdClusterClient, error) { return nil, err }
+	return func(_ context.Context, _ []string, _ *tls.Config) (EtcdClusterClient, error) { return nil, err }
 }
 
 // testScheme returns a runtime scheme registered with corev1 and v1alpha2.

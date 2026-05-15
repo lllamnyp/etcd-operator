@@ -137,6 +137,92 @@ spec:
                 - message: spec.storageMedium is immutable; delete and recreate the
                     cluster to change the storage backend
                   rule: self == oldSelf
+              tls:
+                description: |-
+                  TLS configures transport-layer security for the etcd client and
+                  peer APIs. Absent means plaintext on both surfaces. The whole
+                  subtree is immutable post-create — the immutability rules live at
+                  the EtcdClusterSpec level (above) because pointer-field transition
+                  rules don't fire when the field is being added (nil → set) and we
+                  want to reject that direction too.
+                properties:
+                  client:
+                    description: |-
+                      Client configures TLS for the etcd client API (port 2379). Absent
+                      means plaintext. See ClientTLS for the mTLS-toggle semantics.
+                    properties:
+                      operatorClientSecretRef:
+                        description: |-
+                          OperatorClientSecretRef points at a Secret in the cluster's
+                          namespace holding the operator's etcd-client identity (tls.crt,
+                          tls.key). Setting this enables mTLS — etcd is started with
+                          --client-cert-auth=true and the operator presents this cert when
+                          dialing. Leaving it unset selects server-TLS-only mode.
+                        properties:
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                        type: object
+                        x-kubernetes-map-type: atomic
+                      serverSecretRef:
+                        description: |-
+                          ServerSecretRef points at a Secret in the cluster's namespace
+                          holding the etcd server cert in the standard kubernetes.io/tls
+                          shape: tls.crt, tls.key, and ca.crt. ca.crt is always required
+                          (the operator's own etcd client needs it to verify the server,
+                          and when mTLS is on it doubles as --trusted-ca-file).
+                        properties:
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                        type: object
+                        x-kubernetes-map-type: atomic
+                    required:
+                    - serverSecretRef
+                    type: object
+                  peer:
+                    description: |-
+                      Peer configures TLS for the etcd peer API (port 2380). Absent
+                      means plaintext. When set, peer is always mTLS — etcd's peer mesh
+                      is symmetric and there is no useful encrypt-only-no-identity mode
+                      for it.
+                    properties:
+                      secretRef:
+                        description: |-
+                          SecretRef points at a Secret in the cluster's namespace holding
+                          the peer cert+key in the standard kubernetes.io/tls shape:
+                          tls.crt, tls.key, ca.crt. ca.crt is required (peer is symmetric
+                          — same cert is used to serve inbound and dial outbound peer
+                          connections — and --peer-trusted-ca-file is always populated).
+                          The peer cert MUST carry both serverAuth and clientAuth in EKU.
+                        properties:
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                        type: object
+                        x-kubernetes-map-type: atomic
+                    required:
+                    - secretRef
+                    type: object
+                type: object
               version:
                 description: Version is the desired etcd version (e.g. "3.5.17").
                 pattern: ^\d+\.\d+\.\d+$
@@ -154,6 +240,12 @@ spec:
                 tmpfs sizeLimit cannot be zero).
               rule: '!(has(self.storageMedium) && self.storageMedium == ''Memory'')
                 || quantity(string(self.storage)).isGreaterThan(quantity(''0''))'
+            - message: spec.tls cannot be added to or removed from an existing cluster;
+                delete and recreate
+              rule: has(self.tls) == has(oldSelf.tls)
+            - message: spec.tls is immutable post-create; delete and recreate the
+                cluster to change TLS configuration
+              rule: '!has(self.tls) || !has(oldSelf.tls) || self.tls == oldSelf.tls'
           status:
             description: EtcdClusterStatus defines the observed state of an etcd cluster.
             properties:

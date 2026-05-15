@@ -458,3 +458,122 @@ kubectl logs -n <ns> "$LEADER" --tail=200
 Just `kubectl cordon` + `kubectl drain` works. The Pod gets evicted, reschedules onto another node, the PVC reattaches (if storage class supports relocation) or stays put (if not — then the Pod stays Pending until the node is back). Etcd is fine with this — `MemberAddAsLearner` isn't involved because the member ID and data dir are preserved in the PVC.
 
 PodAntiAffinity is not configured by default (see [What's not supported](../README.md#whats-not-supported-yet)). Two etcd pods can land on the same node, which means a single node drain can take out two voters simultaneously and lose quorum on a 3-member cluster. Recommended workaround: add a PodAntiAffinity rule via a `PodTopologySpread` mutating webhook or pre-deploy a `Deployment`-level affinity wrapper. (A native operator option is a future feature.)
+
+## TLS-enabled clusters
+
+The operator does **not** generate certs in Phase 1 — you provide them as Secrets and reference them from `spec.tls`. See [concepts: TLS](concepts.md#tls) for what each Secret needs to contain and the EKU / CA-bundle constraints.
+
+### Creating the Secrets
+
+A typical full-mTLS cluster needs three Secrets in the cluster's namespace:
+
+```sh
+# Server cert+key, plus the CA bundle that doubles as the client trust
+# bundle. Server cert SANs MUST cover:
+#   *.<cluster>.<ns>.svc,
+#   *.<cluster>.<ns>.svc.<cluster-domain>,
+#   <cluster>.<ns>.svc, <cluster>-client.<ns>.svc,
+#   localhost (DNS SAN), 127.0.0.1 (IP SAN).
+# The doubled-up wildcards aren't redundant: the second covers the
+# fully-qualified PTR record kube-dns returns for pod IPs, which
+# etcd's peer-mTLS validator looks up. <cluster-domain> defaults to
+# cluster.local; Cozystack and a few others use cozy.local. See
+# installation.md for how to identify it.
+# Server cert EKU MUST include both serverAuth and clientAuth.
+kubectl create secret generic my-cluster-server-tls -n <ns> \
+  --from-file=tls.crt=server.crt \
+  --from-file=tls.key=server.key \
+  --from-file=ca.crt=ca.crt
+
+# Operator's etcd-client identity. EKU MUST include clientAuth. Signed by
+# a CA whose public cert is in the trust bundle above (typically the same
+# CA, in which case the bundle is just that one cert).
+kubectl create secret generic my-cluster-operator-client-tls -n <ns> \
+  --from-file=tls.crt=op-client.crt \
+  --from-file=tls.key=op-client.key
+
+# Peer cert+key+CA. SANs MUST cover *.<cluster>.<ns>.svc AND
+# *.<cluster>.<ns>.svc.<cluster-domain> — the second covers the
+# fully-qualified PTR record etcd's peer-mTLS verifier compares against
+# the connecting peer's reverse-DNS. Peer cert EKU MUST include both
+# serverAuth and clientAuth (peer is symmetric).
+kubectl create secret generic my-cluster-peer-tls -n <ns> \
+  --from-file=tls.crt=peer.crt \
+  --from-file=tls.key=peer.key \
+  --from-file=ca.crt=peer-ca.crt
+```
+
+Then reference them in the cluster spec:
+
+```yaml
+apiVersion: lllamnyp.su/v1alpha2
+kind: EtcdCluster
+metadata:
+  name: my-cluster
+spec:
+  replicas: 3
+  version: 3.5.17
+  storage: 1Gi
+  tls:
+    client:
+      serverSecretRef:
+        name: my-cluster-server-tls
+      operatorClientSecretRef:
+        name: my-cluster-operator-client-tls
+    peer:
+      secretRef:
+        name: my-cluster-peer-tls
+```
+
+Server-TLS-only (encryption without client identity) drops the `operatorClientSecretRef` line. Peer-plaintext drops the whole `peer:` block. The two surfaces are independently optional.
+
+### Talking to a TLS cluster from `etcdctl`
+
+The hardcoded `--endpoints=http://localhost:2379` examples elsewhere in this doc become:
+
+```sh
+POD=$(kubectl get pod -l etcd.lllamnyp.su/cluster=<cluster> -n <ns> \
+  -o jsonpath='{.items[0].metadata.name}')
+
+# Stage a client cert+key inside the Pod for an exec-side etcdctl. Any
+# client cert signed by a CA in /etc/etcd/tls/client/ca.crt works; the
+# operator-client cert is a convenient one because it's already issued.
+# `kubectl cp` takes a local source path (the directory holding tls.crt
+# and tls.key) and writes into the Pod at the destination path.
+kubectl cp ./client-cert-dir "<ns>/$POD:/tmp/cli"
+
+kubectl exec -n <ns> "$POD" -- etcdctl \
+  --endpoints=https://localhost:2379 \
+  --cacert=/etc/etcd/tls/client/ca.crt \
+  --cert=/tmp/cli/tls.crt \
+  --key=/tmp/cli/tls.key \
+  member list -w table
+```
+
+For server-TLS-only clusters, drop `--cert` and `--key`.
+
+### Cert rotation (Phase 1)
+
+The operator does NOT watch the referenced Secrets. What rotation needs depends on which material changed, because Go's `crypto/tls` re-reads some files per handshake and bakes others into an `*x509.CertPool` at config time:
+
+| Material | Re-read live? | Rotation procedure |
+|---|---|---|
+| `tls.crt` / `tls.key` in `serverSecretRef` (etcd's `--cert-file` / `--key-file`) | **Yes.** Wired through `tls.Config.GetCertificate`; etcd re-loads the files on every new TLS handshake. | Update the Secret. New connections pick up the new cert within a kubelet refresh cycle (~60s for the mounted volume to project). Existing keepalive connections continue with the old cert until they cycle naturally. No restart needed. |
+| `tls.crt` / `tls.key` in peer `secretRef` (etcd's `--peer-cert-file` / `--peer-key-file`) | **Yes**, same mechanism. | Same as above. |
+| `ca.crt` in `serverSecretRef` (etcd's `--trusted-ca-file`) | **No.** Loaded into an `x509.CertPool` at etcd startup and held in memory. | Update the Secret, then bounce each Pod one at a time (`kubectl delete pod <member-pod-name>`; wait for `Ready` and `member list` to confirm the rejoin before continuing). |
+| `ca.crt` in peer `secretRef` (etcd's `--peer-trusted-ca-file`) | **No**, same reason. | Same as above. |
+| `tls.crt` / `tls.key` / `ca.crt` in `operatorClientSecretRef` (operator-side, not mounted into etcd Pods) | **Yes** — the operator rebuilds its `*tls.Config` from the Secret on every reconcile, so all three rotate without an operator restart. | Update the Secret. The change takes effect on the next reconcile (~30s on idle, immediately on event-driven triggers). |
+
+When in doubt: certs + keys are hot-swappable; trust bundles (the `ca.crt` consumed *as a trust anchor*) need a Pod restart. A future operator version will watch the Secrets and roll Pods on RV change so the trust-bundle case is automated too.
+
+### Toggling TLS on or off after create
+
+Not supported (see the `spec.tls` immutability rules in [concepts](concepts.md#apiserver-enforced-validation)). The apiserver rejects the change directly:
+
+```sh
+$ kubectl patch etcdcluster my-cluster --type=merge -p '{"spec":{"tls":null}}'
+Error from server (Invalid): ... spec.tls cannot be added to or removed from
+  an existing cluster; delete and recreate
+```
+
+The same applies to mTLS-toggle (adding/removing `operatorClientSecretRef`) and to swapping in a different secret. The path is delete and recreate.

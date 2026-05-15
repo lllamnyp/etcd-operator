@@ -121,6 +121,54 @@ spec:
                 - ""
                 - Memory
                 type: string
+              tls:
+                description: |-
+                  TLS mirrors the parent cluster's TLS configuration at the time
+                  this member was created. Carries only what the etcd Pod needs to
+                  see (secret references and the mTLS flag); operator-side material
+                  stays on the parent cluster spec.
+                properties:
+                  clientMTLS:
+                    description: |-
+                      ClientMTLS mirrors "EtcdClusterTLS.Client.OperatorClientSecretRef
+                      is set" — i.e. whether the etcd server should be started with
+                      --client-cert-auth=true and --trusted-ca-file. Decoupled from the
+                      secret ref because the secret itself is operator-side only.
+                    type: boolean
+                  clientServerSecretRef:
+                    description: |-
+                      ClientServerSecretRef mirrors EtcdClusterTLS.Client.ServerSecretRef.
+                      When nil, the member runs the client API in plaintext.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  peerSecretRef:
+                    description: |-
+                      PeerSecretRef mirrors EtcdClusterTLS.Peer.SecretRef. When nil, the
+                      member runs the peer API in plaintext. When set, peer is always
+                      mTLS (--peer-client-cert-auth=true).
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                type: object
               version:
                 description: Version is the etcd version for this member.
                 pattern: ^\d+\.\d+\.\d+$

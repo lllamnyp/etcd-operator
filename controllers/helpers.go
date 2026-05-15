@@ -29,22 +29,83 @@ const (
 )
 
 // peerURL returns the etcd peer URL for a member, using the headless Service DNS.
-func peerURL(member, cluster, namespace string) string {
-	return fmt.Sprintf("http://%s.%s.%s.svc:2380", member, cluster, namespace)
+// scheme is "http" or "https" depending on whether peer TLS is enabled.
+func peerURL(scheme, member, cluster, namespace string) string {
+	return fmt.Sprintf("%s://%s.%s.%s.svc:2380", scheme, member, cluster, namespace)
 }
 
 // clientURL returns the etcd client URL for a member.
-func clientURL(member, cluster, namespace string) string {
-	return fmt.Sprintf("http://%s.%s.%s.svc:2379", member, cluster, namespace)
+// scheme is "http" or "https" depending on whether client TLS is enabled.
+func clientURL(scheme, member, cluster, namespace string) string {
+	return fmt.Sprintf("%s://%s.%s.%s.svc:2379", scheme, member, cluster, namespace)
+}
+
+// clusterClientScheme returns "https" when the cluster has client TLS
+// configured, "http" otherwise. The operator's etcd client and the
+// `--advertise-client-urls` values both key off this.
+func clusterClientScheme(cluster *lll.EtcdCluster) string {
+	if cluster != nil && cluster.Spec.TLS != nil && cluster.Spec.TLS.Client != nil {
+		return "https"
+	}
+	return "http"
+}
+
+// clusterPeerScheme returns "https" when the cluster has peer TLS configured,
+// "http" otherwise.
+func clusterPeerScheme(cluster *lll.EtcdCluster) string {
+	if cluster != nil && cluster.Spec.TLS != nil && cluster.Spec.TLS.Peer != nil {
+		return "https"
+	}
+	return "http"
+}
+
+// memberClientScheme is the per-member counterpart to clusterClientScheme,
+// keyed off the propagated EtcdMemberSpec.TLS.
+func memberClientScheme(member *lll.EtcdMember) string {
+	if member != nil && member.Spec.TLS != nil && member.Spec.TLS.ClientServerSecretRef != nil {
+		return "https"
+	}
+	return "http"
+}
+
+// memberPeerScheme is the per-member counterpart to clusterPeerScheme.
+func memberPeerScheme(member *lll.EtcdMember) string {
+	if member != nil && member.Spec.TLS != nil && member.Spec.TLS.PeerSecretRef != nil {
+		return "https"
+	}
+	return "http"
 }
 
 // buildInitialCluster builds the --initial-cluster flag value from member names.
-func buildInitialCluster(names []string, cluster, namespace string) string {
+func buildInitialCluster(peerScheme string, names []string, cluster, namespace string) string {
 	parts := make([]string, len(names))
 	for i, name := range names {
-		parts[i] = name + "=" + peerURL(name, cluster, namespace)
+		parts[i] = name + "=" + peerURL(peerScheme, name, cluster, namespace)
 	}
 	return strings.Join(parts, ",")
+}
+
+// deriveMemberTLS produces the per-member TLS view from a cluster's TLS
+// spec. Mirrors only the secret references plus the mTLS flag; the operator-
+// side operator-client secret stays on the parent cluster.
+func deriveMemberTLS(cluster *lll.EtcdCluster) *lll.EtcdMemberTLS {
+	if cluster == nil || cluster.Spec.TLS == nil {
+		return nil
+	}
+	if cluster.Spec.TLS.Client == nil && cluster.Spec.TLS.Peer == nil {
+		return nil
+	}
+	out := &lll.EtcdMemberTLS{}
+	if cluster.Spec.TLS.Client != nil {
+		ref := cluster.Spec.TLS.Client.ServerSecretRef
+		out.ClientServerSecretRef = &ref
+		out.ClientMTLS = cluster.Spec.TLS.Client.OperatorClientSecretRef != nil
+	}
+	if cluster.Spec.TLS.Peer != nil {
+		ref := cluster.Spec.TLS.Peer.SecretRef
+		out.PeerSecretRef = &ref
+	}
+	return out
 }
 
 // memberEndpoints returns etcd client endpoints for the subset of
@@ -74,11 +135,11 @@ func buildInitialCluster(names []string, cluster, namespace string) string {
 // learner's own discoverMemberID call where the peer list is just
 // "self" — letting the dialer try anyway is no worse than silently
 // returning [].
-func memberEndpoints(members []lll.EtcdMember, cluster, namespace string) []string {
+func memberEndpoints(scheme string, members []lll.EtcdMember, cluster, namespace string) []string {
 	voters := make([]string, 0, len(members))
 	for _, m := range members {
 		if m.Status.IsVoter {
-			voters = append(voters, clientURL(m.Name, cluster, namespace))
+			voters = append(voters, clientURL(scheme, m.Name, cluster, namespace))
 		}
 	}
 	if len(voters) > 0 {
@@ -86,7 +147,7 @@ func memberEndpoints(members []lll.EtcdMember, cluster, namespace string) []stri
 	}
 	eps := make([]string, len(members))
 	for i, m := range members {
-		eps[i] = clientURL(m.Name, cluster, namespace)
+		eps[i] = clientURL(scheme, m.Name, cluster, namespace)
 	}
 	return eps
 }

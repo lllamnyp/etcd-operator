@@ -17,9 +17,35 @@ limitations under the License.
 package v1alpha2
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+// EtcdMemberTLS is the per-member view of the parent cluster's
+// EtcdClusterTLS. The cluster controller copies the *secret references*
+// here at member creation; operator-side material
+// (EtcdClusterTLS.Client.OperatorClientSecretRef) is NOT mirrored because
+// it never gets mounted into the etcd Pod.
+type EtcdMemberTLS struct {
+	// ClientServerSecretRef mirrors EtcdClusterTLS.Client.ServerSecretRef.
+	// When nil, the member runs the client API in plaintext.
+	// +optional
+	ClientServerSecretRef *corev1.LocalObjectReference `json:"clientServerSecretRef,omitempty"`
+
+	// ClientMTLS mirrors "EtcdClusterTLS.Client.OperatorClientSecretRef
+	// is set" — i.e. whether the etcd server should be started with
+	// --client-cert-auth=true and --trusted-ca-file. Decoupled from the
+	// secret ref because the secret itself is operator-side only.
+	// +optional
+	ClientMTLS bool `json:"clientMTLS,omitempty"`
+
+	// PeerSecretRef mirrors EtcdClusterTLS.Peer.SecretRef. When nil, the
+	// member runs the peer API in plaintext. When set, peer is always
+	// mTLS (--peer-client-cert-auth=true).
+	// +optional
+	PeerSecretRef *corev1.LocalObjectReference `json:"peerSecretRef,omitempty"`
+}
 
 // Condition types for EtcdMember.
 const (
@@ -88,6 +114,13 @@ type EtcdMemberSpec struct {
 	// not count toward the EtcdCluster's `current` replica accounting.
 	// +optional
 	Dormant bool `json:"dormant,omitempty"`
+
+	// TLS mirrors the parent cluster's TLS configuration at the time
+	// this member was created. Carries only what the etcd Pod needs to
+	// see (secret references and the mTLS flag); operator-side material
+	// stays on the parent cluster spec.
+	// +optional
+	TLS *EtcdMemberTLS `json:"tls,omitempty"`
 }
 
 // EtcdMemberStatus defines the observed state of a single etcd member.

@@ -118,6 +118,25 @@ spec:
 
 This trades durability for speed: a Pod that loses its tmpfs (eviction, node failure) loses its data and the member is automatically replaced via `MemberRemove` + scale-up. **Don't use it as a general-purpose etcd backend** — see [docs/concepts.md](concepts.md#storage) and [docs/operations.md](operations.md#memory-backed-clusters) for the full trade-off. The remaining production hardening gaps (anti-affinity, container memory limits) are tracked in [#16](https://github.com/lllamnyp/etcd-operator/issues/16). The apiserver rejects `replicas: 0` on memory clusters via the [CEL validation rules](concepts.md#apiserver-enforced-validation), and every cluster gets an auto-emitted [PodDisruptionBudget](concepts.md#poddisruptionbudget).
 
+### TLS-enabled variant
+
+You can opt the client API (2379), the peer API (2380), or both onto TLS by referencing Secrets you've created out-of-band. The operator does not issue certs in Phase 1 — see [operations: TLS-enabled clusters](operations.md#tls-enabled-clusters) for Secret-creation commands, and [concepts: TLS](concepts.md#tls) for the constraint rationale (EKU `clientAuth` on the server cert, CA-bundle topology, etc.).
+
+Required SANs on the per-cluster server cert (BYO must cover all of these because the cert is shared by every member):
+
+- `*.<cluster>.<ns>.svc` (DNS SAN, wildcard — etcd ≥3.4 supports wildcard DNS SANs)
+- `*.<cluster>.<ns>.svc.<cluster-domain>` (also wildcard) — required by etcd's peer-mTLS verification, which reverse-DNS-looks-up the connecting peer's IP. Kubernetes' DNS returns the fully-qualified `<pod>.<svc>.<ns>.svc.<cluster-domain>` form, and the cert SAN has to cover it. `<cluster-domain>` is `cluster.local` on most clusters; Cozystack uses `cozy.local`. Check `kubectl exec -n kube-system <coredns-pod> -- cat /etc/coredns/Corefile` or your cluster's resolved DNS suffix if unsure.
+- `<cluster>.<ns>.svc` (the headless Service)
+- `<cluster>-client.<ns>.svc` (the client Service)
+- `localhost` (DNS SAN, for the `kubectl exec ... etcdctl --endpoints=https://localhost:2379` flow documented under operations)
+- `127.0.0.1` (IP SAN — same)
+
+Required SANs on the per-cluster peer cert: both `*.<cluster>.<ns>.svc` AND `*.<cluster>.<ns>.svc.<cluster-domain>` — the second is load-bearing for peer-mTLS, as above.
+
+Server cert EKU **must include `serverAuth` AND `clientAuth`** (the etcd grpc-gateway loopback presents the server cert as a client cert when self-dialing; the server's `--trusted-ca-file` then verifies it with `ExtKeyUsageClientAuth`). Peer cert EKU must include both because peer is symmetric. Operator-client cert needs only `clientAuth`.
+
+The `spec.tls` subtree is immutable post-create — flipping TLS on or off on an existing cluster is delete-and-recreate.
+
 ## Image versions
 
 `spec.version` in an `EtcdCluster` becomes `quay.io/coreos/etcd:v<version>`. The image repository is hard-coded in `controllers/helpers.go:EtcdImage`. Override it by patching the operator image with your own registry/repo if you mirror etcd internally.
