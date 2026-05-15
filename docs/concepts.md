@@ -172,8 +172,62 @@ Four CEL `x-kubernetes-validations` rules on `EtcdClusterSpec` are evaluated at 
 | `replicas: 0` + `storageMedium: Memory` rejected | CREATE + UPDATE | The pause path deletes the Pod, the tmpfs evaporates, and resume would silently produce an empty data dir; etcd refuses to start. |
 | `storage > 0` when `storageMedium: Memory` | CREATE + UPDATE | Zero `Storage` produces an unbounded tmpfs `SizeLimit` against node memory. |
 | `storage` cannot shrink | UPDATE | PVCs cannot shrink and tmpfs `SizeLimit` reduction does not free allocated memory. |
+| `tls` cannot be added or removed | UPDATE | Toggling TLS on an existing cluster is a rolling restart that has to land on the operator's etcd client and every member Pod in lockstep; not implemented. |
+| `tls` subtree immutable | UPDATE | Same reason — secret-ref swaps, mTLS-flip via `operatorClientSecretRef`, peer-only ↔ both toggles are all in-place rolling changes that v1 doesn't perform. |
 
 These rules live in the CRD itself; the apiserver enforces them with no separate webhook, no cert-manager, no extra Deployment. Errors come back as standard apiserver admission rejections (`kubectl apply` prints the rule's `message` field).
+
+## TLS
+
+`spec.tls` configures transport-layer security for the cluster's two etcd surfaces: the client API (port 2379) and the peer API (port 2380). Each subtree is independently optional — you can opt one surface into TLS without the other. The whole `tls` subtree is immutable post-create (see the validation table above): toggling TLS on an existing cluster is a rolling change that v1 doesn't perform, so the policy is delete-and-recreate.
+
+### Census of certs
+
+| Artifact | Mount / location | etcd flag | Source |
+|---|---|---|---|
+| Server cert + key (client API) | each etcd Pod, `/etc/etcd/tls/client/{tls.crt,tls.key}` | `--cert-file`, `--key-file` | `spec.tls.client.serverSecretRef` |
+| Client trust bundle (client API) | each etcd Pod, `/etc/etcd/tls/client/ca.crt` | `--trusted-ca-file` (mTLS only) | `ca.crt` key of `serverSecretRef`'s Secret |
+| Operator's client cert + key | operator Pod (not mounted into etcd Pods — read by the operator's etcd client) | n/a (Go `tls.Config.Certificates`) | `spec.tls.client.operatorClientSecretRef` |
+| Peer cert + key + trust | each etcd Pod, `/etc/etcd/tls/peer/{tls.crt,tls.key,ca.crt}` | `--peer-cert-file`, `--peer-key-file`, `--peer-trusted-ca-file` | `spec.tls.peer.secretRef` |
+
+The cluster controller propagates the per-Pod secret references (server, peer) onto each `EtcdMember` at creation, so the member controller builds Pods without re-reading the cluster spec. Operator-side material (the operator-client secret) stays on the parent cluster — the member controller fetches the cluster only when it needs an etcd client itself.
+
+### Modes from field presence
+
+Two boolean knobs on the client plane, each derived from which fields are populated:
+
+- **Client TLS off** → `spec.tls.client` absent. Plaintext on 2379.
+- **Server TLS only** → `serverSecretRef` set, `operatorClientSecretRef` absent. Encryption, no client identity. `serverSecretRef`'s `ca.crt` is required for the operator to verify the server.
+- **Full mTLS** → both refs set. `--client-cert-auth=true` and `--trusted-ca-file` pointed at the server-secret's `ca.crt`. Operator presents its own cert when dialing.
+
+Peer is simpler — it's a closed mesh:
+
+- **Peer TLS off** → `spec.tls.peer` absent. Plaintext on 2380.
+- **Peer TLS on** → `secretRef` set. Always mTLS (`--peer-client-cert-auth=true`); there is no useful encrypt-only mode for a symmetric peer plane.
+
+### Constraints on the client-plane CA topology
+
+The trust bundle in `serverSecretRef.ca.crt` is consumed twice when mTLS is on: as the operator's `RootCAs` (for verifying the server) and as etcd's `--trusted-ca-file` (for verifying incoming client certs). The trust bundle MUST therefore include both **the CA that signed the server cert** and **the CA that signed the operator-client cert**. In the common one-CA-per-cluster topology these are the same content; with two CAs on the client plane the user bundles both PEM blocks into a single `ca.crt`.
+
+This isn't a documentation preference — etcd's grpc-gateway loopback dials its own client API and presents the **server cert as a client cert** for that self-dial. If the server's issuing CA isn't in `--trusted-ca-file`, the loopback fails chain validation and the server logs become a steady stream of `x509: certificate signed by unknown authority` errors. For the same reason the server cert MUST carry `clientAuth` in its EKU alongside `serverAuth` — Go's `crypto/tls` enforces `ExtKeyUsageClientAuth` server-side when verifying client certs.
+
+### Peer-plane SAN constraint
+
+The peer-plane verification in etcd does *more* than the standard Go TLS chain check: it reverse-DNS-looks-up the connecting peer's source IP and matches the resulting PTR record against the cert's DNS SANs (`client/pkg/transport/listener_tls.go`'s `checkCertSAN`). Kubernetes' DNS returns the fully-qualified `<pod>.<svc>.<ns>.svc.<cluster-domain>` form for pod IPs, so the peer cert SAN list MUST include `*.<cluster>.<ns>.svc.<cluster-domain>` (the wildcard with the cluster DNS suffix appended) in addition to `*.<cluster>.<ns>.svc`. Without the second wildcard the seed will silently EOF every incoming peer-TLS connection from a non-seed member with a hard-to-diagnose `rejected connection on peer endpoint` log line, and the new pods crashloop on `discovery failed`.
+
+The cluster DNS suffix is environment-dependent — `cluster.local` on most upstream k8s, `cozy.local` on Cozystack — see [installation: TLS-enabled variant](installation.md#tls-enabled-variant) for how to identify it.
+
+### Readiness probe under TLS
+
+When client TLS is on, the kubelet readiness probe can't dial `/health` on 2379: it has no client cert to present (in mTLS mode etcd rejects it) and `InsecureSkipVerify` HTTPS probes are noisy on some kubelet versions. The operator routes around this by adding `--listen-metrics-urls=http://0.0.0.0:2381` and pointing the readiness probe at port 2381. Bound to `0.0.0.0` rather than `localhost` because kubelet's HTTPGet probe dials the Pod IP, not loopback — a `127.0.0.1`-only listener is unreachable from the kubelet. This is the standard etcd-on-k8s idiom; it decouples the probe from the TLS configuration and the only thing newly exposed is `/health` plus the Prometheus metrics, both of which are already accessible via the client API.
+
+Plaintext clusters keep probing `2379/health` directly — no behavioural change.
+
+### What the operator does NOT manage (Phase 1)
+
+- **Cert issuance.** The user creates the Secrets out-of-band. cert-manager integration is a Phase 2 follow-up.
+- **Cert rotation.** Renewing a cert means updating the Secret and bouncing the Pods. Until the operator watches the referenced Secrets and rolls Pods on RV change, rotation is a manual one-Pod-at-a-time `kubectl delete pod`.
+- **SAN validation.** The operator does not parse the user's cert to verify SANs cover the required DNS / IP names; etcd will fail to start (or self-dial loops will spam logs) if the cert is wrong. Required SANs are listed in `docs/installation.md`.
 
 ## PodDisruptionBudget
 

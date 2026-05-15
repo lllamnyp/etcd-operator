@@ -16,6 +16,7 @@ import (
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -194,6 +195,106 @@ func TestCEL_StorageMustBeNonZero_IntegerInput(t *testing.T) {
 	}
 }
 
+// TestCEL_TLSAddOnExistingClusterRejected verifies that flipping a plaintext
+// cluster to TLS post-create is rejected. Pointer-field immutability is
+// enforced at the spec level via the explicit has(self.tls)==has(oldSelf.tls)
+// rule rather than `self == oldSelf` on the field, because the latter only
+// fires when both sides are populated.
+func TestCEL_TLSAddOnExistingClusterRejected(t *testing.T) {
+	skipIfNoEnvtest(t)
+	ctx := context.Background()
+
+	c := validCluster("tls-add")
+	if err := k8s.Create(ctx, c); err != nil {
+		t.Fatalf("Create plaintext cluster: %v", err)
+	}
+	t.Cleanup(func() { _ = k8s.Delete(ctx, c) })
+
+	got := &lll.EtcdCluster{}
+	if err := k8s.Get(ctx, ctrlclient.ObjectKeyFromObject(c), got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	got.Spec.TLS = &lll.EtcdClusterTLS{
+		Client: &lll.ClientTLS{
+			ServerSecretRef: corev1.LocalObjectReference{Name: "fake-server-tls"},
+		},
+	}
+
+	err := k8s.Update(ctx, got)
+	if err == nil {
+		t.Fatalf("apiserver accepted TLS being added to existing plaintext cluster; expected rejection")
+	}
+	if !strings.Contains(err.Error(), "spec.tls cannot be added") {
+		t.Fatalf("error did not mention add/remove rejection: %v", err)
+	}
+}
+
+// TestCEL_TLSRemoveOnExistingClusterRejected mirrors the previous case for
+// the TLS→plaintext direction.
+func TestCEL_TLSRemoveOnExistingClusterRejected(t *testing.T) {
+	skipIfNoEnvtest(t)
+	ctx := context.Background()
+
+	c := validCluster("tls-remove")
+	c.Spec.TLS = &lll.EtcdClusterTLS{
+		Client: &lll.ClientTLS{
+			ServerSecretRef: corev1.LocalObjectReference{Name: "fake-server-tls"},
+		},
+	}
+	if err := k8s.Create(ctx, c); err != nil {
+		t.Fatalf("Create TLS cluster: %v", err)
+	}
+	t.Cleanup(func() { _ = k8s.Delete(ctx, c) })
+
+	got := &lll.EtcdCluster{}
+	if err := k8s.Get(ctx, ctrlclient.ObjectKeyFromObject(c), got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	got.Spec.TLS = nil
+
+	err := k8s.Update(ctx, got)
+	if err == nil {
+		t.Fatalf("apiserver accepted TLS being removed from existing TLS cluster; expected rejection")
+	}
+	if !strings.Contains(err.Error(), "spec.tls cannot be added") {
+		t.Fatalf("error did not mention add/remove rejection: %v", err)
+	}
+}
+
+// TestCEL_TLSSubfieldChangeRejected verifies that the inner-secret-ref
+// immutability rule fires when both sides have tls set but content differs.
+// Toggling mTLS on/off post-create or swapping secret refs is the
+// intended blocked path.
+func TestCEL_TLSSubfieldChangeRejected(t *testing.T) {
+	skipIfNoEnvtest(t)
+	ctx := context.Background()
+
+	c := validCluster("tls-subfield")
+	c.Spec.TLS = &lll.EtcdClusterTLS{
+		Client: &lll.ClientTLS{
+			ServerSecretRef: corev1.LocalObjectReference{Name: "fake-server-tls"},
+		},
+	}
+	if err := k8s.Create(ctx, c); err != nil {
+		t.Fatalf("Create TLS cluster: %v", err)
+	}
+	t.Cleanup(func() { _ = k8s.Delete(ctx, c) })
+
+	got := &lll.EtcdCluster{}
+	if err := k8s.Get(ctx, ctrlclient.ObjectKeyFromObject(c), got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	got.Spec.TLS.Client.OperatorClientSecretRef = &corev1.LocalObjectReference{Name: "fake-op-client-tls"}
+
+	err := k8s.Update(ctx, got)
+	if err == nil {
+		t.Fatalf("apiserver accepted mTLS toggle (added operatorClientSecretRef); expected rejection")
+	}
+	if !strings.Contains(err.Error(), "spec.tls is immutable") {
+		t.Fatalf("error did not mention subtree immutability: %v", err)
+	}
+}
+
 // TestCEL_HappyPathAccepts is a negative-side guard: a fully valid
 // cluster spec must pass the apiserver. Catches accidental rule
 // inversions and over-broad CEL expressions.
@@ -221,6 +322,20 @@ func TestCEL_HappyPathAccepts(t *testing.T) {
 			mut: func(c *lll.EtcdCluster) {
 				c.Spec.Replicas = ptr32(0)
 				// PVC default; the wedge rule only fires for Memory.
+			},
+		},
+		{
+			name: "tls full mTLS on create",
+			mut: func(c *lll.EtcdCluster) {
+				c.Spec.TLS = &lll.EtcdClusterTLS{
+					Client: &lll.ClientTLS{
+						ServerSecretRef:         corev1.LocalObjectReference{Name: "fake-server-tls"},
+						OperatorClientSecretRef: &corev1.LocalObjectReference{Name: "fake-op-client-tls"},
+					},
+					Peer: &lll.PeerTLS{
+						SecretRef: corev1.LocalObjectReference{Name: "fake-peer-tls"},
+					},
+				}
 			},
 		},
 	}

@@ -98,7 +98,7 @@ func TestBootstrap_CreatesSingleSeedMember(t *testing.T) {
 	if seed.Name == "test-" {
 		t.Fatalf("seed name should carry a GenerateName-assigned suffix; got bare %q", seed.Name)
 	}
-	wantIC := buildInitialCluster([]string{seed.Name}, "test", "ns")
+	wantIC := buildInitialCluster("http", []string{seed.Name}, "test", "ns")
 	if seed.Spec.InitialCluster != wantIC {
 		t.Fatalf("seed initial-cluster mismatch: got %q want %q", seed.Spec.InitialCluster, wantIC)
 	}
@@ -146,7 +146,7 @@ func TestObservedSpec_LocksMidFlight(t *testing.T) {
 		t.Fatalf("Update: %v", err)
 	}
 
-	fe := newFakeEtcd(0xdeadbeef, &etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")}})
+	fe := newFakeEtcd(0xdeadbeef, &etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("http", "test-0", "test", "ns")}})
 	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
 
 	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test", Namespace: "ns"}}); err != nil {
@@ -518,9 +518,9 @@ func TestScaleUp_AdoptsPendingCRAndRetriesAdd(t *testing.T) {
 	// Etcd has only the three pre-existing members; the pending CR's peer
 	// URL is NOT yet registered.
 	fe := newFakeEtcd(0xdeadbeef,
-		&etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")}},
-		&etcdserverpb.Member{ID: 0xa02, Name: "test-1", PeerURLs: []string{peerURL("test-1", "test", "ns")}},
-		&etcdserverpb.Member{ID: 0xa03, Name: "test-2", PeerURLs: []string{peerURL("test-2", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("http", "test-0", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa02, Name: "test-1", PeerURLs: []string{peerURL("http", "test-1", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa03, Name: "test-2", PeerURLs: []string{peerURL("http", "test-2", "test", "ns")}},
 	)
 
 	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
@@ -536,7 +536,7 @@ func TestScaleUp_AdoptsPendingCRAndRetriesAdd(t *testing.T) {
 	if len(fe.addCalls) != 0 {
 		t.Fatalf("scale-up must use AddAsLearner, not voting MemberAdd; got %v", fe.addCalls)
 	}
-	if len(fe.addLearnerCalls) != 1 || fe.addLearnerCalls[0] != peerURL("test-pndng", "test", "ns") {
+	if len(fe.addLearnerCalls) != 1 || fe.addLearnerCalls[0] != peerURL("http", "test-pndng", "test", "ns") {
 		t.Fatalf("expected one MemberAddAsLearner against the pending CR's peer URL; got %v", fe.addLearnerCalls)
 	}
 	// Pending CR must still exist (adopted, not duplicated) and must now
@@ -589,7 +589,7 @@ func TestBootstrap_Idempotent(t *testing.T) {
 		},
 		Spec: lll.EtcdMemberSpec{
 			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
-			Bootstrap: true, InitialCluster: buildInitialCluster([]string{seedName}, "test", "ns"),
+			Bootstrap: true, InitialCluster: buildInitialCluster("http", []string{seedName}, "test", "ns"),
 			ClusterToken: "ns-test-x",
 		},
 	}
@@ -655,7 +655,7 @@ func TestBootstrap_CompletesPendingSeed(t *testing.T) {
 		t.Fatalf("expected exactly one member after completion; got %d", len(members.Items))
 	}
 	got := members.Items[0]
-	wantIC := buildInitialCluster([]string{seedName}, "test", "ns")
+	wantIC := buildInitialCluster("http", []string{seedName}, "test", "ns")
 	if got.Spec.InitialCluster != wantIC {
 		t.Fatalf("pending seed InitialCluster not filled: got %q want %q", got.Spec.InitialCluster, wantIC)
 	}
@@ -695,7 +695,7 @@ func TestBootstrap_RejectsStaleSeed(t *testing.T) {
 		},
 		Spec: lll.EtcdMemberSpec{
 			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
-			Bootstrap: true, InitialCluster: buildInitialCluster([]string{"test-stalez"}, "test", "ns"),
+			Bootstrap: true, InitialCluster: buildInitialCluster("http", []string{"test-stalez"}, "test", "ns"),
 			ClusterToken: "ns-test-x",
 		},
 	}
@@ -930,7 +930,7 @@ func TestScaleUp_WakesFromDormant(t *testing.T) {
 		},
 		Spec: lll.EtcdMemberSpec{
 			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
-			InitialCluster: buildInitialCluster([]string{"test-saved1"}, "test", "ns"),
+			InitialCluster: buildInitialCluster("http", []string{"test-saved1"}, "test", "ns"),
 			ClusterToken:   "ns-test-x", Bootstrap: true, Dormant: true,
 		},
 	}
@@ -1258,7 +1258,7 @@ func TestReconcile_PausedDormantMessageNamesPVC(t *testing.T) {
 		},
 		Spec: lll.EtcdMemberSpec{
 			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
-			InitialCluster: buildInitialCluster([]string{"test-saved1"}, "test", "ns"),
+			InitialCluster: buildInitialCluster("http", []string{"test-saved1"}, "test", "ns"),
 			ClusterToken:   "ns-test-x", Bootstrap: true, Dormant: true,
 		},
 	}
@@ -1318,7 +1318,7 @@ func TestReconcile_DormantToOneAdoptsNewSpec(t *testing.T) {
 		},
 		Spec: lll.EtcdMemberSpec{
 			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
-			InitialCluster: buildInitialCluster([]string{"test-saved1"}, "test", "ns"),
+			InitialCluster: buildInitialCluster("http", []string{"test-saved1"}, "test", "ns"),
 			ClusterToken:   "ns-test-x", Bootstrap: true, Dormant: true,
 		},
 	}
@@ -1472,7 +1472,7 @@ func TestTryDiscoverCluster_RejectsPartialMembership(t *testing.T) {
 	c, _ := newTestClient(t, cluster, seed)
 	// fakeEtcd returns a member with the wrong name.
 	fe := newFakeEtcd(0xdeadbeef, &etcdserverpb.Member{
-		ID: 0xff, Name: "wrong-name", PeerURLs: []string{peerURL("wrong-name", "test", "ns")},
+		ID: 0xff, Name: "wrong-name", PeerURLs: []string{peerURL("http", "wrong-name", "test", "ns")},
 	})
 	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
 
@@ -1511,7 +1511,7 @@ func TestTryDiscoverCluster_LatchesOnValidResponse(t *testing.T) {
 	}
 	c, _ := newTestClient(t, cluster, seed)
 	fe := newFakeEtcd(0xabc, &etcdserverpb.Member{
-		ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")},
+		ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("http", "test-0", "test", "ns")},
 	})
 	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
 
@@ -1602,7 +1602,7 @@ func TestTryDiscoverCluster_FindsSeedByBootstrapFlag(t *testing.T) {
 	}
 	c, _ := newTestClient(t, cluster, &sibling, &seed)
 	fe := newFakeEtcd(0xabc, &etcdserverpb.Member{
-		ID: 0xa01, Name: seed.Name, PeerURLs: []string{peerURL(seed.Name, "test", "ns")},
+		ID: 0xa01, Name: seed.Name, PeerURLs: []string{peerURL("http", seed.Name, "test", "ns")},
 	})
 	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
 
@@ -1858,10 +1858,10 @@ func TestScaleUp_InitialClusterMatchesEtcdMembership(t *testing.T) {
 	// Etcd already has 4 members. The pending member's peer URL is
 	// registered (joiner not yet reported in, so etcd's Name=="").
 	fe := newFakeEtcd(0xdeadbeef,
-		&etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")}},
-		&etcdserverpb.Member{ID: 0xa02, Name: "test-1", PeerURLs: []string{peerURL("test-1", "test", "ns")}},
-		&etcdserverpb.Member{ID: 0xa03, Name: "test-2", PeerURLs: []string{peerURL("test-2", "test", "ns")}},
-		&etcdserverpb.Member{ID: 0xa04, Name: "", PeerURLs: []string{peerURL("test-pndng", "test", "ns")}, IsLearner: true},
+		&etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("http", "test-0", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa02, Name: "test-1", PeerURLs: []string{peerURL("http", "test-1", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa03, Name: "test-2", PeerURLs: []string{peerURL("http", "test-2", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa04, Name: "", PeerURLs: []string{peerURL("http", "test-pndng", "test", "ns")}, IsLearner: true},
 	)
 	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
 
@@ -1895,7 +1895,7 @@ func TestScaleUp_InitialClusterMatchesEtcdMembership(t *testing.T) {
 	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "test-pndng"}, got); err != nil {
 		t.Fatalf("pending EtcdMember disappeared: %v", err)
 	}
-	wantIC := buildInitialCluster([]string{"test-0", "test-1", "test-2", "test-pndng"}, "test", "ns")
+	wantIC := buildInitialCluster("http", []string{"test-0", "test-1", "test-2", "test-pndng"}, "test", "ns")
 	if got.Spec.InitialCluster != wantIC {
 		t.Fatalf("Spec.InitialCluster mismatch:\n  got  %q\n  want %q", got.Spec.InitialCluster, wantIC)
 	}
@@ -1954,10 +1954,10 @@ func TestScaleUp_RecoversFromCrashBetweenAddAndPatch(t *testing.T) {
 	objs = append(objs, pending)
 	c, _ := newTestClient(t, objs...)
 	fe := newFakeEtcd(0xdeadbeef,
-		&etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")}},
-		&etcdserverpb.Member{ID: 0xa02, Name: "test-1", PeerURLs: []string{peerURL("test-1", "test", "ns")}},
-		&etcdserverpb.Member{ID: 0xa03, Name: "test-2", PeerURLs: []string{peerURL("test-2", "test", "ns")}},
-		&etcdserverpb.Member{ID: 0xa04, Name: "", PeerURLs: []string{peerURL("test-pndng", "test", "ns")}, IsLearner: true},
+		&etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("http", "test-0", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa02, Name: "test-1", PeerURLs: []string{peerURL("http", "test-1", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa03, Name: "test-2", PeerURLs: []string{peerURL("http", "test-2", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa04, Name: "", PeerURLs: []string{peerURL("http", "test-pndng", "test", "ns")}, IsLearner: true},
 	)
 	// Promote always errors — the orphan learner is permanently stuck
 	// until its pod comes up (which requires the InitialCluster patch).
@@ -2007,8 +2007,8 @@ func TestScaleUp_AddsAsLearner(t *testing.T) {
 	}
 	c, _ := newTestClient(t, objs...)
 	fe := newFakeEtcd(0xdeadbeef,
-		&etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")}},
-		&etcdserverpb.Member{ID: 0xa02, Name: "test-1", PeerURLs: []string{peerURL("test-1", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("http", "test-0", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa02, Name: "test-1", PeerURLs: []string{peerURL("http", "test-1", "test", "ns")}},
 	)
 	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
 
@@ -2071,9 +2071,9 @@ func TestScaleUp_PromotesExistingLearner(t *testing.T) {
 	c, _ := newTestClient(t, objs...)
 	const learnerID uint64 = 0xbb01
 	fe := newFakeEtcd(0xdeadbeef,
-		&etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")}},
-		&etcdserverpb.Member{ID: 0xa02, Name: "test-1", PeerURLs: []string{peerURL("test-1", "test", "ns")}},
-		&etcdserverpb.Member{ID: learnerID, Name: "test-2", PeerURLs: []string{peerURL("test-2", "test", "ns")}, IsLearner: true},
+		&etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("http", "test-0", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa02, Name: "test-1", PeerURLs: []string{peerURL("http", "test-1", "test", "ns")}},
+		&etcdserverpb.Member{ID: learnerID, Name: "test-2", PeerURLs: []string{peerURL("http", "test-2", "test", "ns")}, IsLearner: true},
 	)
 	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
 
@@ -2127,9 +2127,9 @@ func TestReconcile_PromotesLearnerWhenCurrentEqualsDesired(t *testing.T) {
 	c, _ := newTestClient(t, objs...)
 	const learnerID uint64 = 0xbb01
 	fe := newFakeEtcd(0xdeadbeef,
-		&etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")}},
-		&etcdserverpb.Member{ID: 0xa02, Name: "test-1", PeerURLs: []string{peerURL("test-1", "test", "ns")}},
-		&etcdserverpb.Member{ID: learnerID, Name: "test-2", PeerURLs: []string{peerURL("test-2", "test", "ns")}, IsLearner: true},
+		&etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("http", "test-0", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa02, Name: "test-1", PeerURLs: []string{peerURL("http", "test-1", "test", "ns")}},
+		&etcdserverpb.Member{ID: learnerID, Name: "test-2", PeerURLs: []string{peerURL("http", "test-2", "test", "ns")}, IsLearner: true},
 	)
 	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
 
@@ -2211,9 +2211,9 @@ func TestClusterUpdateStatus_NoChurnInSteadyState(t *testing.T) {
 	}
 	c, _ := newTestClient(t, objs...)
 	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xabc,
-		&etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")}},
-		&etcdserverpb.Member{ID: 0xa02, Name: "test-1", PeerURLs: []string{peerURL("test-1", "test", "ns")}},
-		&etcdserverpb.Member{ID: 0xa03, Name: "test-2", PeerURLs: []string{peerURL("test-2", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("http", "test-0", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa02, Name: "test-1", PeerURLs: []string{peerURL("http", "test-1", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa03, Name: "test-2", PeerURLs: []string{peerURL("http", "test-2", "test", "ns")}},
 	))}
 
 	rvBefore := mustGet(t, c, "test", "ns", &lll.EtcdCluster{}).ResourceVersion
@@ -2354,7 +2354,7 @@ func TestTryDiscoverCluster_LatchesAvailableTrueOnSuccess(t *testing.T) {
 	}
 	c, _ := newTestClient(t, cluster, seed)
 	fe := newFakeEtcd(0xabc, &etcdserverpb.Member{
-		ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")},
+		ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("http", "test-0", "test", "ns")},
 	})
 	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
 
@@ -2602,9 +2602,9 @@ func TestSyncIsVoter_PatchesFromMemberList(t *testing.T) {
 
 	listResp := &clientv3.MemberListResponse{
 		Members: []*etcdserverpb.Member{
-			{ID: 0x1, PeerURLs: []string{peerURL("test-v", "test", "ns")}, IsLearner: false},
-			{ID: 0x2, PeerURLs: []string{peerURL("test-l", "test", "ns")}, IsLearner: true},
-			{ID: 0x3, PeerURLs: []string{peerURL("test-s", "test", "ns")}, IsLearner: false},
+			{ID: 0x1, PeerURLs: []string{peerURL("http", "test-v", "test", "ns")}, IsLearner: false},
+			{ID: 0x2, PeerURLs: []string{peerURL("http", "test-l", "test", "ns")}, IsLearner: true},
+			{ID: 0x3, PeerURLs: []string{peerURL("http", "test-s", "test", "ns")}, IsLearner: false},
 		},
 	}
 

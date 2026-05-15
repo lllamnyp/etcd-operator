@@ -60,6 +60,7 @@ type EtcdClusterReconciler struct {
 //+kubebuilder:rbac:groups=lllamnyp.su,resources=etcdmembers/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch
 //+kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
 func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
@@ -264,8 +265,12 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// here too. Cheap: list etcd once and try to promote any learner;
 	// no-op if none.
 	if cluster.Status.ClusterID != "" && len(running) > 0 {
-		endpoints := memberEndpoints(running, cluster.Name, cluster.Namespace)
-		etcdClient, err := r.EtcdClientFactory(ctx, endpoints)
+		endpoints := memberEndpoints(clusterClientScheme(cluster), running, cluster.Name, cluster.Namespace)
+		tlsCfg, err := buildOperatorTLSConfig(ctx, r.Client, cluster)
+		if err != nil {
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+		etcdClient, err := r.EtcdClientFactory(ctx, endpoints, tlsCfg)
 		if err == nil {
 			defer etcdClient.Close()
 			res, perr := r.promotePendingLearner(ctx, cluster, running, etcdClient, endpoints)
@@ -339,6 +344,7 @@ func (r *EtcdClusterReconciler) bootstrap(
 				StorageMedium: cluster.Status.Observed.StorageMedium,
 				Bootstrap:     true,
 				ClusterToken:  cluster.Status.ClusterToken,
+				TLS:           deriveMemberTLS(cluster),
 				// InitialCluster filled in below once apiserver assigns Name.
 			},
 		}
@@ -375,7 +381,7 @@ func (r *EtcdClusterReconciler) bootstrap(
 
 	if seed.Spec.InitialCluster == "" {
 		original := seed.DeepCopy()
-		seed.Spec.InitialCluster = buildInitialCluster([]string{seed.Name}, cluster.Name, cluster.Namespace)
+		seed.Spec.InitialCluster = buildInitialCluster(clusterPeerScheme(cluster), []string{seed.Name}, cluster.Name, cluster.Namespace)
 		// Now that apiserver-assigned name is known, populate the
 		// per-member component label so the seed CR's label set matches
 		// the Pod/PVC the member controller will create.
@@ -438,9 +444,13 @@ func (r *EtcdClusterReconciler) tryDiscoverCluster(
 		}
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
-	endpoints := []string{clientURL(seed.Name, cluster.Name, cluster.Namespace)}
+	endpoints := []string{clientURL(clusterClientScheme(cluster), seed.Name, cluster.Name, cluster.Namespace)}
 
-	etcdClient, err := r.EtcdClientFactory(ctx, endpoints)
+	tlsCfg, err := buildOperatorTLSConfig(ctx, r.Client, cluster)
+	if err != nil {
+		return r.surfaceDiscoveryError(ctx, cluster, "operator TLS config", err)
+	}
+	etcdClient, err := r.EtcdClientFactory(ctx, endpoints, tlsCfg)
 	if err != nil {
 		return r.surfaceDiscoveryError(ctx, cluster, "etcd client construction failed", err)
 	}
@@ -462,7 +472,7 @@ func (r *EtcdClusterReconciler) tryDiscoverCluster(
 		log.Info("waiting for definitive single-member response", "members", len(resp.Members))
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
-	expectedPeer := peerURL(seed.Name, cluster.Name, cluster.Namespace)
+	expectedPeer := peerURL(clusterPeerScheme(cluster), seed.Name, cluster.Name, cluster.Namespace)
 	matched := resp.Members[0].Name == seed.Name
 	if !matched {
 		for _, p := range resp.Members[0].PeerURLs {
@@ -588,8 +598,13 @@ func (r *EtcdClusterReconciler) scaleUp(
 	// CR, which we just handled). From this point on we only care about
 	// running (non-dormant) members for the etcd-side flow.
 	running := filterRunningMembers(members)
-	endpoints := memberEndpoints(running, cluster.Name, cluster.Namespace)
-	etcdClient, err := r.EtcdClientFactory(ctx, endpoints)
+	endpoints := memberEndpoints(clusterClientScheme(cluster), running, cluster.Name, cluster.Namespace)
+	tlsCfg, err := buildOperatorTLSConfig(ctx, r.Client, cluster)
+	if err != nil {
+		log.Error(err, "cannot build operator TLS config for scale-up")
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+	etcdClient, err := r.EtcdClientFactory(ctx, endpoints, tlsCfg)
 	if err != nil {
 		log.Error(err, "cannot connect to etcd for scale-up", "endpoints", endpoints)
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
@@ -638,6 +653,7 @@ func (r *EtcdClusterReconciler) scaleUp(
 			StorageMedium: cluster.Status.Observed.StorageMedium,
 			Bootstrap:     false,
 			ClusterToken:  cluster.Status.ClusterToken,
+			TLS:           deriveMemberTLS(cluster),
 			// InitialCluster filled in by completePendingMember below.
 		},
 	}
@@ -670,7 +686,7 @@ func (r *EtcdClusterReconciler) completePendingMember(
 	pending *lll.EtcdMember,
 ) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
-	pendingPeerURL := peerURL(pending.Name, cluster.Name, cluster.Namespace)
+	pendingPeerURL := peerURL(clusterPeerScheme(cluster), pending.Name, cluster.Name, cluster.Namespace)
 
 	alreadyAdded := false
 	for _, m := range listResp.Members {
@@ -712,7 +728,7 @@ func (r *EtcdClusterReconciler) completePendingMember(
 		}
 	}
 	sort.Strings(allNames)
-	initialCluster := buildInitialCluster(allNames, cluster.Name, cluster.Namespace)
+	initialCluster := buildInitialCluster(clusterPeerScheme(cluster), allNames, cluster.Name, cluster.Namespace)
 
 	original := pending.DeepCopy()
 	pending.Spec.InitialCluster = initialCluster
@@ -847,7 +863,7 @@ func (r *EtcdClusterReconciler) syncIsVoter(
 		if !m.DeletionTimestamp.IsZero() {
 			continue
 		}
-		url := peerURL(m.Name, cluster.Name, cluster.Namespace)
+		url := peerURL(clusterPeerScheme(cluster), m.Name, cluster.Name, cluster.Namespace)
 		var wantVoter bool
 		switch {
 		case voterByURL[url]:

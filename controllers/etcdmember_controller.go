@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"strconv"
 	"time"
@@ -51,6 +52,7 @@ type EtcdMemberReconciler struct {
 //+kubebuilder:rbac:groups=lllamnyp.su,resources=etcdclusters,verbs=get
 //+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;patch;delete
 //+kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
 func (r *EtcdMemberReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
@@ -203,7 +205,7 @@ func (r *EtcdMemberReconciler) handleDeletion(ctx context.Context, member *lll.E
 	}
 
 	if !clusterDeleting {
-		if err := r.removeMemberFromEtcd(ctx, member); err != nil {
+		if err := r.removeMemberFromEtcd(ctx, cluster, member); err != nil {
 			log.Error(err, "failed to remove member from etcd, will retry")
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
@@ -226,7 +228,7 @@ func (r *EtcdMemberReconciler) handleDeletion(ctx context.Context, member *lll.E
 //     still clean it up.
 //  3. The member is not in etcd's list at all — treat as already gone and
 //     return nil so the finalizer can be removed.
-func (r *EtcdMemberReconciler) removeMemberFromEtcd(ctx context.Context, member *lll.EtcdMember) error {
+func (r *EtcdMemberReconciler) removeMemberFromEtcd(ctx context.Context, cluster *lll.EtcdCluster, member *lll.EtcdMember) error {
 	memberList := &lll.EtcdMemberList{}
 	if err := r.List(ctx, memberList,
 		client.InNamespace(member.Namespace),
@@ -238,6 +240,7 @@ func (r *EtcdMemberReconciler) removeMemberFromEtcd(ctx context.Context, member 
 	// Only dial peers that aren't themselves being deleted. Endpoints of
 	// a Terminating pod can hang the client until our 10s deadline and
 	// don't help us anyway.
+	scheme := clusterClientScheme(cluster)
 	var endpoints []string
 	otherMembers := 0
 	for _, m := range filterActiveMembers(memberList.Items) {
@@ -246,7 +249,7 @@ func (r *EtcdMemberReconciler) removeMemberFromEtcd(ctx context.Context, member 
 		}
 		otherMembers++
 		if m.Status.PodName != "" {
-			endpoints = append(endpoints, clientURL(m.Name, member.Spec.ClusterName, member.Namespace))
+			endpoints = append(endpoints, clientURL(scheme, m.Name, member.Spec.ClusterName, member.Namespace))
 		}
 	}
 	if len(endpoints) == 0 {
@@ -261,7 +264,11 @@ func (r *EtcdMemberReconciler) removeMemberFromEtcd(ctx context.Context, member 
 		return nil
 	}
 
-	etcdClient, err := r.EtcdClientFactory(ctx, endpoints)
+	tlsCfg, err := buildOperatorTLSConfig(ctx, r.Client, cluster)
+	if err != nil {
+		return fmt.Errorf("build operator TLS config: %w", err)
+	}
+	etcdClient, err := r.EtcdClientFactory(ctx, endpoints, tlsCfg)
 	if err != nil {
 		return err
 	}
@@ -309,7 +316,7 @@ func (r *EtcdMemberReconciler) resolveMemberID(
 		}
 		// Match by peer URL too — etcd may have a member added via MemberAdd
 		// whose Name is empty until it joins.
-		expected := peerURL(member.Name, member.Spec.ClusterName, member.Namespace)
+		expected := peerURL(memberPeerScheme(member), member.Name, member.Spec.ClusterName, member.Namespace)
 		for _, p := range m.PeerURLs {
 			if p == expected {
 				return m.ID, nil
@@ -425,6 +432,16 @@ func (r *EtcdMemberReconciler) ensurePod(ctx context.Context, member *lll.EtcdMe
 		return err
 	}
 
+	// Gate Pod creation on referenced TLS Secrets actually existing.
+	// Without this check the Pod is created but stays in
+	// ContainerCreating with FailedMount until the Secret materializes
+	// — a confusing failure mode for users who typo a secret name or
+	// haven't created the Secret yet. Returning an error here triggers
+	// the standard backoff requeue.
+	if err := r.checkTLSSecretsAvailable(ctx, member); err != nil {
+		return err
+	}
+
 	pod = r.buildPod(member)
 	if err := controllerutil.SetControllerReference(member, pod, r.Scheme); err != nil {
 		return err
@@ -434,6 +451,34 @@ func (r *EtcdMemberReconciler) ensurePod(ctx context.Context, member *lll.EtcdMe
 	}
 	member.Status.PodName = pod.Name
 	member.Status.PodUID = string(pod.UID)
+	return nil
+}
+
+// checkTLSSecretsAvailable verifies that every TLS Secret referenced by
+// this member exists. Returns nil for plaintext clusters or when all
+// referenced Secrets are present; returns an error (which propagates to a
+// requeue) otherwise.
+func (r *EtcdMemberReconciler) checkTLSSecretsAvailable(ctx context.Context, member *lll.EtcdMember) error {
+	if member.Spec.TLS == nil {
+		return nil
+	}
+	check := func(name string) error {
+		sec := &corev1.Secret{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: member.Namespace, Name: name}, sec); err != nil {
+			return fmt.Errorf("TLS secret %s/%s: %w", member.Namespace, name, err)
+		}
+		return nil
+	}
+	if member.Spec.TLS.ClientServerSecretRef != nil {
+		if err := check(member.Spec.TLS.ClientServerSecretRef.Name); err != nil {
+			return err
+		}
+	}
+	if member.Spec.TLS.PeerSecretRef != nil {
+		if err := check(member.Spec.TLS.PeerSecretRef.Name); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -495,8 +540,14 @@ func (r *EtcdMemberReconciler) buildPod(member *lll.EtcdMember) *corev1.Pod {
 		clusterState = "existing"
 	}
 
-	pAddr := peerURL(member.Name, member.Spec.ClusterName, member.Namespace)
-	cAddr := clientURL(member.Name, member.Spec.ClusterName, member.Namespace)
+	clientScheme := memberClientScheme(member)
+	peerScheme := memberPeerScheme(member)
+	clientTLS := clientScheme == "https"
+	peerTLS := peerScheme == "https"
+	clientMTLS := clientTLS && member.Spec.TLS != nil && member.Spec.TLS.ClientMTLS
+
+	pAddr := peerURL(peerScheme, member.Name, member.Spec.ClusterName, member.Namespace)
+	cAddr := clientURL(clientScheme, member.Name, member.Spec.ClusterName, member.Namespace)
 
 	// Data volume source: tmpfs emptyDir for memory-backed members,
 	// PVC otherwise. SizeLimit on the emptyDir caps tmpfs allocation;
@@ -531,6 +582,79 @@ func (r *EtcdMemberReconciler) buildPod(member *lll.EtcdMember) *corev1.Pod {
 		labels[LabelRole] = RoleVoter
 	}
 
+	cmd := []string{
+		"etcd",
+		"--name=" + member.Name,
+		"--data-dir=/var/lib/etcd",
+		"--listen-peer-urls=" + peerScheme + "://0.0.0.0:2380",
+		"--listen-client-urls=" + clientScheme + "://0.0.0.0:2379",
+		"--advertise-client-urls=" + cAddr,
+		"--initial-advertise-peer-urls=" + pAddr,
+		"--initial-cluster=" + member.Spec.InitialCluster,
+		"--initial-cluster-token=" + member.Spec.ClusterToken,
+		"--initial-cluster-state=" + clusterState,
+	}
+
+	volumes := []corev1.Volume{{Name: "data", VolumeSource: dataVolumeSource}}
+	mounts := []corev1.VolumeMount{{Name: "data", MountPath: "/var/lib/etcd"}}
+
+	if clientTLS {
+		cmd = append(cmd,
+			"--cert-file=/etc/etcd/tls/client/tls.crt",
+			"--key-file=/etc/etcd/tls/client/tls.key",
+		)
+		if clientMTLS {
+			cmd = append(cmd,
+				"--client-cert-auth=true",
+				"--trusted-ca-file=/etc/etcd/tls/client/ca.crt",
+			)
+		}
+		// Kubelet readiness probe can't present a client cert when
+		// --client-cert-auth=true, and even in server-TLS-only mode the
+		// SchemeHTTPS probe is awkward. Expose /health on a separate
+		// plaintext metrics listener — the standard etcd-on-k8s idiom —
+		// and point the readiness probe at port 2381. Binds 0.0.0.0
+		// because kubelet probes dial the Pod IP, not loopback.
+		cmd = append(cmd, "--listen-metrics-urls=http://0.0.0.0:2381")
+		volumes = append(volumes, corev1.Volume{
+			Name: "tls-client",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: member.Spec.TLS.ClientServerSecretRef.Name,
+				},
+			},
+		})
+		mounts = append(mounts, corev1.VolumeMount{
+			Name: "tls-client", MountPath: "/etc/etcd/tls/client", ReadOnly: true,
+		})
+	}
+	if peerTLS {
+		cmd = append(cmd,
+			"--peer-cert-file=/etc/etcd/tls/peer/tls.crt",
+			"--peer-key-file=/etc/etcd/tls/peer/tls.key",
+			"--peer-trusted-ca-file=/etc/etcd/tls/peer/ca.crt",
+			"--peer-client-cert-auth=true",
+		)
+		volumes = append(volumes, corev1.Volume{
+			Name: "tls-peer",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: member.Spec.TLS.PeerSecretRef.Name,
+				},
+			},
+		})
+		mounts = append(mounts, corev1.VolumeMount{
+			Name: "tls-peer", MountPath: "/etc/etcd/tls/peer", ReadOnly: true,
+		})
+	}
+
+	// Readiness target: when client TLS is on, the localhost metrics
+	// listener on 2381; otherwise the regular client port on 2379.
+	readinessPort := 2379
+	if clientTLS {
+		readinessPort = 2381
+	}
+
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      member.Name,
@@ -558,25 +682,12 @@ func (r *EtcdMemberReconciler) buildPod(member *lll.EtcdMember) *corev1.Pod {
 						Drop: []corev1.Capability{"ALL"},
 					},
 				},
-				Command: []string{
-					"etcd",
-					"--name=" + member.Name,
-					"--data-dir=/var/lib/etcd",
-					"--listen-peer-urls=http://0.0.0.0:2380",
-					"--listen-client-urls=http://0.0.0.0:2379",
-					"--advertise-client-urls=" + cAddr,
-					"--initial-advertise-peer-urls=" + pAddr,
-					"--initial-cluster=" + member.Spec.InitialCluster,
-					"--initial-cluster-token=" + member.Spec.ClusterToken,
-					"--initial-cluster-state=" + clusterState,
-				},
+				Command: cmd,
 				Ports: []corev1.ContainerPort{
 					{Name: "client", ContainerPort: 2379},
 					{Name: "peer", ContainerPort: 2380},
 				},
-				VolumeMounts: []corev1.VolumeMount{
-					{Name: "data", MountPath: "/var/lib/etcd"},
-				},
+				VolumeMounts: mounts,
 				Resources: corev1.ResourceRequirements{
 					Requests: corev1.ResourceList{
 						corev1.ResourceCPU:    resource.MustParse("100m"),
@@ -604,7 +715,7 @@ func (r *EtcdMemberReconciler) buildPod(member *lll.EtcdMember) *corev1.Pod {
 					ProbeHandler: corev1.ProbeHandler{
 						HTTPGet: &corev1.HTTPGetAction{
 							Path: "/health",
-							Port: intstr.FromInt(2379),
+							Port: intstr.FromInt(readinessPort),
 						},
 					},
 					InitialDelaySeconds: 5,
@@ -612,10 +723,7 @@ func (r *EtcdMemberReconciler) buildPod(member *lll.EtcdMember) *corev1.Pod {
 					FailureThreshold:    3,
 				},
 			}},
-			Volumes: []corev1.Volume{{
-				Name:         "data",
-				VolumeSource: dataVolumeSource,
-			}},
+			Volumes: volumes,
 		},
 	}
 }
@@ -709,6 +817,20 @@ func (r *EtcdMemberReconciler) updateStatus(ctx context.Context, member *lll.Etc
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 }
 
+// memberTLSConfig builds an operator-side *tls.Config for dialling etcd on
+// behalf of this member, by fetching the parent cluster and delegating to
+// buildOperatorTLSConfig. Returns (nil, nil) for plaintext clusters.
+func (r *EtcdMemberReconciler) memberTLSConfig(ctx context.Context, member *lll.EtcdMember) (*tls.Config, error) {
+	if member.Spec.TLS == nil || member.Spec.TLS.ClientServerSecretRef == nil {
+		return nil, nil
+	}
+	cluster := &lll.EtcdCluster{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: member.Namespace, Name: member.Spec.ClusterName}, cluster); err != nil {
+		return nil, fmt.Errorf("fetch parent cluster %s/%s for TLS config: %w", member.Namespace, member.Spec.ClusterName, err)
+	}
+	return buildOperatorTLSConfig(ctx, r.Client, cluster)
+}
+
 // discoverMemberID asks etcd for this member's ID. It prefers asking peers
 // rather than the member's own pod: if this member is crashlooping (PVC
 // corruption, OOM, etc.) its own etcd never responds, but the rest of the
@@ -729,6 +851,7 @@ func (r *EtcdMemberReconciler) discoverMemberID(ctx context.Context, member *lll
 		return 0, err
 	}
 
+	scheme := memberClientScheme(member)
 	var endpoints []string
 	for _, m := range filterActiveMembers(memberList.Items) {
 		if m.Name == member.Name {
@@ -743,15 +866,19 @@ func (r *EtcdMemberReconciler) discoverMemberID(ctx context.Context, member *lll
 			// context budget.
 			continue
 		}
-		endpoints = append(endpoints, clientURL(m.Name, member.Spec.ClusterName, member.Namespace))
+		endpoints = append(endpoints, clientURL(scheme, m.Name, member.Spec.ClusterName, member.Namespace))
 	}
 	// Self last — used during single-node bootstrap when there are no
 	// other peers, or when no other peer is yet Ready. Etcd handles
 	// MemberList on a single-member-voter cluster fine; the learner
 	// rejection only fires when we route past a voter to a learner.
-	endpoints = append(endpoints, clientURL(member.Name, member.Spec.ClusterName, member.Namespace))
+	endpoints = append(endpoints, clientURL(scheme, member.Name, member.Spec.ClusterName, member.Namespace))
 
-	c, err := r.EtcdClientFactory(ctx, endpoints)
+	tlsCfg, err := r.memberTLSConfig(ctx, member)
+	if err != nil {
+		return 0, err
+	}
+	c, err := r.EtcdClientFactory(ctx, endpoints, tlsCfg)
 	if err != nil {
 		return 0, err
 	}
@@ -764,7 +891,7 @@ func (r *EtcdMemberReconciler) discoverMemberID(ctx context.Context, member *lll
 	if err != nil {
 		return 0, err
 	}
-	expectedPeer := peerURL(member.Name, member.Spec.ClusterName, member.Namespace)
+	expectedPeer := peerURL(memberPeerScheme(member), member.Name, member.Spec.ClusterName, member.Namespace)
 	for _, m := range resp.Members {
 		if m.Name == member.Name {
 			return m.ID, nil

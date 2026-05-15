@@ -12,7 +12,9 @@ package controllers
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
+	"strings"
 	"testing"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
@@ -63,9 +65,9 @@ func TestRemoveMemberFromEtcd_FallbackByName(t *testing.T) {
 	// no Name yet (etcd populates Name only after the joiner reports in).
 	const orphanID uint64 = 0xc0ffee
 	fe := newFakeEtcd(0xdeadbeef,
-		&etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")}},
-		&etcdserverpb.Member{ID: 0xa02, Name: "test-1", PeerURLs: []string{peerURL("test-1", "test", "ns")}},
-		&etcdserverpb.Member{ID: orphanID, Name: "", PeerURLs: []string{peerURL("test-2", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("http", "test-0", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa02, Name: "test-1", PeerURLs: []string{peerURL("http", "test-1", "test", "ns")}},
+		&etcdserverpb.Member{ID: orphanID, Name: "", PeerURLs: []string{peerURL("http", "test-2", "test", "ns")}},
 	)
 
 	c, _ := newTestClient(t, cluster, existing0, existing1, victim)
@@ -75,7 +77,7 @@ func TestRemoveMemberFromEtcd_FallbackByName(t *testing.T) {
 		EtcdClientFactory: factoryReturning(fe),
 	}
 
-	if err := r.removeMemberFromEtcd(ctx, victim); err != nil {
+	if err := r.removeMemberFromEtcd(ctx, cluster, victim); err != nil {
 		t.Fatalf("removeMemberFromEtcd: %v", err)
 	}
 
@@ -110,7 +112,7 @@ func TestRemoveMemberFromEtcd_PeerWithEmptyPodNameRetries(t *testing.T) {
 	fe := newFakeEtcd(0xdeadbeef)
 	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
 
-	err := r.removeMemberFromEtcd(ctx, victim)
+	err := r.removeMemberFromEtcd(ctx, cluster, victim)
 	if err == nil {
 		t.Fatalf("expected error when peers exist on CR side but none have PodName set")
 	}
@@ -184,7 +186,7 @@ func TestRemoveMemberFromEtcd_NotFoundIsClean(t *testing.T) {
 	}
 
 	fe := newFakeEtcd(0xdeadbeef,
-		&etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa01, Name: "test-0", PeerURLs: []string{peerURL("http", "test-0", "test", "ns")}},
 	)
 
 	c, _ := newTestClient(t, cluster, existing0, victim)
@@ -194,7 +196,7 @@ func TestRemoveMemberFromEtcd_NotFoundIsClean(t *testing.T) {
 		EtcdClientFactory: factoryReturning(fe),
 	}
 
-	if err := r.removeMemberFromEtcd(ctx, victim); err != nil {
+	if err := r.removeMemberFromEtcd(ctx, cluster, victim); err != nil {
 		t.Fatalf("removeMemberFromEtcd should not error when member already gone: %v", err)
 	}
 	if len(fe.removeCalls) != 0 {
@@ -548,7 +550,7 @@ func TestUpdateStatus_PopulatesMemberIDAndFlipsReady(t *testing.T) {
 	c, _ := newTestClient(t, member, pod)
 	const wantID uint64 = 0xae36f238164a08ad
 	fe := newFakeEtcd(0xdeadbeef,
-		&etcdserverpb.Member{ID: wantID, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")}},
+		&etcdserverpb.Member{ID: wantID, Name: "test-0", PeerURLs: []string{peerURL("http", "test-0", "test", "ns")}},
 	)
 	r := &EtcdMemberReconciler{
 		Client:            c,
@@ -600,7 +602,7 @@ func TestRemoveMemberFromEtcd_LastMemberIsNoOp(t *testing.T) {
 		EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead)), // never reached
 	}
 
-	if err := r.removeMemberFromEtcd(ctx, victim); err != nil {
+	if err := r.removeMemberFromEtcd(ctx, cluster, victim); err != nil {
 		t.Fatalf("removeMemberFromEtcd should be a no-op when no peers reachable; got %v", err)
 	}
 }
@@ -630,7 +632,7 @@ func TestRemoveMemberFromEtcd_FactoryError(t *testing.T) {
 		EtcdClientFactory: failingFactory(errors.New("dial timeout")),
 	}
 
-	err := r.removeMemberFromEtcd(ctx, victim)
+	err := r.removeMemberFromEtcd(ctx, cluster, victim)
 	if err == nil {
 		t.Fatalf("expected error from removeMemberFromEtcd when factory fails")
 	}
@@ -738,25 +740,25 @@ func TestRemoveMemberFromEtcd_SkipsDeletingPeers(t *testing.T) {
 	// Record the endpoints the factory was called with.
 	var seenEndpoints []string
 	fe := newFakeEtcd(0xdeadbeef,
-		&etcdserverpb.Member{ID: 0x1, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")}},
-		&etcdserverpb.Member{ID: 0x2, Name: "test-1", PeerURLs: []string{peerURL("test-1", "test", "ns")}},
-		&etcdserverpb.Member{ID: 0x3, Name: "test-2", PeerURLs: []string{peerURL("test-2", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0x1, Name: "test-0", PeerURLs: []string{peerURL("http", "test-0", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0x2, Name: "test-1", PeerURLs: []string{peerURL("http", "test-1", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0x3, Name: "test-2", PeerURLs: []string{peerURL("http", "test-2", "test", "ns")}},
 	)
-	factory := func(_ context.Context, eps []string) (EtcdClusterClient, error) {
+	factory := func(_ context.Context, eps []string, _ *tls.Config) (EtcdClusterClient, error) {
 		seenEndpoints = append([]string(nil), eps...)
 		return fe, nil
 	}
 	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factory}
 
-	if err := r.removeMemberFromEtcd(ctx, victim); err != nil {
+	if err := r.removeMemberFromEtcd(ctx, cluster, victim); err != nil {
 		t.Fatalf("removeMemberFromEtcd: %v", err)
 	}
 	for _, ep := range seenEndpoints {
-		if ep == clientURL("test-2", "test", "ns") {
+		if ep == clientURL("http", "test-2", "test", "ns") {
 			t.Fatalf("dialed a Terminating peer (test-2); endpoints were %v", seenEndpoints)
 		}
 	}
-	if len(seenEndpoints) != 1 || seenEndpoints[0] != clientURL("test-0", "test", "ns") {
+	if len(seenEndpoints) != 1 || seenEndpoints[0] != clientURL("http", "test-0", "test", "ns") {
 		t.Fatalf("expected dial only against test-0; got %v", seenEndpoints)
 	}
 }
@@ -789,11 +791,11 @@ func TestDiscoverMemberID_FallsBackToPeers(t *testing.T) {
 	// URL is present, succeed with a fake that knows about target.
 	const wantID uint64 = 0xfeedface
 	fe := newFakeEtcd(0xdead,
-		&etcdserverpb.Member{ID: 0x1, Name: "test-0", PeerURLs: []string{peerURL("test-0", "test", "ns")}},
-		&etcdserverpb.Member{ID: wantID, Name: "test-1", PeerURLs: []string{peerURL("test-1", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0x1, Name: "test-0", PeerURLs: []string{peerURL("http", "test-0", "test", "ns")}},
+		&etcdserverpb.Member{ID: wantID, Name: "test-1", PeerURLs: []string{peerURL("http", "test-1", "test", "ns")}},
 	)
 	var capturedEndpoints []string
-	factory := func(_ context.Context, eps []string) (EtcdClusterClient, error) {
+	factory := func(_ context.Context, eps []string, _ *tls.Config) (EtcdClusterClient, error) {
 		capturedEndpoints = append([]string(nil), eps...)
 		return fe, nil
 	}
@@ -807,7 +809,7 @@ func TestDiscoverMemberID_FallsBackToPeers(t *testing.T) {
 		t.Fatalf("id = %x, want %x", id, wantID)
 	}
 	// Assert at least one peer URL is in the endpoint list (and not just self).
-	wantPeer := clientURL("test-0", "test", "ns")
+	wantPeer := clientURL("http", "test-0", "test", "ns")
 	hasPeer := false
 	for _, ep := range capturedEndpoints {
 		if ep == wantPeer {
@@ -861,11 +863,11 @@ func TestDiscoverMemberID_ExcludesNonVoterPeers(t *testing.T) {
 
 	const wantID uint64 = 0xfeedface
 	fe := newFakeEtcd(0xdead,
-		&etcdserverpb.Member{ID: 0x1, Name: "test-voter", PeerURLs: []string{peerURL("test-voter", "test", "ns")}},
-		&etcdserverpb.Member{ID: wantID, Name: "test-target", PeerURLs: []string{peerURL("test-target", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0x1, Name: "test-voter", PeerURLs: []string{peerURL("http", "test-voter", "test", "ns")}},
+		&etcdserverpb.Member{ID: wantID, Name: "test-target", PeerURLs: []string{peerURL("http", "test-target", "test", "ns")}},
 	)
 	var captured []string
-	factory := func(_ context.Context, eps []string) (EtcdClusterClient, error) {
+	factory := func(_ context.Context, eps []string, _ *tls.Config) (EtcdClusterClient, error) {
 		captured = append([]string(nil), eps...)
 		return fe, nil
 	}
@@ -874,13 +876,13 @@ func TestDiscoverMemberID_ExcludesNonVoterPeers(t *testing.T) {
 	if _, err := r.discoverMemberID(ctx, target); err != nil {
 		t.Fatalf("discoverMemberID: %v", err)
 	}
-	learnerURL := clientURL("test-learner", "test", "ns")
+	learnerURL := clientURL("http", "test-learner", "test", "ns")
 	for _, ep := range captured {
 		if ep == learnerURL {
 			t.Fatalf("discoverMemberID must not pass the non-Ready learner's URL to clientv3; got %v", captured)
 		}
 	}
-	voterURL := clientURL("test-voter", "test", "ns")
+	voterURL := clientURL("http", "test-voter", "test", "ns")
 	hasVoter := false
 	for _, ep := range captured {
 		if ep == voterURL {
@@ -909,7 +911,7 @@ func TestDiscoverMemberID_FallsBackToPeerURL(t *testing.T) {
 	const wantID uint64 = 0xfeedface
 	// fakeEtcd returns the target with Name="" but matching PeerURLs.
 	fe := newFakeEtcd(0xdead,
-		&etcdserverpb.Member{ID: wantID, Name: "", PeerURLs: []string{peerURL("test-1", "test", "ns")}},
+		&etcdserverpb.Member{ID: wantID, Name: "", PeerURLs: []string{peerURL("http", "test-1", "test", "ns")}},
 	)
 	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
 
@@ -1069,8 +1071,8 @@ func TestHandleDeletion_StillCallsMemberRemove(t *testing.T) {
 	}
 	c, _ := newTestClient(t, cluster, survivor, victim)
 	fe := newFakeEtcd(0xdeadbeef,
-		&etcdserverpb.Member{ID: 0xa1, Name: "test-keep1", PeerURLs: []string{peerURL("test-keep1", "test", "ns")}},
-		&etcdserverpb.Member{ID: 0xb2, Name: "test-gone1", PeerURLs: []string{peerURL("test-gone1", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xa1, Name: "test-keep1", PeerURLs: []string{peerURL("http", "test-keep1", "test", "ns")}},
+		&etcdserverpb.Member{ID: 0xb2, Name: "test-gone1", PeerURLs: []string{peerURL("http", "test-gone1", "test", "ns")}},
 	)
 	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(fe)}
 
@@ -1175,7 +1177,7 @@ func TestReconcile_WakeFromDormantCreatesPod(t *testing.T) {
 		},
 		Spec: lll.EtcdMemberSpec{
 			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
-			InitialCluster: buildInitialCluster([]string{"test-saved1"}, "test", "ns"),
+			InitialCluster: buildInitialCluster("http", []string{"test-saved1"}, "test", "ns"),
 			ClusterToken:   "ns-test-x", Bootstrap: true,
 			// Dormant=false — the cluster controller just flipped it back.
 		},
@@ -1334,7 +1336,7 @@ func TestEnsurePod_CapturesUIDOfExistingPod(t *testing.T) {
 			ClusterName:    "test",
 			Version:        "3.5.17",
 			Storage:        quickQty(t, "1Gi"),
-			InitialCluster: "m-1=" + peerURL("m-1", "test", "ns"),
+			InitialCluster: "m-1=" + peerURL("http", "m-1", "test", "ns"),
 			ClusterToken:   "ns-test-x",
 			Bootstrap:      true,
 		},
@@ -1385,7 +1387,7 @@ func TestReconcile_MemoryMemberDeletesSelfOnPodLoss(t *testing.T) {
 			Version:        "3.5.17",
 			Storage:        quickQty(t, "1Gi"),
 			StorageMedium:  lll.StorageMediumMemory,
-			InitialCluster: "m-1=" + peerURL("m-1", "test", "ns"),
+			InitialCluster: "m-1=" + peerURL("http", "m-1", "test", "ns"),
 			ClusterToken:   "ns-test-x",
 			Bootstrap:      true,
 		},
@@ -1447,7 +1449,7 @@ func TestReconcile_MemoryMemberStablePodIsNotLost(t *testing.T) {
 			Version:        "3.5.17",
 			Storage:        quickQty(t, "1Gi"),
 			StorageMedium:  lll.StorageMediumMemory,
-			InitialCluster: "m-1=" + peerURL("m-1", "test", "ns"),
+			InitialCluster: "m-1=" + peerURL("http", "m-1", "test", "ns"),
 			ClusterToken:   "ns-test-x",
 			Bootstrap:      true,
 		},
@@ -1499,7 +1501,7 @@ func TestUpdateStatus_MemoryMemberLeavesPVCNameEmpty(t *testing.T) {
 			Version:        "3.5.17",
 			Storage:        quickQty(t, "1Gi"),
 			StorageMedium:  lll.StorageMediumMemory,
-			InitialCluster: "m-1=" + peerURL("m-1", "test", "ns"),
+			InitialCluster: "m-1=" + peerURL("http", "m-1", "test", "ns"),
 			ClusterToken:   "ns-test-x",
 			Bootstrap:      true,
 		},
@@ -1600,7 +1602,7 @@ func TestEnsurePod_AppliesRoleLabelWhenIsVoter(t *testing.T) {
 			ClusterName:    "test",
 			Version:        "3.5.17",
 			Storage:        quickQty(t, "1Gi"),
-			InitialCluster: "m-1=" + peerURL("m-1", "test", "ns"),
+			InitialCluster: "m-1=" + peerURL("http", "m-1", "test", "ns"),
 			ClusterToken:   "ns-test-x",
 			Bootstrap:      true,
 		},
@@ -1697,5 +1699,273 @@ func TestBuildPod_RoleLabelAtCreateForVoter(t *testing.T) {
 	})
 	if _, present := pod2.Labels[LabelRole]; present {
 		t.Fatalf("buildPod with IsVoter=false must not set %s; got %q", LabelRole, pod2.Labels[LabelRole])
+	}
+}
+
+// ── TLS ──────────────────────────────────────────────────────────────────
+
+func cmdContains(cmd []string, want string) bool {
+	for _, a := range cmd {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
+func mountFor(pod *corev1.Pod, name string) *corev1.VolumeMount {
+	for i, m := range pod.Spec.Containers[0].VolumeMounts {
+		if m.Name == name {
+			return &pod.Spec.Containers[0].VolumeMounts[i]
+		}
+	}
+	return nil
+}
+
+func volumeFor(pod *corev1.Pod, name string) *corev1.Volume {
+	for i, v := range pod.Spec.Volumes {
+		if v.Name == name {
+			return &pod.Spec.Volumes[i]
+		}
+	}
+	return nil
+}
+
+// TestBuildPod_PlaintextHasNoTLSFlags is the negative regression: existing
+// non-TLS clusters must keep their http:// listen URLs, no --cert-file, no
+// extra volumes, and probe :2379. Catches accidental TLS-defaults creep.
+func TestBuildPod_PlaintextHasNoTLSFlags(t *testing.T) {
+	r := &EtcdMemberReconciler{}
+	pod := r.buildPod(&lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "ns"},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi")},
+	})
+	cmd := pod.Spec.Containers[0].Command
+	if !cmdContains(cmd, "--listen-peer-urls=http://0.0.0.0:2380") {
+		t.Fatalf("plaintext peer listen URL missing: %v", cmd)
+	}
+	if !cmdContains(cmd, "--listen-client-urls=http://0.0.0.0:2379") {
+		t.Fatalf("plaintext client listen URL missing: %v", cmd)
+	}
+	for _, a := range cmd {
+		if strings.HasPrefix(a, "--cert-file") || strings.HasPrefix(a, "--peer-cert-file") {
+			t.Fatalf("plaintext pod must not have cert flags; got %q", a)
+		}
+	}
+	if mountFor(pod, "tls-client") != nil || mountFor(pod, "tls-peer") != nil {
+		t.Fatalf("plaintext pod must not mount TLS volumes")
+	}
+	if pod.Spec.Containers[0].ReadinessProbe.HTTPGet.Port.IntValue() != 2379 {
+		t.Fatalf("plaintext readiness probe should target 2379; got %v", pod.Spec.Containers[0].ReadinessProbe.HTTPGet.Port)
+	}
+}
+
+// TestBuildPod_ClientTLSOnlyAddsServerCertButNoClientAuth covers the
+// server-TLS-only mode: --cert-file/--key-file but no --client-cert-auth
+// and no --trusted-ca-file (etcd would otherwise require client certs).
+func TestBuildPod_ClientTLSOnlyAddsServerCertButNoClientAuth(t *testing.T) {
+	r := &EtcdMemberReconciler{}
+	pod := r.buildPod(&lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "ns"},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			TLS: &lll.EtcdMemberTLS{
+				ClientServerSecretRef: &corev1.LocalObjectReference{Name: "srv"},
+				ClientMTLS:            false,
+			},
+		},
+	})
+	cmd := pod.Spec.Containers[0].Command
+	if !cmdContains(cmd, "--listen-client-urls=https://0.0.0.0:2379") {
+		t.Fatalf("client listen URL not https: %v", cmd)
+	}
+	if !cmdContains(cmd, "--cert-file=/etc/etcd/tls/client/tls.crt") {
+		t.Fatalf("missing --cert-file flag: %v", cmd)
+	}
+	for _, a := range cmd {
+		if strings.HasPrefix(a, "--client-cert-auth") {
+			t.Fatalf("server-TLS-only mode must not enable client-cert-auth; got %q", a)
+		}
+		if strings.HasPrefix(a, "--trusted-ca-file") {
+			t.Fatalf("server-TLS-only mode must not mount trusted CA; got %q", a)
+		}
+	}
+	if v := volumeFor(pod, "tls-client"); v == nil || v.Secret == nil || v.Secret.SecretName != "srv" {
+		t.Fatalf("expected tls-client volume backed by Secret %q; got %+v", "srv", v)
+	}
+	if pod.Spec.Containers[0].ReadinessProbe.HTTPGet.Port.IntValue() != 2381 {
+		t.Fatalf("client-TLS readiness probe should target the localhost metrics port 2381; got %v", pod.Spec.Containers[0].ReadinessProbe.HTTPGet.Port)
+	}
+	if !cmdContains(cmd, "--listen-metrics-urls=http://0.0.0.0:2381") {
+		t.Fatalf("client-TLS pod must expose plaintext metrics URL for the probe: %v", cmd)
+	}
+}
+
+// TestBuildPod_ClientMTLSAddsTrustedCAAndClientCertAuth verifies that
+// ClientMTLS=true on the propagated member spec emits the apiserver-required
+// flags. The mTLS bit is a separate signal from "client TLS is on" so the
+// operator can recover the spec from the EtcdMember in isolation.
+func TestBuildPod_ClientMTLSAddsTrustedCAAndClientCertAuth(t *testing.T) {
+	r := &EtcdMemberReconciler{}
+	pod := r.buildPod(&lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "ns"},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			TLS: &lll.EtcdMemberTLS{
+				ClientServerSecretRef: &corev1.LocalObjectReference{Name: "srv"},
+				ClientMTLS:            true,
+			},
+		},
+	})
+	cmd := pod.Spec.Containers[0].Command
+	if !cmdContains(cmd, "--client-cert-auth=true") {
+		t.Fatalf("mTLS pod must set --client-cert-auth=true: %v", cmd)
+	}
+	if !cmdContains(cmd, "--trusted-ca-file=/etc/etcd/tls/client/ca.crt") {
+		t.Fatalf("mTLS pod must set --trusted-ca-file: %v", cmd)
+	}
+}
+
+// TestBuildPod_PeerTLSAlwaysMTLS covers the peer plane's fixed-mTLS
+// semantics. Peer is symmetric (same cert serves and dials), there is no
+// useful encrypt-only mode, and --peer-client-cert-auth=true must always
+// be set whenever peer TLS is on.
+func TestBuildPod_PeerTLSAlwaysMTLS(t *testing.T) {
+	r := &EtcdMemberReconciler{}
+	pod := r.buildPod(&lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "ns"},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			TLS: &lll.EtcdMemberTLS{
+				PeerSecretRef: &corev1.LocalObjectReference{Name: "peer"},
+			},
+		},
+	})
+	cmd := pod.Spec.Containers[0].Command
+	if !cmdContains(cmd, "--listen-peer-urls=https://0.0.0.0:2380") {
+		t.Fatalf("peer listen URL not https: %v", cmd)
+	}
+	for _, want := range []string{
+		"--peer-cert-file=/etc/etcd/tls/peer/tls.crt",
+		"--peer-key-file=/etc/etcd/tls/peer/tls.key",
+		"--peer-trusted-ca-file=/etc/etcd/tls/peer/ca.crt",
+		"--peer-client-cert-auth=true",
+	} {
+		if !cmdContains(cmd, want) {
+			t.Fatalf("missing required peer-TLS flag %q in: %v", want, cmd)
+		}
+	}
+	if v := volumeFor(pod, "tls-peer"); v == nil || v.Secret == nil || v.Secret.SecretName != "peer" {
+		t.Fatalf("expected tls-peer volume backed by Secret %q; got %+v", "peer", v)
+	}
+}
+
+// TestDeriveMemberTLS covers the cluster→member projection. ClientMTLS
+// must be true iff OperatorClientSecretRef is set; secret refs are deep-
+// copied so a later edit to the parent's pointer can't mutate the
+// already-created member.
+func TestDeriveMemberTLS(t *testing.T) {
+	type want struct {
+		nilOut     bool
+		hasClient  bool
+		hasPeer    bool
+		clientMTLS bool
+	}
+	cases := []struct {
+		name string
+		in   *lll.EtcdCluster
+		want want
+	}{
+		{
+			name: "nil tls",
+			in:   &lll.EtcdCluster{},
+			want: want{nilOut: true},
+		},
+		{
+			name: "client only, no mtls",
+			in: &lll.EtcdCluster{Spec: lll.EtcdClusterSpec{TLS: &lll.EtcdClusterTLS{
+				Client: &lll.ClientTLS{ServerSecretRef: corev1.LocalObjectReference{Name: "s"}},
+			}}},
+			want: want{hasClient: true, clientMTLS: false},
+		},
+		{
+			name: "client with mtls",
+			in: &lll.EtcdCluster{Spec: lll.EtcdClusterSpec{TLS: &lll.EtcdClusterTLS{
+				Client: &lll.ClientTLS{
+					ServerSecretRef:         corev1.LocalObjectReference{Name: "s"},
+					OperatorClientSecretRef: &corev1.LocalObjectReference{Name: "op"},
+				},
+			}}},
+			want: want{hasClient: true, clientMTLS: true},
+		},
+		{
+			name: "peer only",
+			in: &lll.EtcdCluster{Spec: lll.EtcdClusterSpec{TLS: &lll.EtcdClusterTLS{
+				Peer: &lll.PeerTLS{SecretRef: corev1.LocalObjectReference{Name: "p"}},
+			}}},
+			want: want{hasPeer: true},
+		},
+		{
+			name: "both",
+			in: &lll.EtcdCluster{Spec: lll.EtcdClusterSpec{TLS: &lll.EtcdClusterTLS{
+				Client: &lll.ClientTLS{ServerSecretRef: corev1.LocalObjectReference{Name: "s"}},
+				Peer:   &lll.PeerTLS{SecretRef: corev1.LocalObjectReference{Name: "p"}},
+			}}},
+			want: want{hasClient: true, hasPeer: true},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := deriveMemberTLS(tc.in)
+			if tc.want.nilOut {
+				if got != nil {
+					t.Fatalf("expected nil; got %+v", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("expected non-nil")
+			}
+			if (got.ClientServerSecretRef != nil) != tc.want.hasClient {
+				t.Fatalf("hasClient = %v; want %v", got.ClientServerSecretRef != nil, tc.want.hasClient)
+			}
+			if (got.PeerSecretRef != nil) != tc.want.hasPeer {
+				t.Fatalf("hasPeer = %v; want %v", got.PeerSecretRef != nil, tc.want.hasPeer)
+			}
+			if got.ClientMTLS != tc.want.clientMTLS {
+				t.Fatalf("ClientMTLS = %v; want %v", got.ClientMTLS, tc.want.clientMTLS)
+			}
+		})
+	}
+}
+
+// TestEnsurePod_BlocksOnMissingTLSSecret covers the precheck: without it,
+// the Pod would be created and stay in ContainerCreating with FailedMount.
+// Returning an error keeps the reconcile in the standard backoff loop and
+// surfaces a clear cause in the operator logs.
+func TestEnsurePod_BlocksOnMissingTLSSecret(t *testing.T) {
+	ctx := context.Background()
+	member := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "ns", UID: types.UID("mu")},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			TLS: &lll.EtcdMemberTLS{ClientServerSecretRef: &corev1.LocalObjectReference{Name: "missing"}},
+		},
+	}
+	c, _ := newTestClient(t, member)
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t)}
+
+	err := r.ensurePod(ctx, member)
+	if err == nil {
+		t.Fatalf("expected error when referenced TLS secret is absent")
+	}
+	if !apierrors.IsNotFound(err) && !strings.Contains(err.Error(), "TLS secret") {
+		t.Fatalf("expected the error to identify the missing TLS secret; got %v", err)
+	}
+	// And the Pod must not have been created.
+	pod := &corev1.Pod{}
+	getErr := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "m"}, pod)
+	if getErr == nil {
+		t.Fatalf("Pod should not exist when referenced TLS secret is missing")
 	}
 }

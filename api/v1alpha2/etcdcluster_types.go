@@ -17,9 +17,87 @@ limitations under the License.
 package v1alpha2
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+// EtcdClusterTLS configures transport-layer security for the cluster's two
+// etcd surfaces: the client API (port 2379) and the peer API (port 2380).
+// Each subtree is independently optional. Subtree fields are immutable
+// post-create — flipping TLS on or off on an existing cluster is a
+// non-trivial rolling change (the operator's own etcd client must switch
+// protocols in lockstep with the members), so v1 punts that to delete-and-
+// recreate.
+type EtcdClusterTLS struct {
+	// Client configures TLS for the etcd client API (port 2379). Absent
+	// means plaintext. See ClientTLS for the mTLS-toggle semantics.
+	// +optional
+	Client *ClientTLS `json:"client,omitempty"`
+
+	// Peer configures TLS for the etcd peer API (port 2380). Absent
+	// means plaintext. When set, peer is always mTLS — etcd's peer mesh
+	// is symmetric and there is no useful encrypt-only-no-identity mode
+	// for it.
+	// +optional
+	Peer *PeerTLS `json:"peer,omitempty"`
+}
+
+// ClientTLS configures TLS for the etcd client API.
+//
+// Modes (derived from which fields are populated):
+//
+//   - ServerSecretRef set, OperatorClientSecretRef absent → server-TLS only
+//     (encryption, no client identity). etcd serves https://. The operator
+//     dials with RootCAs from ServerSecretRef's ca.crt but presents no
+//     client cert. ServerSecretRef.ca.crt is REQUIRED in this mode (the
+//     operator needs to verify the server).
+//
+//   - ServerSecretRef set, OperatorClientSecretRef set → full mTLS. All of
+//     the above, plus etcd is started with --client-cert-auth=true and
+//     --trusted-ca-file pointing at ServerSecretRef.ca.crt. The operator
+//     presents OperatorClientSecretRef's tls.crt/tls.key on every dial.
+//
+//     ServerSecretRef.ca.crt MUST include both (a) the CA that issued the
+//     server cert (because etcd self-dials its own grpc-gateway loopback
+//     and the server cert is presented as the client cert on that path —
+//     so --trusted-ca-file has to verify it) and (b) the CA that signed
+//     OperatorClientSecretRef.tls.crt. In the common one-CA topology these
+//     are the same content; with two CAs on the client plane the user
+//     bundles both PEM blocks into a single ca.crt.
+//
+//     ServerSecretRef.tls.crt MUST carry clientAuth in its EKU alongside
+//     serverAuth — same loopback reason. The operator does not parse the
+//     cert to validate this; misconfiguration surfaces as etcd startup
+//     failure in the Pod logs.
+type ClientTLS struct {
+	// ServerSecretRef points at a Secret in the cluster's namespace
+	// holding the etcd server cert in the standard kubernetes.io/tls
+	// shape: tls.crt, tls.key, and ca.crt. ca.crt is always required
+	// (the operator's own etcd client needs it to verify the server,
+	// and when mTLS is on it doubles as --trusted-ca-file).
+	ServerSecretRef corev1.LocalObjectReference `json:"serverSecretRef"`
+
+	// OperatorClientSecretRef points at a Secret in the cluster's
+	// namespace holding the operator's etcd-client identity (tls.crt,
+	// tls.key). Setting this enables mTLS — etcd is started with
+	// --client-cert-auth=true and the operator presents this cert when
+	// dialing. Leaving it unset selects server-TLS-only mode.
+	// +optional
+	OperatorClientSecretRef *corev1.LocalObjectReference `json:"operatorClientSecretRef,omitempty"`
+}
+
+// PeerTLS configures TLS for the etcd peer API. When PeerTLS is set, peer
+// is always mTLS.
+type PeerTLS struct {
+	// SecretRef points at a Secret in the cluster's namespace holding
+	// the peer cert+key in the standard kubernetes.io/tls shape:
+	// tls.crt, tls.key, ca.crt. ca.crt is required (peer is symmetric
+	// — same cert is used to serve inbound and dial outbound peer
+	// connections — and --peer-trusted-ca-file is always populated).
+	// The peer cert MUST carry both serverAuth and clientAuth in EKU.
+	SecretRef corev1.LocalObjectReference `json:"secretRef"`
+}
 
 // Condition types for EtcdCluster.
 const (
@@ -78,6 +156,8 @@ const (
 //
 // +kubebuilder:validation:XValidation:rule="!(has(self.replicas) && self.replicas == 0 && has(self.storageMedium) && self.storageMedium == 'Memory')",message="spec.replicas=0 with spec.storageMedium=Memory is unsupported: pausing a memory-backed cluster wedges on resume. Delete and recreate the cluster instead."
 // +kubebuilder:validation:XValidation:rule="!(has(self.storageMedium) && self.storageMedium == 'Memory') || quantity(string(self.storage)).isGreaterThan(quantity('0'))",message="spec.storage must be > 0 when spec.storageMedium=Memory (the tmpfs sizeLimit cannot be zero)."
+// +kubebuilder:validation:XValidation:rule="has(self.tls) == has(oldSelf.tls)",message="spec.tls cannot be added to or removed from an existing cluster; delete and recreate"
+// +kubebuilder:validation:XValidation:rule="!has(self.tls) || !has(oldSelf.tls) || self.tls == oldSelf.tls",message="spec.tls is immutable post-create; delete and recreate the cluster to change TLS configuration"
 type EtcdClusterSpec struct {
 	// Replicas is the desired number of cluster members. Should be odd.
 	// A value of 0 parks the cluster ("scale to zero"): the operator
@@ -138,6 +218,15 @@ type EtcdClusterSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	ProgressDeadlineSeconds *int32 `json:"progressDeadlineSeconds,omitempty"`
+
+	// TLS configures transport-layer security for the etcd client and
+	// peer APIs. Absent means plaintext on both surfaces. The whole
+	// subtree is immutable post-create — the immutability rules live at
+	// the EtcdClusterSpec level (above) because pointer-field transition
+	// rules don't fire when the field is being added (nil → set) and we
+	// want to reject that direction too.
+	// +optional
+	TLS *EtcdClusterTLS `json:"tls,omitempty"`
 }
 
 // ObservedClusterSpec is the locked-in target the controller is currently
