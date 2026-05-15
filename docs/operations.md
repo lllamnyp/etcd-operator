@@ -535,9 +535,12 @@ The hardcoded `--endpoints=http://localhost:2379` examples elsewhere in this doc
 POD=$(kubectl get pod -l etcd.lllamnyp.su/cluster=<cluster> -n <ns> \
   -o jsonpath='{.items[0].metadata.name}')
 
-# Copy the operator-client cert into the Pod for an exec-side etcdctl.
-# Or use any client cert signed by a CA in --trusted-ca-file.
-kubectl cp <ns>/<some-client-cert-dir> "<ns>/$POD:/tmp/cli"
+# Stage a client cert+key inside the Pod for an exec-side etcdctl. Any
+# client cert signed by a CA in /etc/etcd/tls/client/ca.crt works; the
+# operator-client cert is a convenient one because it's already issued.
+# `kubectl cp` takes a local source path (the directory holding tls.crt
+# and tls.key) and writes into the Pod at the destination path.
+kubectl cp ./client-cert-dir "<ns>/$POD:/tmp/cli"
 
 kubectl exec -n <ns> "$POD" -- etcdctl \
   --endpoints=https://localhost:2379 \
@@ -551,12 +554,17 @@ For server-TLS-only clusters, drop `--cert` and `--key`.
 
 ### Cert rotation (Phase 1)
 
-The operator does NOT watch the referenced Secrets. To rotate a cert:
+The operator does NOT watch the referenced Secrets. What rotation needs depends on which material changed, because Go's `crypto/tls` re-reads some files per handshake and bakes others into an `*x509.CertPool` at config time:
 
-1. Update the Secret (`kubectl apply -f new-server-tls.yaml`). The new PEM appears in the mounted volume within a kubelet refresh cycle (~60s), but etcd reads the cert files at startup and won't pick up the change.
-2. Restart Pods one at a time: `kubectl delete pod <member-pod-name>`. Wait for the new Pod to be Ready, etcd to rejoin its cluster, and `member list` to show all members healthy before restarting the next one.
+| Material | Re-read live? | Rotation procedure |
+|---|---|---|
+| `tls.crt` / `tls.key` in `serverSecretRef` (etcd's `--cert-file` / `--key-file`) | **Yes.** Wired through `tls.Config.GetCertificate`; etcd re-loads the files on every new TLS handshake. | Update the Secret. New connections pick up the new cert within a kubelet refresh cycle (~60s for the mounted volume to project). Existing keepalive connections continue with the old cert until they cycle naturally. No restart needed. |
+| `tls.crt` / `tls.key` in peer `secretRef` (etcd's `--peer-cert-file` / `--peer-key-file`) | **Yes**, same mechanism. | Same as above. |
+| `ca.crt` in `serverSecretRef` (etcd's `--trusted-ca-file`) | **No.** Loaded into an `x509.CertPool` at etcd startup and held in memory. | Update the Secret, then bounce each Pod one at a time (`kubectl delete pod <member-pod-name>`; wait for `Ready` and `member list` to confirm the rejoin before continuing). |
+| `ca.crt` in peer `secretRef` (etcd's `--peer-trusted-ca-file`) | **No**, same reason. | Same as above. |
+| `tls.crt` / `tls.key` / `ca.crt` in `operatorClientSecretRef` (operator-side, not mounted into etcd Pods) | **Yes** — the operator rebuilds its `*tls.Config` from the Secret on every reconcile, so all three rotate without an operator restart. | Update the Secret. The change takes effect on the next reconcile (~30s on idle, immediately on event-driven triggers). |
 
-A future operator version will watch Secrets and roll Pods automatically on RV change.
+When in doubt: certs + keys are hot-swappable; trust bundles (the `ca.crt` consumed *as a trust anchor*) need a Pod restart. A future operator version will watch the Secrets and roll Pods on RV change so the trust-bundle case is automated too.
 
 ### Toggling TLS on or off after create
 

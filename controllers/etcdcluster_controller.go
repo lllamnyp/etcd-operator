@@ -266,23 +266,32 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// no-op if none.
 	if cluster.Status.ClusterID != "" && len(running) > 0 {
 		endpoints := memberEndpoints(clusterClientScheme(cluster), running, cluster.Name, cluster.Namespace)
-		tlsCfg, err := buildOperatorTLSConfig(ctx, r.Client, cluster)
-		if err != nil {
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-		}
-		etcdClient, err := r.EtcdClientFactory(ctx, endpoints, tlsCfg)
-		if err == nil {
-			defer etcdClient.Close()
-			res, perr := r.promotePendingLearner(ctx, cluster, running, etcdClient, endpoints)
-			if perr != nil {
-				return ctrl.Result{}, perr
+		tlsCfg, tlsErr := buildOperatorTLSConfig(ctx, r.Client, cluster)
+		if tlsErr != nil {
+			// Don't bail out of the whole reconcile — updateStatus
+			// below still has useful work (PDB reconcile, cached-
+			// status fields). Just skip the promote attempt and
+			// surface the error so a missing/typo'd TLS Secret is
+			// debuggable without rg-ing through silent retries.
+			log.Error(tlsErr, "cannot build operator TLS config for promote-after-converged; skipping promotion this pass")
+		} else {
+			etcdClient, err := r.EtcdClientFactory(ctx, endpoints, tlsCfg)
+			if err != nil {
+				log.Error(err, "cannot dial etcd for promote-after-converged; skipping promotion this pass", "endpoints", endpoints)
+			} else {
+				defer etcdClient.Close()
+				res, perr := r.promotePendingLearner(ctx, cluster, running, etcdClient, endpoints)
+				if perr != nil {
+					return ctrl.Result{}, perr
+				}
+				if res != nil {
+					return *res, nil
+				}
 			}
-			if res != nil {
-				return *res, nil
-			}
 		}
-		// If we couldn't build a client, fall through to updateStatus —
-		// the next reconcile will retry.
+		// Fall through to updateStatus — the next reconcile will retry
+		// promotion. This matches scaleUp's "log and continue" behaviour
+		// when the etcd client can't be built.
 	}
 
 	// ── Steady state ───────────────────────────────────────────────────
