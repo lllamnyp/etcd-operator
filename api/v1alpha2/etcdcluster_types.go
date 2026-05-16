@@ -164,6 +164,25 @@ type StorageSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="spec.storage.medium is immutable; delete and recreate the cluster to change the storage backend"
 	// +optional
 	Medium StorageMedium `json:"medium,omitempty"`
+
+	// StorageClassName selects the StorageClass for the per-member PVC.
+	// Mirrors corev1.PersistentVolumeClaimSpec.StorageClassName semantics:
+	// nil (the default) uses the namespace's default StorageClass; the
+	// empty string explicitly disables dynamic provisioning (a
+	// pre-provisioned PV must already match the PVC selector); any other
+	// value names a specific StorageClass.
+	//
+	// Ignored when Medium=Memory (no PVC is created).
+	//
+	// Immutable post-create — PersistentVolumeClaim.spec.storageClassName
+	// is itself immutable after PVC creation, so honouring a mid-life
+	// change would require a rolling PVC-recreation flow that this
+	// operator does not perform. The immutability rules live at the
+	// EtcdClusterSpec level (alongside the other pointer-field rules)
+	// because *string transition CEL on the inner field cannot fire when
+	// the field is being added from nil.
+	// +optional
+	StorageClassName *string `json:"storageClassName,omitempty"`
 }
 
 // EtcdClusterSpec defines the desired state of an etcd cluster.
@@ -185,6 +204,8 @@ type StorageSpec struct {
 // +kubebuilder:validation:XValidation:rule="!(has(self.storage) && has(self.storage.medium) && self.storage.medium == 'Memory') || quantity(string(self.storage.size)).isGreaterThan(quantity('0'))",message="spec.storage.size must be > 0 when spec.storage.medium=Memory (the tmpfs sizeLimit cannot be zero)."
 // +kubebuilder:validation:XValidation:rule="has(self.tls) == has(oldSelf.tls)",message="spec.tls cannot be added to or removed from an existing cluster; delete and recreate"
 // +kubebuilder:validation:XValidation:rule="!has(self.tls) || !has(oldSelf.tls) || self.tls == oldSelf.tls",message="spec.tls is immutable post-create; delete and recreate the cluster to change TLS configuration"
+// +kubebuilder:validation:XValidation:rule="has(self.storage.storageClassName) == has(oldSelf.storage.storageClassName)",message="spec.storage.storageClassName cannot be added to or removed from an existing cluster; delete and recreate"
+// +kubebuilder:validation:XValidation:rule="!has(self.storage.storageClassName) || !has(oldSelf.storage.storageClassName) || self.storage.storageClassName == oldSelf.storage.storageClassName",message="spec.storage.storageClassName is immutable post-create (a PVC's storageClassName itself is immutable, and the operator does not roll PVCs); delete and recreate the cluster to change the StorageClass"
 type EtcdClusterSpec struct {
 	// Replicas is the desired number of cluster members. Should be odd.
 	// A value of 0 parks the cluster ("scale to zero"): the operator

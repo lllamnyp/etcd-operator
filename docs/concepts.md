@@ -123,12 +123,14 @@ The single exception is the steady-state call to `updateStatus`, which receives 
 
 ## Storage
 
-Each member's data dir is configured via `spec.storage`, a struct with `size` and `medium`. The medium chooses between a PVC and a tmpfs `emptyDir`; the locking pattern protects size and medium just like `replicas` and `version` — a mid-flight flip is locked out until the current target is reached or the deadline expires.
+Each member's data dir is configured via `spec.storage`, a struct with `size`, `medium`, and an optional `storageClassName`. The medium chooses between a PVC and a tmpfs `emptyDir`; the locking pattern protects size and medium just like `replicas` and `version` — a mid-flight flip is locked out until the current target is reached or the deadline expires.
 
 | `spec.storage.medium` | Backend | Lifetime | Pod loss → |
 |---|---|---|---|
-| `""` (default) | PVC; namespace's default `StorageClass`; `ReadWriteOnce` | Survives Pod restart, eviction, node failure (re-attached to new Pod). | Same Pod / new Pod re-uses existing data dir; etcd rejoins with the same member ID and `ClusterID`. |
+| `""` (default) | PVC; `spec.storage.storageClassName` if set, else the namespace default; `ReadWriteOnce` | Survives Pod restart, eviction, node failure (re-attached to new Pod). | Same Pod / new Pod re-uses existing data dir; etcd rejoins with the same member ID and `ClusterID`. |
 | `"Memory"` | `emptyDir{medium: Memory}` with `sizeLimit: spec.storage.size` | Bound to the Pod. Container restart preserves tmpfs; Pod deletion / eviction / node failure destroys it. | Operator detects Pod loss via recorded `Status.PodUID`, self-deletes the `EtcdMember`, finalizer calls `MemberRemove`, scale-up gap-fill creates a replacement with a fresh member ID. |
+
+`spec.storage.storageClassName` mirrors the corev1 PVC field of the same name: **nil** uses the namespace's default `StorageClass`, the **empty string** explicitly disables dynamic provisioning (a pre-provisioned PV must already match), any other value names a specific `StorageClass`. It's immutable post-create — `PersistentVolumeClaim.spec.storageClassName` is itself immutable, so there is no in-place change a controller could honour without rolling every PVC. Ignored when `medium=Memory` (no PVC is created).
 
 ### Why memory-backed is opt-in
 
@@ -172,6 +174,8 @@ Four CEL `x-kubernetes-validations` rules on `EtcdClusterSpec` are evaluated at 
 | `replicas: 0` + `storage.medium: Memory` rejected | CREATE + UPDATE | The pause path deletes the Pod, the tmpfs evaporates, and resume would silently produce an empty data dir; etcd refuses to start. |
 | `storage.size > 0` when `storage.medium: Memory` | CREATE + UPDATE | Zero `storage.size` produces an unbounded tmpfs `SizeLimit` against node memory. |
 | `storage.size` cannot shrink | UPDATE | PVCs cannot shrink and tmpfs `SizeLimit` reduction does not free allocated memory. |
+| `storage.storageClassName` cannot be added or removed | UPDATE | `PersistentVolumeClaim.spec.storageClassName` is immutable; honouring a mid-life add/remove would require rolling every PVC. |
+| `storage.storageClassName` value immutable | UPDATE | Same reason — the StorageClass chosen at cluster creation is the only one PVCs will ever carry. |
 | `tls` cannot be added or removed | UPDATE | Toggling TLS on an existing cluster is a rolling restart that has to land on the operator's etcd client and every member Pod in lockstep; not implemented. |
 | `tls` subtree immutable | UPDATE | Same reason — secret-ref swaps, mTLS-flip via `operatorClientSecretRef`, peer-only ↔ both toggles are all in-place rolling changes that v1 doesn't perform. |
 

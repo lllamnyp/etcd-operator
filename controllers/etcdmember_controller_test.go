@@ -357,6 +357,73 @@ func TestEnsurePVC_AcceptsOwnPVC(t *testing.T) {
 	}
 }
 
+// TestEnsurePVC_AppliesStorageClassName covers the wiring of
+// spec.storage.storageClassName onto the created PVC. The propagation
+// is what makes per-cluster StorageClass overrides actually take effect
+// — a member spec with the field set must result in
+// PersistentVolumeClaim.spec.storageClassName carrying the same value.
+func TestEnsurePVC_AppliesStorageClassName(t *testing.T) {
+	ctx := context.Background()
+	sc := "replicated"
+	member := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", UID: types.UID("mu"), Labels: memberLabels("test", "test-0")},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName: "test", Version: "3.5.17",
+			Storage:        lll.StorageSpec{Size: quickQty(t, "1Gi"), StorageClassName: &sc},
+			InitialCluster: "x", ClusterToken: "test",
+		},
+	}
+	c, _ := newTestClient(t, member)
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t)}
+
+	if err := r.ensurePVC(ctx, member); err != nil {
+		t.Fatalf("ensurePVC: %v", err)
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "data-test-0"}, pvc); err != nil {
+		t.Fatalf("PVC not created: %v", err)
+	}
+	if pvc.Spec.StorageClassName == nil {
+		t.Fatalf("PVC.spec.storageClassName is nil; want %q", sc)
+	}
+	if *pvc.Spec.StorageClassName != sc {
+		t.Fatalf("PVC.spec.storageClassName = %q; want %q", *pvc.Spec.StorageClassName, sc)
+	}
+}
+
+// TestEnsurePVC_NilStorageClassNamePassesNil covers the negative case:
+// when spec.storage.storageClassName is unset on the member, the
+// resulting PVC must have a nil StorageClassName (which means "use the
+// namespace's default"), NOT an empty string (which means "explicitly
+// no dynamic provisioning"). Conflating the two would silently disable
+// dynamic provisioning on clusters that didn't ask for it.
+func TestEnsurePVC_NilStorageClassNamePassesNil(t *testing.T) {
+	ctx := context.Background()
+	member := &lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", UID: types.UID("mu"), Labels: memberLabels("test", "test-0")},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName: "test", Version: "3.5.17",
+			Storage:        lll.StorageSpec{Size: quickQty(t, "1Gi")}, // StorageClassName left nil.
+			InitialCluster: "x", ClusterToken: "test",
+		},
+	}
+	c, _ := newTestClient(t, member)
+	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t)}
+
+	if err := r.ensurePVC(ctx, member); err != nil {
+		t.Fatalf("ensurePVC: %v", err)
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "data-test-0"}, pvc); err != nil {
+		t.Fatalf("PVC not created: %v", err)
+	}
+	if pvc.Spec.StorageClassName != nil {
+		t.Fatalf("PVC.spec.storageClassName must be nil when not set on the member; got %q", *pvc.Spec.StorageClassName)
+	}
+}
+
 // TestEnsurePod_RefusesStaleOwner mirrors TestEnsurePVC_RefusesStaleOwner:
 // a same-named Pod owned by a now-deleted EtcdMember (pending GC) must
 // not be adopted by the fresh EtcdMember of the same name. Less severe

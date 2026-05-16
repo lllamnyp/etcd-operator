@@ -9,7 +9,7 @@ For the operator's runtime behaviour see [concepts](concepts.md); for day-2 oper
 | Requirement | Note |
 |---|---|
 | Kubernetes | 1.29+ recommended: CEL CRD validation went GA in 1.29 and the `quantity()` CEL extension (used by two of the operator's validation rules) was added in 1.28. 1.28 *may* work in practice because the CEL gate was beta-on-by-default from 1.25, but is not covered by CI. |
-| Default `StorageClass` | Every per-member PVC uses the namespace's default `StorageClass`. |
+| Default `StorageClass` | Each per-member PVC uses the namespace's default `StorageClass`. Override per-cluster via `spec.storage.storageClassName` (a string naming a specific `StorageClass`, or `""` to disable dynamic provisioning entirely). Immutable post-create — Kubernetes PVCs cannot have their StorageClass swapped in place. |
 | Go (build-from-source only) | 1.25+, matches `go.mod`'s `toolchain` directive. |
 | Docker / buildx (build-from-source only) | For producing the operator image. The Dockerfile uses `golang:1.25.10` for the builder and `gcr.io/distroless/static:nonroot` for runtime. |
 
