@@ -123,12 +123,12 @@ The single exception is the steady-state call to `updateStatus`, which receives 
 
 ## Storage
 
-Each member's data dir is backed by one of two volume types, selected per-cluster via `spec.storageMedium`. The locking pattern protects the medium just like `replicas` and `version` — a mid-flight flip is locked out until the current target is reached or the deadline expires.
+Each member's data dir is configured via `spec.storage`, a struct with `size` and `medium`. The medium chooses between a PVC and a tmpfs `emptyDir`; the locking pattern protects size and medium just like `replicas` and `version` — a mid-flight flip is locked out until the current target is reached or the deadline expires.
 
-| `spec.storageMedium` | Backend | Lifetime | Pod loss → |
+| `spec.storage.medium` | Backend | Lifetime | Pod loss → |
 |---|---|---|---|
-| `""` (default) | PVC, default `StorageClass`, `ReadWriteOnce` | Survives Pod restart, eviction, node failure (re-attached to new Pod). | Same Pod / new Pod re-uses existing data dir; etcd rejoins with the same member ID and `ClusterID`. |
-| `"Memory"` | `emptyDir{medium: Memory}` with `sizeLimit: spec.storage` | Bound to the Pod. Container restart preserves tmpfs; Pod deletion / eviction / node failure destroys it. | Operator detects Pod loss via recorded `Status.PodUID`, self-deletes the `EtcdMember`, finalizer calls `MemberRemove`, scale-up gap-fill creates a replacement with a fresh member ID. |
+| `""` (default) | PVC; namespace's default `StorageClass`; `ReadWriteOnce` | Survives Pod restart, eviction, node failure (re-attached to new Pod). | Same Pod / new Pod re-uses existing data dir; etcd rejoins with the same member ID and `ClusterID`. |
+| `"Memory"` | `emptyDir{medium: Memory}` with `sizeLimit: spec.storage.size` | Bound to the Pod. Container restart preserves tmpfs; Pod deletion / eviction / node failure destroys it. | Operator detects Pod loss via recorded `Status.PodUID`, self-deletes the `EtcdMember`, finalizer calls `MemberRemove`, scale-up gap-fill creates a replacement with a fresh member ID. |
 
 ### Why memory-backed is opt-in
 
@@ -168,10 +168,10 @@ Four CEL `x-kubernetes-validations` rules on `EtcdClusterSpec` are evaluated at 
 
 | Rule | When | Why |
 |---|---|---|
-| `storageMedium` immutable | UPDATE | Flipping the medium would orphan the previous PVC (or tmpfs); rolling-migrate is not implemented. |
-| `replicas: 0` + `storageMedium: Memory` rejected | CREATE + UPDATE | The pause path deletes the Pod, the tmpfs evaporates, and resume would silently produce an empty data dir; etcd refuses to start. |
-| `storage > 0` when `storageMedium: Memory` | CREATE + UPDATE | Zero `Storage` produces an unbounded tmpfs `SizeLimit` against node memory. |
-| `storage` cannot shrink | UPDATE | PVCs cannot shrink and tmpfs `SizeLimit` reduction does not free allocated memory. |
+| `storage.medium` immutable | UPDATE | Flipping the medium would orphan the previous PVC (or tmpfs); rolling-migrate is not implemented. |
+| `replicas: 0` + `storage.medium: Memory` rejected | CREATE + UPDATE | The pause path deletes the Pod, the tmpfs evaporates, and resume would silently produce an empty data dir; etcd refuses to start. |
+| `storage.size > 0` when `storage.medium: Memory` | CREATE + UPDATE | Zero `storage.size` produces an unbounded tmpfs `SizeLimit` against node memory. |
+| `storage.size` cannot shrink | UPDATE | PVCs cannot shrink and tmpfs `SizeLimit` reduction does not free allocated memory. |
 | `tls` cannot be added or removed | UPDATE | Toggling TLS on an existing cluster is a rolling restart that has to land on the operator's etcd client and every member Pod in lockstep; not implemented. |
 | `tls` subtree immutable | UPDATE | Same reason — secret-ref swaps, mTLS-flip via `operatorClientSecretRef`, peer-only ↔ both toggles are all in-place rolling changes that v1 doesn't perform. |
 

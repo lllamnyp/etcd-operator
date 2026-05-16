@@ -347,13 +347,12 @@ func (r *EtcdClusterReconciler) bootstrap(
 				Labels:       clusterLabels(cluster.Name),
 			},
 			Spec: lll.EtcdMemberSpec{
-				ClusterName:   cluster.Name,
-				Version:       cluster.Status.Observed.Version,
-				Storage:       cluster.Status.Observed.Storage,
-				StorageMedium: cluster.Status.Observed.StorageMedium,
-				Bootstrap:     true,
-				ClusterToken:  cluster.Status.ClusterToken,
-				TLS:           deriveMemberTLS(cluster),
+				ClusterName:  cluster.Name,
+				Version:      cluster.Status.Observed.Version,
+				Storage:      cluster.Status.Observed.Storage,
+				Bootstrap:    true,
+				ClusterToken: cluster.Status.ClusterToken,
+				TLS:          deriveMemberTLS(cluster),
 				// InitialCluster filled in below once apiserver assigns Name.
 			},
 		}
@@ -656,13 +655,12 @@ func (r *EtcdClusterReconciler) scaleUp(
 			Labels:       clusterLabels(cluster.Name),
 		},
 		Spec: lll.EtcdMemberSpec{
-			ClusterName:   cluster.Name,
-			Version:       cluster.Status.Observed.Version,
-			Storage:       cluster.Status.Observed.Storage,
-			StorageMedium: cluster.Status.Observed.StorageMedium,
-			Bootstrap:     false,
-			ClusterToken:  cluster.Status.ClusterToken,
-			TLS:           deriveMemberTLS(cluster),
+			ClusterName:  cluster.Name,
+			Version:      cluster.Status.Observed.Version,
+			Storage:      cluster.Status.Observed.Storage,
+			Bootstrap:    false,
+			ClusterToken: cluster.Status.ClusterToken,
+			TLS:          deriveMemberTLS(cluster),
 			// InitialCluster filled in by completePendingMember below.
 		},
 	}
@@ -1032,7 +1030,7 @@ func (r *EtcdClusterReconciler) updateStatus(
 		//   - dormant + PVC-backed: a member existed, was paused, its PVC
 		//     is preserved; scale-up resumes the same etcd cluster.
 		//   - dormant + memory-backed: the CRD's CEL admission rule now
-		//     rejects replicas=0 + storageMedium=Memory on Create/Update,
+		//     rejects replicas=0 + storage.medium=Memory on Create/Update,
 		//     but a cluster paused before the rule was installed (operator
 		//     upgrade on a pre-existing dormant memory cluster) still
 		//     reaches this branch. The tmpfs went with the Pod and there
@@ -1046,7 +1044,7 @@ func (r *EtcdClusterReconciler) updateStatus(
 		//     message would mislead.
 		var msg string
 		switch {
-		case dormant != nil && dormant.Spec.StorageMedium == lll.StorageMediumMemory:
+		case dormant != nil && dormant.Spec.Storage.Medium == lll.StorageMediumMemory:
 			msg = "cluster is paused (spec.replicas=0); data was on tmpfs and has been lost — recreate the cluster to resume"
 		case dormant != nil:
 			msg = fmt.Sprintf("cluster is paused (spec.replicas=0); data is preserved on PVC data-%s", dormant.Name)
@@ -1444,10 +1442,9 @@ func snapshotSpecIntoObserved(cluster *lll.EtcdCluster) {
 		replicas = *cluster.Spec.Replicas
 	}
 	cluster.Status.Observed = &lll.ObservedClusterSpec{
-		Replicas:      replicas,
-		Version:       cluster.Spec.Version,
-		Storage:       cluster.Spec.Storage,
-		StorageMedium: cluster.Spec.StorageMedium,
+		Replicas: replicas,
+		Version:  cluster.Spec.Version,
+		Storage:  cluster.Spec.Storage,
 	}
 }
 
@@ -1462,8 +1459,8 @@ func specEqualsObserved(cluster *lll.EtcdCluster) bool {
 	o := cluster.Status.Observed
 	return o.Replicas == specReplicas &&
 		o.Version == cluster.Spec.Version &&
-		o.Storage.Cmp(cluster.Spec.Storage) == 0 &&
-		o.StorageMedium == cluster.Spec.StorageMedium
+		o.Storage.Size.Cmp(cluster.Spec.Storage.Size) == 0 &&
+		o.Storage.Medium == cluster.Spec.Storage.Medium
 }
 
 func reconciliationComplete(cluster *lll.EtcdCluster, members []lll.EtcdMember) bool {

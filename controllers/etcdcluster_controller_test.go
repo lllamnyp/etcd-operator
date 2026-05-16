@@ -66,7 +66,7 @@ func TestBootstrap_CreatesSingleSeedMember(t *testing.T) {
 		Spec: lll.EtcdClusterSpec{
 			Replicas: ptrInt32(5),
 			Version:  "3.5.17",
-			Storage:  quickQty(t, "1Gi"),
+			Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 	}
 	c, _ := newTestClient(t, cluster)
@@ -119,7 +119,7 @@ func TestObservedSpec_LocksMidFlight(t *testing.T) {
 		Spec: lll.EtcdClusterSpec{
 			Replicas: ptrInt32(3),
 			Version:  "3.5.17",
-			Storage:  quickQty(t, "1Gi"),
+			Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "ns-test-x",
@@ -127,7 +127,7 @@ func TestObservedSpec_LocksMidFlight(t *testing.T) {
 			Observed: &lll.ObservedClusterSpec{
 				Replicas: 3,
 				Version:  "3.5.17",
-				Storage:  quickQty(t, "1Gi"),
+				Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
 		},
@@ -171,7 +171,7 @@ func TestDeadlineExceeded_BootstrapTerminal(t *testing.T) {
 		Spec: lll.EtcdClusterSpec{
 			Replicas: ptrInt32(5), // user already tried to "fix"
 			Version:  "3.5.17",
-			Storage:  quickQty(t, "1Gi"),
+			Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "test",
@@ -179,7 +179,7 @@ func TestDeadlineExceeded_BootstrapTerminal(t *testing.T) {
 			Observed: &lll.ObservedClusterSpec{
 				Replicas: 3,
 				Version:  "3.5.17",
-				Storage:  quickQty(t, "1Gi"),
+				Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(-1)}, // expired
 		},
@@ -220,7 +220,7 @@ func TestDeadlineExceeded_SteadyStateWaitsForSpecUpdate(t *testing.T) {
 		Spec: lll.EtcdClusterSpec{
 			Replicas: ptrInt32(7),
 			Version:  "3.5.17",
-			Storage:  quickQty(t, "1Gi"),
+			Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "test",
@@ -228,7 +228,7 @@ func TestDeadlineExceeded_SteadyStateWaitsForSpecUpdate(t *testing.T) {
 			Observed: &lll.ObservedClusterSpec{
 				Replicas: 7, // spec == observed, deadline still expired
 				Version:  "3.5.17",
-				Storage:  quickQty(t, "1Gi"),
+				Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(-1)},
 		},
@@ -269,7 +269,7 @@ func TestDeadlineExceeded_SteadyStateRetriesOnSpecUpdate(t *testing.T) {
 		Spec: lll.EtcdClusterSpec{
 			Replicas: ptrInt32(5), // user just edited spec down
 			Version:  "3.5.17",
-			Storage:  quickQty(t, "1Gi"),
+			Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "test",
@@ -277,7 +277,7 @@ func TestDeadlineExceeded_SteadyStateRetriesOnSpecUpdate(t *testing.T) {
 			Observed: &lll.ObservedClusterSpec{
 				Replicas: 100, // failed scale-up target
 				Version:  "3.5.17",
-				Storage:  quickQty(t, "1Gi"),
+				Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(-1)},
 		},
@@ -322,14 +322,14 @@ func TestTryDiscoverCluster_SurfacesUnreachableEtcd(t *testing.T) {
 		Spec: lll.EtcdClusterSpec{
 			Replicas: ptrInt32(3),
 			Version:  "3.5.17",
-			Storage:  quickQty(t, "1Gi"),
+			Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "test",
 			Observed: &lll.ObservedClusterSpec{
 				Replicas: 3,
 				Version:  "3.5.17",
-				Storage:  quickQty(t, "1Gi"),
+				Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(60 * 60 * 1e9)},
 		},
@@ -342,7 +342,7 @@ func TestTryDiscoverCluster_SurfacesUnreachableEtcd(t *testing.T) {
 				Namespace: "ns",
 				Labels:    memberLabels("test", fmt.Sprintf("test-%d", i)),
 			},
-			Spec: lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"), InitialCluster: "x", ClusterToken: "test"},
+			Spec: lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")}, InitialCluster: "x", ClusterToken: "test"},
 		}
 		_ = m
 	}
@@ -357,7 +357,7 @@ func TestTryDiscoverCluster_SurfacesUnreachableEtcd(t *testing.T) {
 			// test-0 is the seed (Bootstrap=true); the others are scale-up
 			// peers. With GenerateName the names are arbitrary — the
 			// Bootstrap flag is what makes test-0 discoverable as the seed.
-			Spec: lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"), InitialCluster: "x", ClusterToken: "test", Bootstrap: i == 0},
+			Spec: lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")}, InitialCluster: "x", ClusterToken: "test", Bootstrap: i == 0},
 			// PodName set: we want to exercise the "etcd unreachable" branch,
 			// not the new "waiting for seed pod" gate.
 			Status: lll.EtcdMemberStatus{PodName: fmt.Sprintf("test-%d", i)},
@@ -402,7 +402,7 @@ func TestUpdateStatus_SurfacesBrokenCount(t *testing.T) {
 		Spec: lll.EtcdClusterSpec{
 			Replicas: ptrInt32(3),
 			Version:  "3.5.17",
-			Storage:  quickQty(t, "1Gi"),
+			Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "test",
@@ -410,7 +410,7 @@ func TestUpdateStatus_SurfacesBrokenCount(t *testing.T) {
 			Observed: &lll.ObservedClusterSpec{
 				Replicas: 3,
 				Version:  "3.5.17",
-				Storage:  quickQty(t, "1Gi"),
+				Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(60 * 60 * 1e9)},
 		},
@@ -424,7 +424,7 @@ func TestUpdateStatus_SurfacesBrokenCount(t *testing.T) {
 				Namespace: "ns",
 				Labels:    memberLabels("test", fmt.Sprintf("test-%d", i)),
 			},
-			Spec: lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"), InitialCluster: "x", ClusterToken: "test"},
+			Spec: lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")}, InitialCluster: "x", ClusterToken: "test"},
 			Status: lll.EtcdMemberStatus{
 				MemberID: "abc",
 				Conditions: []metav1.Condition{{
@@ -471,7 +471,7 @@ func TestScaleUp_AdoptsPendingCRAndRetriesAdd(t *testing.T) {
 		Spec: lll.EtcdClusterSpec{
 			Replicas: ptrInt32(4),
 			Version:  "3.5.17",
-			Storage:  quickQty(t, "1Gi"),
+			Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "test",
@@ -479,7 +479,7 @@ func TestScaleUp_AdoptsPendingCRAndRetriesAdd(t *testing.T) {
 			Observed: &lll.ObservedClusterSpec{
 				Replicas: 4,
 				Version:  "3.5.17",
-				Storage:  quickQty(t, "1Gi"),
+				Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
 		},
@@ -492,7 +492,7 @@ func TestScaleUp_AdoptsPendingCRAndRetriesAdd(t *testing.T) {
 				Namespace: "ns",
 				Labels:    memberLabels("test", fmt.Sprintf("test-%d", i)),
 			},
-			Spec:   lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"), InitialCluster: "x", ClusterToken: "test"},
+			Spec:   lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")}, InitialCluster: "x", ClusterToken: "test"},
 			Status: lll.EtcdMemberStatus{PodName: fmt.Sprintf("test-%d", i)},
 		})
 	}
@@ -507,7 +507,7 @@ func TestScaleUp_AdoptsPendingCRAndRetriesAdd(t *testing.T) {
 			}},
 		},
 		Spec: lll.EtcdMemberSpec{
-			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			ClusterToken: "test",
 			// InitialCluster intentionally empty.
 		},
@@ -570,7 +570,7 @@ func TestBootstrap_Idempotent(t *testing.T) {
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "ns-test-x",
 			Observed: &lll.ObservedClusterSpec{
-				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+				Replicas: 3, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 		},
 	}
@@ -588,7 +588,7 @@ func TestBootstrap_Idempotent(t *testing.T) {
 			}},
 		},
 		Spec: lll.EtcdMemberSpec{
-			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			Bootstrap: true, InitialCluster: buildInitialCluster("http", []string{seedName}, "test", "ns"),
 			ClusterToken: "ns-test-x",
 		},
@@ -620,7 +620,7 @@ func TestBootstrap_CompletesPendingSeed(t *testing.T) {
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "ns-test-x",
 			Observed: &lll.ObservedClusterSpec{
-				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+				Replicas: 3, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 		},
 	}
@@ -638,7 +638,7 @@ func TestBootstrap_CompletesPendingSeed(t *testing.T) {
 			}},
 		},
 		Spec: lll.EtcdMemberSpec{
-			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			Bootstrap:    true, // crash-recovery: InitialCluster intentionally empty
 			ClusterToken: "ns-test-x",
 		},
@@ -677,7 +677,7 @@ func TestBootstrap_RejectsStaleSeed(t *testing.T) {
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "ns-test-x",
 			Observed: &lll.ObservedClusterSpec{
-				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+				Replicas: 3, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 		},
 	}
@@ -694,7 +694,7 @@ func TestBootstrap_RejectsStaleSeed(t *testing.T) {
 			}},
 		},
 		Spec: lll.EtcdMemberSpec{
-			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			Bootstrap: true, InitialCluster: buildInitialCluster("http", []string{"test-stalez"}, "test", "ns"),
 			ClusterToken: "ns-test-x",
 		},
@@ -719,13 +719,13 @@ func TestScaleUp_WaitsForInFlightDeletion(t *testing.T) {
 		Spec: lll.EtcdClusterSpec{
 			Replicas: ptrInt32(5),
 			Version:  "3.5.17",
-			Storage:  quickQty(t, "1Gi"),
+			Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "ns-test-x",
 			ClusterID:    "deadbeef",
 			Observed: &lll.ObservedClusterSpec{
-				Replicas: 5, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+				Replicas: 5, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
 		},
@@ -786,13 +786,13 @@ func TestScaleDown_PicksMostRecentlyCreatedVictim(t *testing.T) {
 		Spec: lll.EtcdClusterSpec{
 			Replicas: ptrInt32(3),
 			Version:  "3.5.17",
-			Storage:  quickQty(t, "1Gi"),
+			Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "ns-test-x",
 			ClusterID:    "deadbeef",
 			Observed: &lll.ObservedClusterSpec{
-				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+				Replicas: 3, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
 		},
@@ -861,13 +861,13 @@ func TestScaleDown_OneToZeroPatchesDormant(t *testing.T) {
 		Spec: lll.EtcdClusterSpec{
 			Replicas: ptrInt32(0),
 			Version:  "3.5.17",
-			Storage:  quickQty(t, "1Gi"),
+			Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "ns-test-x",
 			ClusterID:    "deadbeef",
 			Observed: &lll.ObservedClusterSpec{
-				Replicas: 0, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+				Replicas: 0, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
 		},
@@ -912,13 +912,13 @@ func TestScaleUp_WakesFromDormant(t *testing.T) {
 		Spec: lll.EtcdClusterSpec{
 			Replicas: ptrInt32(1),
 			Version:  "3.5.17",
-			Storage:  quickQty(t, "1Gi"),
+			Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "ns-test-x",
 			ClusterID:    "deadbeef",
 			Observed: &lll.ObservedClusterSpec{
-				Replicas: 1, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+				Replicas: 1, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
 		},
@@ -929,7 +929,7 @@ func TestScaleUp_WakesFromDormant(t *testing.T) {
 			Labels: memberLabels("test", "test-saved1"),
 		},
 		Spec: lll.EtcdMemberSpec{
-			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			InitialCluster: buildInitialCluster("http", []string{"test-saved1"}, "test", "ns"),
 			ClusterToken:   "ns-test-x", Bootstrap: true, Dormant: true,
 		},
@@ -970,13 +970,13 @@ func TestUpdateStatus_PausedClusterReportsPausedCondition(t *testing.T) {
 		Spec: lll.EtcdClusterSpec{
 			Replicas: ptrInt32(0),
 			Version:  "3.5.17",
-			Storage:  quickQty(t, "1Gi"),
+			Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "ns-test-x",
 			ClusterID:    "deadbeef",
 			Observed: &lll.ObservedClusterSpec{
-				Replicas: 0, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+				Replicas: 0, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 		},
 	}
@@ -1029,14 +1029,14 @@ func TestUpdateStatus_PausedFreshZeroMessageDifferentiates(t *testing.T) {
 		Spec: lll.EtcdClusterSpec{
 			Replicas: ptrInt32(0),
 			Version:  "3.5.17",
-			Storage:  quickQty(t, "1Gi"),
+			Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "ns-test-x",
 			// No ClusterID (never bootstrapped), no DormantMember (never
 			// had a live member to park).
 			Observed: &lll.ObservedClusterSpec{
-				Replicas: 0, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+				Replicas: 0, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 		},
 	}
@@ -1079,28 +1079,25 @@ func TestUpdateStatus_PausedMessageHonestForMemoryMember(t *testing.T) {
 	cluster := &lll.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: "ns"},
 		Spec: lll.EtcdClusterSpec{
-			Replicas:      ptrInt32(0),
-			Version:       "3.5.17",
-			Storage:       quickQty(t, "128Mi"),
-			StorageMedium: lll.StorageMediumMemory,
+			Replicas: ptrInt32(0),
+			Version:  "3.5.17",
+			Storage:  lll.StorageSpec{Size: quickQty(t, "128Mi"), Medium: lll.StorageMediumMemory},
 		},
 		Status: lll.EtcdClusterStatus{
 			Observed: &lll.ObservedClusterSpec{
-				Replicas:      0,
-				Version:       "3.5.17",
-				Storage:       quickQty(t, "128Mi"),
-				StorageMedium: lll.StorageMediumMemory,
+				Replicas: 0,
+				Version:  "3.5.17",
+				Storage:  lll.StorageSpec{Size: quickQty(t, "128Mi"), Medium: lll.StorageMediumMemory},
 			},
 		},
 	}
 	dormant := &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "c-x", Namespace: "ns", Labels: memberLabels("c", "c-x")},
 		Spec: lll.EtcdMemberSpec{
-			ClusterName:   "c",
-			Version:       "3.5.17",
-			Storage:       quickQty(t, "128Mi"),
-			StorageMedium: lll.StorageMediumMemory,
-			Dormant:       true,
+			ClusterName: "c",
+			Version:     "3.5.17",
+			Storage:     lll.StorageSpec{Size: quickQty(t, "128Mi"), Medium: lll.StorageMediumMemory},
+			Dormant:     true,
 		},
 	}
 	c, _ := newTestClient(t, cluster, dormant)
@@ -1141,7 +1138,7 @@ func TestReconcile_FreshZeroReplicasSkipsBootstrap(t *testing.T) {
 		Spec: lll.EtcdClusterSpec{
 			Replicas: ptrInt32(0),
 			Version:  "3.5.17",
-			Storage:  quickQty(t, "1Gi"),
+			Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 	}
 	c, _ := newTestClient(t, cluster)
@@ -1187,7 +1184,7 @@ func TestReconcile_FreshZeroToOneAdoptsNewSpec(t *testing.T) {
 		Spec: lll.EtcdClusterSpec{
 			Replicas: ptrInt32(0),
 			Version:  "3.5.17",
-			Storage:  quickQty(t, "1Gi"),
+			Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 	}
 	c, _ := newTestClient(t, cluster)
@@ -1241,13 +1238,13 @@ func TestReconcile_PausedDormantMessageNamesPVC(t *testing.T) {
 		Spec: lll.EtcdClusterSpec{
 			Replicas: ptrInt32(0),
 			Version:  "3.5.17",
-			Storage:  quickQty(t, "1Gi"),
+			Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "ns-test-x",
 			ClusterID:    "deadbeef",
 			Observed: &lll.ObservedClusterSpec{
-				Replicas: 0, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+				Replicas: 0, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 		},
 	}
@@ -1257,7 +1254,7 @@ func TestReconcile_PausedDormantMessageNamesPVC(t *testing.T) {
 			Labels: memberLabels("test", "test-saved1"),
 		},
 		Spec: lll.EtcdMemberSpec{
-			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			InitialCluster: buildInitialCluster("http", []string{"test-saved1"}, "test", "ns"),
 			ClusterToken:   "ns-test-x", Bootstrap: true, Dormant: true,
 		},
@@ -1301,13 +1298,13 @@ func TestReconcile_DormantToOneAdoptsNewSpec(t *testing.T) {
 		Spec: lll.EtcdClusterSpec{
 			Replicas: ptrInt32(1),
 			Version:  "3.5.17",
-			Storage:  quickQty(t, "1Gi"),
+			Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "ns-test-x",
 			ClusterID:    "deadbeef",
 			Observed: &lll.ObservedClusterSpec{
-				Replicas: 0, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+				Replicas: 0, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 		},
 	}
@@ -1317,7 +1314,7 @@ func TestReconcile_DormantToOneAdoptsNewSpec(t *testing.T) {
 			Labels: memberLabels("test", "test-saved1"),
 		},
 		Spec: lll.EtcdMemberSpec{
-			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			InitialCluster: buildInitialCluster("http", []string{"test-saved1"}, "test", "ns"),
 			ClusterToken:   "ns-test-x", Bootstrap: true, Dormant: true,
 		},
@@ -1355,7 +1352,7 @@ func TestScaleDown_WaitsForInFlightDeletion(t *testing.T) {
 		Spec: lll.EtcdClusterSpec{
 			Replicas: ptrInt32(1),
 			Version:  "3.5.17",
-			Storage:  quickQty(t, "1Gi"),
+			Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "test",
@@ -1363,7 +1360,7 @@ func TestScaleDown_WaitsForInFlightDeletion(t *testing.T) {
 			Observed: &lll.ObservedClusterSpec{
 				Replicas: 1,
 				Version:  "3.5.17",
-				Storage:  quickQty(t, "1Gi"),
+				Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
 		},
@@ -1378,7 +1375,7 @@ func TestScaleDown_WaitsForInFlightDeletion(t *testing.T) {
 				Namespace: "ns",
 				Labels:    memberLabels("test", fmt.Sprintf("test-%d", i)),
 			},
-			Spec:   lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"), InitialCluster: "x", ClusterToken: "test"},
+			Spec:   lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")}, InitialCluster: "x", ClusterToken: "test"},
 			Status: lll.EtcdMemberStatus{PodName: fmt.Sprintf("test-%d", i), MemberID: "abc", Conditions: []metav1.Condition{{Type: lll.MemberReady, Status: metav1.ConditionTrue, Reason: "PodReady", LastTransitionTime: now}}},
 		}
 		if i == 4 {
@@ -1454,12 +1451,12 @@ func TestTryDiscoverCluster_RejectsPartialMembership(t *testing.T) {
 	cluster := &lll.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
 		Spec: lll.EtcdClusterSpec{
-			Replicas: ptrInt32(3), Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			Replicas: ptrInt32(3), Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "ns-test-x",
 			Observed: &lll.ObservedClusterSpec{
-				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+				Replicas: 3, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
 		},
@@ -1494,12 +1491,12 @@ func TestTryDiscoverCluster_LatchesOnValidResponse(t *testing.T) {
 	cluster := &lll.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
 		Spec: lll.EtcdClusterSpec{
-			Replicas: ptrInt32(3), Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			Replicas: ptrInt32(3), Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "ns-test-x",
 			Observed: &lll.ObservedClusterSpec{
-				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+				Replicas: 3, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
 		},
@@ -1537,12 +1534,12 @@ func TestDeadlineExceeded_NoChurnWhenSteady(t *testing.T) {
 		Spec: lll.EtcdClusterSpec{
 			Replicas: ptrInt32(3),
 			Version:  "3.5.17",
-			Storage:  quickQty(t, "1Gi"),
+			Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "test",
 			Observed: &lll.ObservedClusterSpec{
-				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+				Replicas: 3, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 			ProgressDeadline: &past,
 			Conditions: []metav1.Condition{
@@ -1579,12 +1576,12 @@ func TestTryDiscoverCluster_FindsSeedByBootstrapFlag(t *testing.T) {
 	cluster := &lll.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
 		Spec: lll.EtcdClusterSpec{
-			Replicas: ptrInt32(3), Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			Replicas: ptrInt32(3), Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "ns-test-x",
 			Observed: &lll.ObservedClusterSpec{
-				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+				Replicas: 3, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
 		},
@@ -1624,7 +1621,7 @@ func TestTryDiscoverCluster_EmptySliceDoesNotPanic(t *testing.T) {
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "ns-test-x",
 			Observed: &lll.ObservedClusterSpec{
-				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+				Replicas: 3, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
 		},
@@ -1732,7 +1729,7 @@ func TestReconcile_FirstPassInitsTokenAndObserved(t *testing.T) {
 	cluster := &lll.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns", UID: types.UID("uid-1")},
 		Spec: lll.EtcdClusterSpec{
-			Replicas: ptrInt32(3), Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			Replicas: ptrInt32(3), Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 	}
 	c, _ := newTestClient(t, cluster)
@@ -1759,13 +1756,13 @@ func TestScaleUp_WaitsForAllMembersReady(t *testing.T) {
 	cluster := &lll.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
 		Spec: lll.EtcdClusterSpec{
-			Replicas: ptrInt32(5), Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			Replicas: ptrInt32(5), Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "ns-test-x",
 			ClusterID:    "deadbeef",
 			Observed: &lll.ObservedClusterSpec{
-				Replicas: 5, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+				Replicas: 5, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
 		},
@@ -1819,7 +1816,7 @@ func TestScaleUp_InitialClusterMatchesEtcdMembership(t *testing.T) {
 			ClusterToken: "ns-test-x",
 			ClusterID:    "deadbeef",
 			Observed: &lll.ObservedClusterSpec{
-				Replicas: 4, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+				Replicas: 4, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
 		},
@@ -1848,7 +1845,7 @@ func TestScaleUp_InitialClusterMatchesEtcdMembership(t *testing.T) {
 			}},
 		},
 		Spec: lll.EtcdMemberSpec{
-			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			ClusterToken: "ns-test-x",
 			// InitialCluster intentionally empty — that's the pending state.
 		},
@@ -1915,13 +1912,13 @@ func TestScaleUp_RecoversFromCrashBetweenAddAndPatch(t *testing.T) {
 	cluster := &lll.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns", UID: types.UID("cluster-uid")},
 		Spec: lll.EtcdClusterSpec{
-			Replicas: ptrInt32(4), Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			Replicas: ptrInt32(4), Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "ns-test-x",
 			ClusterID:    "deadbeef",
 			Observed: &lll.ObservedClusterSpec{
-				Replicas: 4, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+				Replicas: 4, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
 		},
@@ -1947,7 +1944,7 @@ func TestScaleUp_RecoversFromCrashBetweenAddAndPatch(t *testing.T) {
 			}},
 		},
 		Spec: lll.EtcdMemberSpec{
-			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			ClusterToken: "ns-test-x",
 		},
 	}
@@ -1988,7 +1985,7 @@ func TestScaleUp_AddsAsLearner(t *testing.T) {
 			ClusterToken: "ns-test-x",
 			ClusterID:    "deadbeef",
 			Observed: &lll.ObservedClusterSpec{
-				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+				Replicas: 3, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
 		},
@@ -2051,7 +2048,7 @@ func TestScaleUp_PromotesExistingLearner(t *testing.T) {
 			ClusterToken: "ns-test-x",
 			ClusterID:    "deadbeef",
 			Observed: &lll.ObservedClusterSpec{
-				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+				Replicas: 3, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
 		},
@@ -2101,13 +2098,13 @@ func TestReconcile_PromotesLearnerWhenCurrentEqualsDesired(t *testing.T) {
 	cluster := &lll.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
 		Spec: lll.EtcdClusterSpec{
-			Replicas: ptrInt32(3), Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			Replicas: ptrInt32(3), Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "ns-test-x",
 			ClusterID:    "deadbeef",
 			Observed: &lll.ObservedClusterSpec{
-				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+				Replicas: 3, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
 		},
@@ -2153,7 +2150,7 @@ func TestReconcile_ShortCircuitsOnDeletion(t *testing.T) {
 			Finalizers:        []string{"keep-me-alive"}, // fake client refuses to track delete-with-zero-finalizers
 		},
 		Spec: lll.EtcdClusterSpec{
-			Replicas: ptrInt32(3), Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			Replicas: ptrInt32(3), Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 	}
 	c, _ := newTestClient(t, cluster)
@@ -2182,14 +2179,14 @@ func TestClusterUpdateStatus_NoChurnInSteadyState(t *testing.T) {
 	cluster := &lll.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
 		Spec: lll.EtcdClusterSpec{
-			Replicas: ptrInt32(3), Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			Replicas: ptrInt32(3), Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "ns-test-x",
 			ClusterID:    "0000000000000abc",
 			ReadyMembers: 3,
 			Observed: &lll.ObservedClusterSpec{
-				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+				Replicas: 3, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 			Conditions: []metav1.Condition{
 				{Type: lll.ClusterAvailable, Status: metav1.ConditionTrue, Reason: "QuorumHealthy", Message: "All members are ready", LastTransitionTime: now},
@@ -2237,7 +2234,7 @@ func TestTryDiscoverCluster_NoChurnOnSameError(t *testing.T) {
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "ns-test-x",
 			Observed: &lll.ObservedClusterSpec{
-				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+				Replicas: 3, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
 		},
@@ -2285,7 +2282,7 @@ func TestTryDiscoverCluster_WaitingForSeed(t *testing.T) {
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "ns-test-x",
 			Observed: &lll.ObservedClusterSpec{
-				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+				Replicas: 3, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
 		},
@@ -2336,7 +2333,7 @@ func TestTryDiscoverCluster_LatchesAvailableTrueOnSuccess(t *testing.T) {
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "ns-test-x",
 			Observed: &lll.ObservedClusterSpec{
-				Replicas: 3, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+				Replicas: 3, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 			ProgressDeadline: &metav1.Time{Time: metav1.Now().Add(time.Hour)},
 			Conditions: []metav1.Condition{{
@@ -2379,8 +2376,8 @@ func TestTryDiscoverCluster_LatchesAvailableTrueOnSuccess(t *testing.T) {
 var _ = etcdserverpb.Member{}
 
 // TestBootstrap_PropagatesStorageMediumToSeed verifies the wiring:
-// EtcdCluster.spec.storageMedium=Memory must end up on the seed
-// EtcdMember's spec and on Status.Observed.StorageMedium (so the
+// EtcdCluster.spec.storage.medium=Memory must end up on the seed
+// EtcdMember's spec and on Status.Observed.Storage.Medium (so the
 // locking pattern protects subsequent reconciles from a mid-flight
 // medium flip).
 //
@@ -2392,10 +2389,9 @@ func TestBootstrap_PropagatesStorageMediumToSeed(t *testing.T) {
 	cluster := &lll.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
 		Spec: lll.EtcdClusterSpec{
-			Replicas:      ptrInt32(3),
-			Version:       "3.5.17",
-			Storage:       quickQty(t, "256Mi"),
-			StorageMedium: lll.StorageMediumMemory,
+			Replicas: ptrInt32(3),
+			Version:  "3.5.17",
+			Storage:  lll.StorageSpec{Size: quickQty(t, "256Mi"), Medium: lll.StorageMediumMemory},
 		},
 	}
 	c, _ := newTestClient(t, cluster)
@@ -2408,8 +2404,8 @@ func TestBootstrap_PropagatesStorageMediumToSeed(t *testing.T) {
 	if got.Status.Observed == nil {
 		t.Fatalf("Status.Observed must be set after first reconciles")
 	}
-	if got.Status.Observed.StorageMedium != lll.StorageMediumMemory {
-		t.Fatalf("Observed.StorageMedium = %q, want %q", got.Status.Observed.StorageMedium, lll.StorageMediumMemory)
+	if got.Status.Observed.Storage.Medium != lll.StorageMediumMemory {
+		t.Fatalf("Observed.Storage.Medium = %q, want %q", got.Status.Observed.Storage.Medium, lll.StorageMediumMemory)
 	}
 
 	// Seed EtcdMember must inherit the medium.
@@ -2420,14 +2416,14 @@ func TestBootstrap_PropagatesStorageMediumToSeed(t *testing.T) {
 	if len(members.Items) != 1 {
 		t.Fatalf("expected exactly one seed member; got %d", len(members.Items))
 	}
-	if members.Items[0].Spec.StorageMedium != lll.StorageMediumMemory {
-		t.Fatalf("seed Spec.StorageMedium = %q, want %q",
-			members.Items[0].Spec.StorageMedium, lll.StorageMediumMemory)
+	if members.Items[0].Spec.Storage.Medium != lll.StorageMediumMemory {
+		t.Fatalf("seed Spec.Storage.Medium = %q, want %q",
+			members.Items[0].Spec.Storage.Medium, lll.StorageMediumMemory)
 	}
 }
 
 // TestSpecEqualsObserved_StorageMediumMatters guards the locking pattern:
-// flipping spec.storageMedium with an unchanged observed must be treated
+// flipping spec.storage.medium with an unchanged observed must be treated
 // as "spec differs from observed" so the deadline gate fires when the
 // in-flight target is reached. Without this the user could change the
 // medium mid-flight and the operator would silently lock the old value
@@ -2435,28 +2431,26 @@ func TestBootstrap_PropagatesStorageMediumToSeed(t *testing.T) {
 func TestSpecEqualsObserved_StorageMediumMatters(t *testing.T) {
 	cluster := &lll.EtcdCluster{
 		Spec: lll.EtcdClusterSpec{
-			Replicas:      ptrInt32(3),
-			Version:       "3.5.17",
-			Storage:       quickQty(t, "1Gi"),
-			StorageMedium: lll.StorageMediumMemory,
+			Replicas: ptrInt32(3),
+			Version:  "3.5.17",
+			Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi"), Medium: lll.StorageMediumMemory},
 		},
 		Status: lll.EtcdClusterStatus{
 			Observed: &lll.ObservedClusterSpec{
-				Replicas:      3,
-				Version:       "3.5.17",
-				Storage:       quickQty(t, "1Gi"),
-				StorageMedium: lll.StorageMediumDefault, // mismatch
+				Replicas: 3,
+				Version:  "3.5.17",
+				Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi"), Medium: lll.StorageMediumDefault}, // mismatch
 			},
 		},
 	}
 	if specEqualsObserved(cluster) {
-		t.Fatalf("specEqualsObserved must return false when StorageMedium differs")
+		t.Fatalf("specEqualsObserved must return false when storage.medium differs")
 	}
 
 	// Match restored — should be true.
-	cluster.Status.Observed.StorageMedium = lll.StorageMediumMemory
+	cluster.Status.Observed.Storage.Medium = lll.StorageMediumMemory
 	if !specEqualsObserved(cluster) {
-		t.Fatalf("specEqualsObserved must return true when all fields including StorageMedium match")
+		t.Fatalf("specEqualsObserved must return true when all fields including storage.medium match")
 	}
 }
 
@@ -2642,7 +2636,7 @@ func TestBootstrap_PreStampsSeedIsVoter(t *testing.T) {
 		Spec: lll.EtcdClusterSpec{
 			Replicas: ptrInt32(3),
 			Version:  "3.5.17",
-			Storage:  quickQty(t, "1Gi"),
+			Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 		},
 	}
 	c, _ := newTestClient(t, cluster)

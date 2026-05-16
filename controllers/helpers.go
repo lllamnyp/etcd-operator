@@ -264,7 +264,7 @@ func deriveClusterToken(cluster *lll.EtcdCluster) string {
 // rather than expected. For PVC-backed members the predicate stays a
 // stub.
 func (r *EtcdClusterReconciler) isBroken(m lll.EtcdMember) bool {
-	if m.Spec.StorageMedium == lll.StorageMediumMemory {
+	if m.Spec.Storage.Medium == lll.StorageMediumMemory {
 		return m.Status.PodUID != "" && m.Status.PodName == ""
 	}
 	return false

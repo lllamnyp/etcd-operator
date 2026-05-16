@@ -275,7 +275,7 @@ Key signals:
 
 ## Memory-backed clusters
 
-Opt-in via `spec.storageMedium: Memory`. Each member's data dir is a tmpfs `emptyDir` whose lifetime is the Pod's. Suits reconstructable workloads only — see [concepts](concepts.md#storage) for the model and trade-offs.
+Opt-in via `spec.storage.medium: Memory`. Each member's data dir is a tmpfs `emptyDir` whose lifetime is the Pod's. Suits reconstructable workloads only — see [concepts](concepts.md#storage) for the model and trade-offs.
 
 ### Create a memory-backed cluster
 
@@ -289,12 +289,13 @@ metadata:
 spec:
   replicas: 3
   version: 3.5.17
-  storage: 256Mi
-  storageMedium: Memory
+  storage:
+    size: 256Mi
+    medium: Memory
 EOF
 ```
 
-`storage` now defines the tmpfs `SizeLimit`, not a PVC capacity. Pick it generously — etcd's WAL plus the keyspace plus a buffer for compaction. 256Mi is enough for sub-MB keyspaces; bump it for anything load-bearing.
+`storage.size` now defines the tmpfs `SizeLimit`, not a PVC capacity. Pick it generously — etcd's WAL plus the keyspace plus a buffer for compaction. 256Mi is enough for sub-MB keyspaces; bump it for anything load-bearing.
 
 ### Verify it's actually using tmpfs
 
@@ -351,7 +352,7 @@ The `PodDisruptionBudget` is auto-emitted now (see [Draining nodes](#draining-no
      limits:
        - type: Container
          default:
-           memory: 512Mi   # >= spec.storage + ~128Mi for etcd headroom
+           memory: 512Mi   # >= spec.storage.size + ~128Mi for etcd headroom
    ```
 
    Without this, tmpfs writes count against node memory not the pod's cgroup, the pod is in BestEffort/Burstable QoS, and it is first in line for eviction under pressure — the exact failure mode that destroys memory members.
@@ -383,7 +384,7 @@ Setting `spec.replicas: 0` on a memory cluster is **rejected by the apiserver** 
 kubectl patch etcdcluster.lllamnyp.su my-mem-etcd -n default --type=merge \
   -p '{"spec":{"replicas":0}}'
 # The EtcdCluster "my-mem-etcd" is invalid: spec: Invalid value: ...:
-#   spec.replicas=0 with spec.storageMedium=Memory is unsupported: ...
+#   spec.replicas=0 with spec.storage.medium=Memory is unsupported: ...
 ```
 
 Pausing a memory cluster would wedge it on resume (Pod deleted → tmpfs gone → wake path treats the empty data dir as preserved → etcd refuses to start). To tear a memory cluster down, delete the `EtcdCluster` and recreate it.
@@ -513,7 +514,8 @@ metadata:
 spec:
   replicas: 3
   version: 3.5.17
-  storage: 1Gi
+  storage:
+    size: 1Gi
   tls:
     client:
       serverSecretRef:

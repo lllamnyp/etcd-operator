@@ -9,7 +9,7 @@ For the operator's runtime behaviour see [concepts](concepts.md); for day-2 oper
 | Requirement | Note |
 |---|---|
 | Kubernetes | 1.29+ recommended: CEL CRD validation went GA in 1.29 and the `quantity()` CEL extension (used by two of the operator's validation rules) was added in 1.28. 1.28 *may* work in practice because the CEL gate was beta-on-by-default from 1.25, but is not covered by CI. |
-| Default `StorageClass` | The sample manifests omit `storageClassName` and rely on the namespace's default. Override per-cluster if you need a specific class. |
+| Default `StorageClass` | Every per-member PVC uses the namespace's default `StorageClass`. |
 | Go (build-from-source only) | 1.25+, matches `go.mod`'s `toolchain` directive. |
 | Docker / buildx (build-from-source only) | For producing the operator image. The Dockerfile uses `golang:1.25.10` for the builder and `gcr.io/distroless/static:nonroot` for runtime. |
 
@@ -76,7 +76,8 @@ metadata:
 spec:
   replicas: 3
   version: 3.5.17
-  storage: 1Gi
+  storage:
+    size: 1Gi
 EOF
 ```
 
@@ -112,8 +113,9 @@ metadata:
 spec:
   replicas: 3
   version: 3.5.17
-  storage: 256Mi       # tmpfs SizeLimit per member
-  storageMedium: Memory
+  storage:
+    size: 256Mi          # tmpfs SizeLimit per member
+    medium: Memory
 ```
 
 This trades durability for speed: a Pod that loses its tmpfs (eviction, node failure) loses its data and the member is automatically replaced via `MemberRemove` + scale-up. **Don't use it as a general-purpose etcd backend** — see [docs/concepts.md](concepts.md#storage) and [docs/operations.md](operations.md#memory-backed-clusters) for the full trade-off. The remaining production hardening gaps (anti-affinity, container memory limits) are tracked in [#16](https://github.com/lllamnyp/etcd-operator/issues/16). The apiserver rejects `replicas: 0` on memory clusters via the [CEL validation rules](concepts.md#apiserver-enforced-validation), and every cluster gets an auto-emitted [PodDisruptionBudget](concepts.md#poddisruptionbudget).

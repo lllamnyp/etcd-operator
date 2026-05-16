@@ -95,7 +95,7 @@ func validCluster(name string) *lll.EtcdCluster {
 		Spec: lll.EtcdClusterSpec{
 			Replicas: ptr32(3),
 			Version:  "3.5.17",
-			Storage:  resource.MustParse("128Mi"),
+			Storage:  lll.StorageSpec{Size: resource.MustParse("128Mi")},
 		},
 	}
 }

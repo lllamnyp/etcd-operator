@@ -134,7 +134,7 @@ func (r *EtcdMemberReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// Terminating until quorum returns. That is the correct outcome for
 	// memory-backed clusters: the cluster is dead and the user has to
 	// recreate.
-	if member.Spec.StorageMedium == lll.StorageMediumMemory && member.Status.PodUID != "" {
+	if member.Spec.Storage.Medium == lll.StorageMediumMemory && member.Status.PodUID != "" {
 		lost, err := r.memoryMemberPodLost(ctx, member)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -333,7 +333,7 @@ func (r *EtcdMemberReconciler) ensurePVC(ctx context.Context, member *lll.EtcdMe
 	// the Pod, not in a PVC. Skip both the create and the ownership check;
 	// the Pod's volume source is the only consumer of Spec.Storage in
 	// that mode.
-	if member.Spec.StorageMedium == lll.StorageMediumMemory {
+	if member.Spec.Storage.Medium == lll.StorageMediumMemory {
 		member.Status.PVCName = ""
 		return nil
 	}
@@ -369,7 +369,7 @@ func (r *EtcdMemberReconciler) ensurePVC(ctx context.Context, member *lll.EtcdMe
 			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
-					corev1.ResourceStorage: member.Spec.Storage,
+					corev1.ResourceStorage: member.Spec.Storage.Size,
 				},
 			},
 		},
@@ -557,12 +557,12 @@ func (r *EtcdMemberReconciler) buildPod(member *lll.EtcdMember) *corev1.Pod {
 	// resources.limits.memory (tracked in
 	// https://github.com/lllamnyp/etcd-operator/issues/16).
 	var dataVolumeSource corev1.VolumeSource
-	if member.Spec.StorageMedium == lll.StorageMediumMemory {
-		storage := member.Spec.Storage
+	if member.Spec.Storage.Medium == lll.StorageMediumMemory {
+		size := member.Spec.Storage.Size
 		dataVolumeSource = corev1.VolumeSource{
 			EmptyDir: &corev1.EmptyDirVolumeSource{
 				Medium:    corev1.StorageMediumMemory,
-				SizeLimit: &storage,
+				SizeLimit: &size,
 			},
 		}
 	} else {
@@ -749,7 +749,7 @@ func (r *EtcdMemberReconciler) updateStatus(ctx context.Context, member *lll.Etc
 		changed = true
 	}
 	// Memory-backed members have no PVC; leave Status.PVCName empty.
-	if member.Spec.StorageMedium != lll.StorageMediumMemory {
+	if member.Spec.Storage.Medium != lll.StorageMediumMemory {
 		wantPVC := "data-" + member.Name
 		if member.Status.PVCName != wantPVC {
 			member.Status.PVCName = wantPVC

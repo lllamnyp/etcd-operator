@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [ master ]
+  push:
+    branches: [ master ]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: codegen drift
+        # If a contributor edits an API type without re-running codegen,
+        # this gate catches it before CRDs and deepcopy ship out of sync
+        # with the Go types. Runs before `make test` so the as-committed
+        # state of generated files is what we check.
+        run: |
+          make generate manifests
+          if ! git diff --quiet --exit-code; then
+            echo "::error::codegen is out of date; run 'make generate manifests' and commit the result"
+            git --no-pager diff
+            exit 1
+          fi
+
+      - name: make test
+        # `make test` runs fmt, vet, downloads envtest assets via
+        # setup-envtest, exports KUBEBUILDER_ASSETS, and runs the whole
+        # suite — including the CEL envtest cases in api/v1alpha2
+        # which silently skip when KUBEBUILDER_ASSETS is unset.
+        run: make test

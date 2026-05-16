@@ -18,7 +18,6 @@ package v1alpha2
 
 import (
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -66,16 +65,11 @@ type EtcdMemberSpec struct {
 	// +kubebuilder:validation:Pattern=`^\d+\.\d+\.\d+$`
 	Version string `json:"version"`
 
-	// Storage is the requested size for this member's data directory. For
-	// StorageMedium="" this is the PVC's requested capacity; for
-	// StorageMedium="Memory" this is the tmpfs emptyDir's SizeLimit.
-	Storage resource.Quantity `json:"storage"`
-
-	// StorageMedium selects the volume backend for this member's data
-	// directory. Mirrors EtcdCluster.spec.storageMedium at the time this
-	// member was created and is not edited afterwards.
-	// +optional
-	StorageMedium StorageMedium `json:"storageMedium,omitempty"`
+	// Storage mirrors EtcdCluster.spec.storage at the time this member
+	// was created. The cluster controller copies size and medium onto
+	// each member at creation; the member controller treats it as
+	// immutable per-member spec.
+	Storage StorageSpec `json:"storage"`
 
 	// Bootstrap indicates this member is part of the initial cluster formation.
 	// When true the member starts with --initial-cluster-state=new.

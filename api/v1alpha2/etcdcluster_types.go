@@ -139,23 +139,50 @@ const (
 	StorageMediumMemory StorageMedium = "Memory"
 )
 
+// StorageSpec configures the per-member data directory.
+type StorageSpec struct {
+	// Size is the requested capacity per member. For Medium="" (PVC) this
+	// is the PVC's requested storage. For Medium="Memory" this is the
+	// tmpfs emptyDir's SizeLimit.
+	//
+	// Shrinking is rejected on UPDATE: PVCs cannot shrink and tmpfs
+	// SizeLimit reduction does not free already-allocated memory.
+	// +kubebuilder:default="1Gi"
+	// +kubebuilder:validation:XValidation:rule="quantity(string(self)).compareTo(quantity(string(oldSelf))) >= 0",message="spec.storage.size cannot be shrunk"
+	// +optional
+	Size resource.Quantity `json:"size,omitempty"`
+
+	// Medium selects the volume backend: "" (PVC) or "Memory" (tmpfs
+	// emptyDir). See the StorageMedium type doc for operational trade-offs.
+	//
+	// Immutable: changing the medium on an existing cluster would orphan
+	// the previous PVC (or tmpfs) and the rolling-migrate path is not
+	// implemented. The default ("") is set explicitly so the apiserver
+	// always stores the field on Create — without it, a first-time set
+	// from absent → Memory would slip past the transition rule.
+	// +kubebuilder:default=""
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="spec.storage.medium is immutable; delete and recreate the cluster to change the storage backend"
+	// +optional
+	Medium StorageMedium `json:"medium,omitempty"`
+}
+
 // EtcdClusterSpec defines the desired state of an etcd cluster.
 //
 // CEL validation rules (k8s 1.29+ apiserver-enforced; both
 // CustomResourceValidationExpressions and the quantity() extension
 // are GA in 1.29):
 //
-//   - StorageMedium=Memory + Replicas=0 wedges the cluster on resume
+//   - storage.medium=Memory + replicas=0 wedges the cluster on resume
 //     (the dormant flip deletes the Pod and the tmpfs goes with it but
 //     the resume path treats the member as if its data were preserved).
 //     Reject the combination outright; recreate is the only safe path.
 //
-//   - StorageMedium=Memory requires Storage > 0. Without a SizeLimit the
-//     tmpfs is unbounded against node memory, which defeats the whole
+//   - storage.medium=Memory requires storage.size > 0. Without a SizeLimit
+//     the tmpfs is unbounded against node memory, which defeats the whole
 //     point of opting into memory backing.
 //
-// +kubebuilder:validation:XValidation:rule="!(has(self.replicas) && self.replicas == 0 && has(self.storageMedium) && self.storageMedium == 'Memory')",message="spec.replicas=0 with spec.storageMedium=Memory is unsupported: pausing a memory-backed cluster wedges on resume. Delete and recreate the cluster instead."
-// +kubebuilder:validation:XValidation:rule="!(has(self.storageMedium) && self.storageMedium == 'Memory') || quantity(string(self.storage)).isGreaterThan(quantity('0'))",message="spec.storage must be > 0 when spec.storageMedium=Memory (the tmpfs sizeLimit cannot be zero)."
+// +kubebuilder:validation:XValidation:rule="!(has(self.replicas) && self.replicas == 0 && has(self.storage) && has(self.storage.medium) && self.storage.medium == 'Memory')",message="spec.replicas=0 with spec.storage.medium=Memory is unsupported: pausing a memory-backed cluster wedges on resume. Delete and recreate the cluster instead."
+// +kubebuilder:validation:XValidation:rule="!(has(self.storage) && has(self.storage.medium) && self.storage.medium == 'Memory') || quantity(string(self.storage.size)).isGreaterThan(quantity('0'))",message="spec.storage.size must be > 0 when spec.storage.medium=Memory (the tmpfs sizeLimit cannot be zero)."
 // +kubebuilder:validation:XValidation:rule="has(self.tls) == has(oldSelf.tls)",message="spec.tls cannot be added to or removed from an existing cluster; delete and recreate"
 // +kubebuilder:validation:XValidation:rule="!has(self.tls) || !has(oldSelf.tls) || self.tls == oldSelf.tls",message="spec.tls is immutable post-create; delete and recreate the cluster to change TLS configuration"
 type EtcdClusterSpec struct {
@@ -176,38 +203,13 @@ type EtcdClusterSpec struct {
 	// +kubebuilder:validation:Pattern=`^\d+\.\d+\.\d+$`
 	Version string `json:"version"`
 
-	// Storage is the requested size per member for the etcd data directory.
-	// For StorageMedium="" (PVC) this is the PVC's requested capacity backed by
-	// the default StorageClass. For StorageMedium="Memory" this is the tmpfs
-	// emptyDir's SizeLimit.
-	//
-	// Shrinking is rejected on UPDATE: PVCs cannot shrink and tmpfs SizeLimit
-	// reduction does not free already-allocated memory.
-	// +kubebuilder:default="1Gi"
-	// +kubebuilder:validation:XValidation:rule="quantity(string(self)).compareTo(quantity(string(oldSelf))) >= 0",message="spec.storage cannot be shrunk"
+	// Storage configures the per-member data directory: size and medium
+	// (PVC or tmpfs). The size shrink-rejection and medium immutability
+	// rules live as field-level CEL on the inner fields; the spec-level
+	// CEL above couples replicas and storage.medium.
+	// +kubebuilder:default={size: "1Gi", medium: ""}
 	// +optional
-	Storage resource.Quantity `json:"storage,omitempty"`
-
-	// StorageMedium selects the volume backend for each member's data
-	// directory. Empty string (the default) means a PVC; "Memory" means a
-	// tmpfs emptyDir whose lifetime is bound to the Pod. See the
-	// StorageMedium type doc for the operational trade-offs.
-	//
-	// Immutable: changing the medium on an existing cluster would orphan the
-	// previous PVC (or tmpfs) and the rolling-migrate path is not implemented.
-	// Pausing a memory-backed cluster (Replicas=0 + Memory) is rejected by
-	// the EtcdClusterSpec-level CEL rules above — the tmpfs evaporates with
-	// the Pod and resume would silently produce an empty data dir.
-	//
-	// The default ("") is set explicitly (rather than relying on Go's zero
-	// value) so the apiserver always stores the field on Create. This makes
-	// `oldSelf` present on Update, which the CEL transition rule below
-	// requires — without the default, a first-time set from absent → Memory
-	// would slip past the immutability check.
-	// +kubebuilder:default=""
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="spec.storageMedium is immutable; delete and recreate the cluster to change the storage backend"
-	// +optional
-	StorageMedium StorageMedium `json:"storageMedium,omitempty"`
+	Storage StorageSpec `json:"storage,omitempty"`
 
 	// ProgressDeadlineSeconds bounds the time the operator spends trying to
 	// reach a desired state before abandoning the in-flight target and
@@ -241,14 +243,12 @@ type ObservedClusterSpec struct {
 	// Version is the locked target etcd version.
 	Version string `json:"version"`
 
-	// Storage is the locked target data-directory size.
-	Storage resource.Quantity `json:"storage"`
-
-	// StorageMedium is the locked target storage backend. The locking
-	// pattern prevents a mid-flight medium flip from being honoured until
-	// the current target is reached or its deadline expires.
-	// +optional
-	StorageMedium StorageMedium `json:"storageMedium,omitempty"`
+	// Storage is the locked target storage configuration. The locking
+	// pattern prevents a mid-flight size grow from being honoured until
+	// the current target is reached or its deadline expires. (Medium
+	// can't change at all post-create — that's enforced by spec-level
+	// CEL.)
+	Storage StorageSpec `json:"storage"`
 }
 
 // EtcdClusterStatus defines the observed state of an etcd cluster.
