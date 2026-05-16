@@ -42,7 +42,7 @@ func TestCEL_StorageMediumImmutable(t *testing.T) {
 	ctx := context.Background()
 
 	c := validCluster("immut-medium")
-	c.Spec.StorageMedium = lll.StorageMediumDefault
+	c.Spec.Storage.Medium = lll.StorageMediumDefault
 	if err := k8s.Create(ctx, c); err != nil {
 		t.Fatalf("Create initial PVC-backed cluster: %v", err)
 	}
@@ -53,12 +53,12 @@ func TestCEL_StorageMediumImmutable(t *testing.T) {
 	if err := k8s.Get(ctx, ctrlclient.ObjectKeyFromObject(c), got); err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	got.Spec.StorageMedium = lll.StorageMediumMemory
+	got.Spec.Storage.Medium = lll.StorageMediumMemory
 	err := k8s.Update(ctx, got)
 	if err == nil {
-		t.Fatalf("apiserver accepted storageMedium flip; expected rejection")
+		t.Fatalf("apiserver accepted storage.medium flip; expected rejection")
 	}
-	if !strings.Contains(err.Error(), "spec.storageMedium is immutable") {
+	if !strings.Contains(err.Error(), "spec.storage.medium is immutable") {
 		t.Fatalf("error did not mention immutability: %v", err)
 	}
 }
@@ -68,15 +68,15 @@ func TestCEL_StorageMustBeNonZeroForMemoryOnCreate(t *testing.T) {
 	ctx := context.Background()
 
 	c := validCluster("memstore-zero")
-	c.Spec.StorageMedium = lll.StorageMediumMemory
-	c.Spec.Storage = resource.MustParse("0")
+	c.Spec.Storage.Medium = lll.StorageMediumMemory
+	c.Spec.Storage.Size = resource.MustParse("0")
 
 	err := k8s.Create(ctx, c)
 	if err == nil {
 		_ = k8s.Delete(ctx, c)
 		t.Fatalf("apiserver accepted storage=0 with medium=Memory; expected rejection")
 	}
-	if !strings.Contains(err.Error(), "spec.storage must be > 0") {
+	if !strings.Contains(err.Error(), "spec.storage.size must be > 0") {
 		t.Fatalf("error did not mention non-zero storage requirement: %v", err)
 	}
 }
@@ -87,7 +87,7 @@ func TestCEL_ReplicasZeroWithMemoryRejected(t *testing.T) {
 
 	// Create-time rejection.
 	c := validCluster("zero-mem-create")
-	c.Spec.StorageMedium = lll.StorageMediumMemory
+	c.Spec.Storage.Medium = lll.StorageMediumMemory
 	c.Spec.Replicas = ptr32(0)
 
 	err := k8s.Create(ctx, c)
@@ -95,13 +95,13 @@ func TestCEL_ReplicasZeroWithMemoryRejected(t *testing.T) {
 		_ = k8s.Delete(ctx, c)
 		t.Fatalf("apiserver accepted replicas=0 + Memory on Create; expected rejection")
 	}
-	if !strings.Contains(err.Error(), "replicas=0 with spec.storageMedium=Memory") {
+	if !strings.Contains(err.Error(), "replicas=0 with spec.storage.medium=Memory") {
 		t.Fatalf("error did not mention replicas+Memory rejection on Create: %v", err)
 	}
 
 	// Update-time rejection: start at 3+Memory, scale to 0 → must be rejected.
 	live := validCluster("zero-mem-update")
-	live.Spec.StorageMedium = lll.StorageMediumMemory
+	live.Spec.Storage.Medium = lll.StorageMediumMemory
 	live.Spec.Replicas = ptr32(3)
 	if err := k8s.Create(ctx, live); err != nil {
 		t.Fatalf("Create baseline memory cluster: %v", err)
@@ -117,7 +117,7 @@ func TestCEL_ReplicasZeroWithMemoryRejected(t *testing.T) {
 	if err == nil {
 		t.Fatalf("apiserver accepted replicas: 3→0 on memory cluster; expected rejection")
 	}
-	if !strings.Contains(err.Error(), "replicas=0 with spec.storageMedium=Memory") {
+	if !strings.Contains(err.Error(), "replicas=0 with spec.storage.medium=Memory") {
 		t.Fatalf("error did not mention replicas+Memory rejection on Update: %v", err)
 	}
 }
@@ -127,7 +127,7 @@ func TestCEL_StorageShrinkRejected(t *testing.T) {
 	ctx := context.Background()
 
 	c := validCluster("storage-shrink")
-	c.Spec.Storage = resource.MustParse("1Gi")
+	c.Spec.Storage.Size = resource.MustParse("1Gi")
 	if err := k8s.Create(ctx, c); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -137,13 +137,13 @@ func TestCEL_StorageShrinkRejected(t *testing.T) {
 	if err := k8s.Get(ctx, ctrlclient.ObjectKeyFromObject(c), got); err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	got.Spec.Storage = resource.MustParse("512Mi")
+	got.Spec.Storage.Size = resource.MustParse("512Mi")
 
 	err := k8s.Update(ctx, got)
 	if err == nil {
 		t.Fatalf("apiserver accepted storage shrink 1Gi→512Mi; expected rejection")
 	}
-	if !strings.Contains(err.Error(), "spec.storage cannot be shrunk") {
+	if !strings.Contains(err.Error(), "spec.storage.size cannot be shrunk") {
 		t.Fatalf("error did not mention shrink rejection: %v", err)
 	}
 
@@ -151,14 +151,14 @@ func TestCEL_StorageShrinkRejected(t *testing.T) {
 	if err := k8s.Get(ctx, ctrlclient.ObjectKeyFromObject(c), got); err != nil {
 		t.Fatalf("Get for grow check: %v", err)
 	}
-	got.Spec.Storage = resource.MustParse("2Gi")
+	got.Spec.Storage.Size = resource.MustParse("2Gi")
 	if err := k8s.Update(ctx, got); err != nil {
 		t.Fatalf("growing storage rejected unexpectedly: %v", err)
 	}
 }
 
 // TestCEL_StorageMustBeNonZero_IntegerInput exercises the kubectl-style
-// integer input path (`storage: 0` without quotes in YAML, which the
+// integer input path (`storage.size: 0` without quotes in YAML, which the
 // apiserver receives as a JSON number rather than a string). The
 // typed Go API always serializes Quantity as a string, so the
 // TestCEL_StorageMustBeNonZeroForMemoryOnCreate test above can't reach
@@ -179,18 +179,20 @@ func TestCEL_StorageMustBeNonZero_IntegerInput(t *testing.T) {
 	u.SetName("memstore-zero-int")
 	u.SetNamespace("default")
 	u.Object["spec"] = map[string]any{
-		"replicas":      int64(3),
-		"version":       "3.5.17",
-		"storage":       int64(0), // <-- the case we care about
-		"storageMedium": "Memory",
+		"replicas": int64(3),
+		"version":  "3.5.17",
+		"storage": map[string]any{
+			"size":   int64(0), // <-- the case we care about
+			"medium": "Memory",
+		},
 	}
 
 	err := k8s.Create(ctx, u)
 	if err == nil {
 		_ = k8s.Delete(ctx, u)
-		t.Fatalf("apiserver accepted storage=0 (integer) with medium=Memory; expected rejection")
+		t.Fatalf("apiserver accepted storage.size=0 (integer) with medium=Memory; expected rejection")
 	}
-	if !strings.Contains(err.Error(), "spec.storage must be > 0") {
+	if !strings.Contains(err.Error(), "spec.storage.size must be > 0") {
 		t.Fatalf("error did not surface the intended message (CEL coercion missing?): %v", err)
 	}
 }
@@ -313,8 +315,8 @@ func TestCEL_HappyPathAccepts(t *testing.T) {
 		{
 			name: "memory with positive storage",
 			mut: func(c *lll.EtcdCluster) {
-				c.Spec.StorageMedium = lll.StorageMediumMemory
-				c.Spec.Storage = resource.MustParse("256Mi")
+				c.Spec.Storage.Medium = lll.StorageMediumMemory
+				c.Spec.Storage.Size = resource.MustParse("256Mi")
 			},
 		},
 		{

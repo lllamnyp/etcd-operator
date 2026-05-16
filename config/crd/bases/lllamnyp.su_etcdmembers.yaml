@@ -103,24 +103,50 @@ spec:
                 minimum: 1
                 type: integer
               storage:
-                anyOf:
-                - type: integer
-                - type: string
                 description: |-
-                  Storage is the requested size for this member's data directory. For
-                  StorageMedium="" this is the PVC's requested capacity; for
-                  StorageMedium="Memory" this is the tmpfs emptyDir's SizeLimit.
-                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                x-kubernetes-int-or-string: true
-              storageMedium:
-                description: |-
-                  StorageMedium selects the volume backend for this member's data
-                  directory. Mirrors EtcdCluster.spec.storageMedium at the time this
-                  member was created and is not edited afterwards.
-                enum:
-                - ""
-                - Memory
-                type: string
+                  Storage mirrors EtcdCluster.spec.storage at the time this member
+                  was created. The cluster controller copies size and medium onto
+                  each member at creation; the member controller treats it as
+                  immutable per-member spec.
+                properties:
+                  medium:
+                    default: ""
+                    description: |-
+                      Medium selects the volume backend: "" (PVC) or "Memory" (tmpfs
+                      emptyDir). See the StorageMedium type doc for operational trade-offs.
+
+                      Immutable: changing the medium on an existing cluster would orphan
+                      the previous PVC (or tmpfs) and the rolling-migrate path is not
+                      implemented. The default ("") is set explicitly so the apiserver
+                      always stores the field on Create — without it, a first-time set
+                      from absent → Memory would slip past the transition rule.
+                    enum:
+                    - ""
+                    - Memory
+                    type: string
+                    x-kubernetes-validations:
+                    - message: spec.storage.medium is immutable; delete and recreate
+                        the cluster to change the storage backend
+                      rule: self == oldSelf
+                  size:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    default: 1Gi
+                    description: |-
+                      Size is the requested capacity per member. For Medium="" (PVC) this
+                      is the PVC's requested storage. For Medium="Memory" this is the
+                      tmpfs emptyDir's SizeLimit.
+
+                      Shrinking is rejected on UPDATE: PVCs cannot shrink and tmpfs
+                      SizeLimit reduction does not free already-allocated memory.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                    x-kubernetes-validations:
+                    - message: spec.storage.size cannot be shrunk
+                      rule: quantity(string(self)).compareTo(quantity(string(oldSelf)))
+                        >= 0
+                type: object
               tls:
                 description: |-
                   TLS mirrors the parent cluster's TLS configuration at the time

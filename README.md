@@ -19,8 +19,8 @@ The full design rationale is in [docs/concepts.md](docs/concepts.md).
 - **Scale up / down**: cluster controller adds members one at a time as learners and promotes them; scale-down picks the most-recently-created member, runs `MemberRemove` via a finalizer, then GCs the Pod and PVC.
 - **Scale to zero (pause/resume)**: `spec.replicas: 0` parks the surviving member via `spec.dormant=true`; the Pod is deleted, the PVC stays owned by the `EtcdMember`. Scaling back up to ≥ 1 flips `spec.dormant=false` on the same member; etcd resumes from the existing data dir with the same cluster ID and member ID.
 - **Pod restart / node failure**: data PVC is preserved, the new Pod reads the existing WAL and rejoins with the same member ID.
-- **Memory-backed storage (opt-in)**: `spec.storageMedium: Memory` switches each member's data dir to a tmpfs `emptyDir` whose lifetime is bound to the Pod. Members that lose their Pod (eviction, node failure) lose their data; the operator detects this, removes the member from etcd, and replaces it via the existing scale-up path. Suits scenarios where the etcd state is reconstructable and replication absorbs single-member losses. Remaining production hardening (anti-affinity / resource defaults) is tracked in [#16](https://github.com/lllamnyp/etcd-operator/issues/16); see [docs/concepts.md](docs/concepts.md#storage).
-- **Apiserver-enforced validation**: CEL rules on the CRD (k8s 1.29+) reject `replicas: 0` with `storageMedium: Memory`, `storage: 0` with `storageMedium: Memory`, `storageMedium` changes after creation, and `storage` shrinks. No webhook / cert-manager dependency.
+- **Memory-backed storage (opt-in)**: `spec.storage.medium: Memory` switches each member's data dir to a tmpfs `emptyDir` whose lifetime is bound to the Pod. Members that lose their Pod (eviction, node failure) lose their data; the operator detects this, removes the member from etcd, and replaces it via the existing scale-up path. Suits scenarios where the etcd state is reconstructable and replication absorbs single-member losses. Remaining production hardening (anti-affinity / resource defaults) is tracked in [#16](https://github.com/lllamnyp/etcd-operator/issues/16); see [docs/concepts.md](docs/concepts.md#storage).
+- **Apiserver-enforced validation**: CEL rules on the CRD (k8s 1.29+) reject `replicas: 0` with `storage.medium: Memory`, `storage.size: 0` with `storage.medium: Memory`, `storage.medium` changes after creation, and `storage.size` shrinks. No webhook / cert-manager dependency.
 - **PodDisruptionBudget**: per-cluster PDB selects voting members only (`role=voter`); `maxUnavailable = (voters-1)/2` so `kubectl drain` cannot voluntarily push the cluster below quorum.
 - **TLS (BYO Secrets)**: `spec.tls.client` / `spec.tls.peer` reference user-provided Secrets to enable TLS on the client API, the peer API, or both. mTLS is the implicit mode when an operator-client Secret is supplied; server-TLS-only when it isn't. CEL-locked immutable post-create; rotation is one-Pod-at-a-time in Phase 1. cert-manager integration is a Phase 2 follow-up; see [docs/concepts.md](docs/concepts.md#tls).
 - **Locking pattern**: `status.observed` snapshots the in-flight target so mid-flight spec edits don't corrupt consensus; `progressDeadline` bounds how long the operator will spend trying to reach a target.
@@ -51,7 +51,8 @@ metadata:
 spec:
   replicas: 3
   version: 3.5.17
-  storage: 1Gi
+  storage:
+    size: 1Gi
 EOF
 
 # 3. Wait for ready and inspect.

@@ -5,4 +5,5 @@ metadata:
 spec:
   replicas: 3
   version: "3.5.17"
-  storage: 1Gi
+  storage:
+    size: 1Gi

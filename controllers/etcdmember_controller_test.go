@@ -235,7 +235,7 @@ func TestEnsurePVC_RefusesStaleOwner(t *testing.T) {
 
 	freshMember := &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-1", Namespace: "ns", UID: freshUID, Labels: memberLabels("test", "test-1")},
-		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"), InitialCluster: "x", ClusterToken: "test"},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")}, InitialCluster: "x", ClusterToken: "test"},
 	}
 
 	c, _ := newTestClient(t, freshMember, stalePVC)
@@ -267,7 +267,7 @@ func TestEnsurePVC_RefusesPVCWithNoOwnerRefs(t *testing.T) {
 	}
 	member := &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", UID: types.UID("uid"), Labels: memberLabels("test", "test-0")},
-		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"), InitialCluster: "x", ClusterToken: "test"},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")}, InitialCluster: "x", ClusterToken: "test"},
 	}
 
 	c, _ := newTestClient(t, member, prePVC)
@@ -304,7 +304,7 @@ func TestEnsurePVC_RefusesPVCOwnedByOther(t *testing.T) {
 	}
 	member := &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", UID: types.UID("uid"), Labels: memberLabels("test", "test-0")},
-		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"), InitialCluster: "x", ClusterToken: "test"},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")}, InitialCluster: "x", ClusterToken: "test"},
 	}
 
 	c, _ := newTestClient(t, member, otherPVC)
@@ -343,7 +343,7 @@ func TestEnsurePVC_AcceptsOwnPVC(t *testing.T) {
 
 	member := &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", UID: uid, Labels: memberLabels("test", "test-0")},
-		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"), InitialCluster: "x", ClusterToken: "test"},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")}, InitialCluster: "x", ClusterToken: "test"},
 	}
 
 	c, _ := newTestClient(t, member, ownPVC)
@@ -378,7 +378,7 @@ func TestEnsurePod_RefusesStaleOwner(t *testing.T) {
 	}
 	freshMember := &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-1", Namespace: "ns", UID: types.UID("fresh-uid"), Labels: memberLabels("test", "test-1")},
-		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"), InitialCluster: "x", ClusterToken: "test"},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")}, InitialCluster: "x", ClusterToken: "test"},
 	}
 	c, _ := newTestClient(t, freshMember, stalePod)
 	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t)}
@@ -400,7 +400,7 @@ func TestEnsurePod_RefusesPodWithNoOwnerRefs(t *testing.T) {
 	}
 	member := &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", UID: types.UID("uid"), Labels: memberLabels("test", "test-0")},
-		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"), InitialCluster: "x", ClusterToken: "test"},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")}, InitialCluster: "x", ClusterToken: "test"},
 	}
 	c, _ := newTestClient(t, member, prePod)
 	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t)}
@@ -429,7 +429,7 @@ func TestEnsurePod_RefusesPodOwnedByOther(t *testing.T) {
 	}
 	member := &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", UID: types.UID("uid"), Labels: memberLabels("test", "test-0")},
-		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"), InitialCluster: "x", ClusterToken: "test"},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")}, InitialCluster: "x", ClusterToken: "test"},
 	}
 	c, _ := newTestClient(t, member, otherPod)
 	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t)}
@@ -459,7 +459,7 @@ func TestEnsurePod_AcceptsOwnPod(t *testing.T) {
 	}
 	member := &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", UID: uid, Labels: memberLabels("test", "test-0")},
-		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"), InitialCluster: "x", ClusterToken: "test"},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")}, InitialCluster: "x", ClusterToken: "test"},
 	}
 	c, _ := newTestClient(t, member, ownPod)
 	r := &EtcdMemberReconciler{Client: c, Scheme: testScheme(t)}
@@ -484,7 +484,7 @@ func TestUpdateStatus_NoMemberIDKeepsReadyFalse(t *testing.T) {
 
 	member := &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", Labels: memberLabels("test", "test-0")},
-		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"), InitialCluster: "x", ClusterToken: "test"},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")}, InitialCluster: "x", ClusterToken: "test"},
 	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns"},
@@ -537,7 +537,7 @@ func TestUpdateStatus_PopulatesMemberIDAndFlipsReady(t *testing.T) {
 
 	member := &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", Labels: memberLabels("test", "test-0")},
-		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"), InitialCluster: "x", ClusterToken: "test"},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")}, InitialCluster: "x", ClusterToken: "test"},
 	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns"},
@@ -646,7 +646,7 @@ func TestUpdateStatus_PodNotReadyKeepsReadyFalse(t *testing.T) {
 
 	member := &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns", Labels: memberLabels("test", "test-0")},
-		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"), InitialCluster: "x", ClusterToken: "test"},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")}, InitialCluster: "x", ClusterToken: "test"},
 	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-0", Namespace: "ns"},
@@ -981,7 +981,7 @@ func TestReconcile_WaitsForInitialClusterPatch(t *testing.T) {
 			Name: "test-pndng", Namespace: "ns", Labels: clusterLabels("test"),
 		},
 		Spec: lll.EtcdMemberSpec{
-			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			ClusterToken: "ns-test-x",
 			// InitialCluster intentionally empty.
 		},
@@ -1046,7 +1046,7 @@ func TestHandleDeletion_StillCallsMemberRemove(t *testing.T) {
 			ClusterToken: "ns-test-x",
 			ClusterID:    "deadbeef",
 			Observed: &lll.ObservedClusterSpec{
-				Replicas: 0, Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+				Replicas: 0, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
 		},
 	}
@@ -1099,7 +1099,7 @@ func TestReconcile_DormantMemberDeletesPod(t *testing.T) {
 			Finalizers: []string{MemberFinalizer},
 		},
 		Spec: lll.EtcdMemberSpec{
-			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			InitialCluster: "x", ClusterToken: "ns-test-x", Bootstrap: true,
 			Dormant: true,
 		},
@@ -1166,7 +1166,7 @@ func TestReconcile_WakeFromDormantCreatesPod(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns", UID: types.UID("cluster-uid")},
 		Status: lll.EtcdClusterStatus{
 			ClusterToken: "ns-test-x", ClusterID: "deadbeef",
-			Observed: &lll.ObservedClusterSpec{Replicas: 1, Version: "3.5.17", Storage: quickQty(t, "1Gi")},
+			Observed: &lll.ObservedClusterSpec{Replicas: 1, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")}},
 		},
 	}
 	woken := &lll.EtcdMember{
@@ -1176,7 +1176,7 @@ func TestReconcile_WakeFromDormantCreatesPod(t *testing.T) {
 			Finalizers: []string{MemberFinalizer},
 		},
 		Spec: lll.EtcdMemberSpec{
-			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			InitialCluster: buildInitialCluster("http", []string{"test-saved1"}, "test", "ns"),
 			ClusterToken:   "ns-test-x", Bootstrap: true,
 			// Dormant=false — the cluster controller just flipped it back.
@@ -1220,21 +1220,20 @@ func TestReconcile_WakeFromDormantCreatesPod(t *testing.T) {
 // silence unused imports
 var _ = ctrl.Result{}
 
-// TestBuildPod_MemoryMediumUsesEmptyDir verifies that StorageMedium=Memory
+// TestBuildPod_MemoryMediumUsesEmptyDir verifies that storage.medium=Memory
 // flips the Pod's data volume from a PVC to a tmpfs emptyDir with
-// SizeLimit set from Spec.Storage. Without this, etcd writes to the
-// node's filesystem and the whole "memory-backed cluster" feature is a
-// no-op.
+// SizeLimit set from spec.storage.size. Without this, etcd writes to
+// the node's filesystem and the whole "memory-backed cluster" feature
+// is a no-op.
 func TestBuildPod_MemoryMediumUsesEmptyDir(t *testing.T) {
 	r := &EtcdMemberReconciler{}
 	storage := quickQty(t, "256Mi")
 	pod := r.buildPod(&lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "m-1", Namespace: "ns"},
 		Spec: lll.EtcdMemberSpec{
-			ClusterName:   "test",
-			Version:       "3.5.17",
-			Storage:       storage,
-			StorageMedium: lll.StorageMediumMemory,
+			ClusterName: "test",
+			Version:     "3.5.17",
+			Storage:     lll.StorageSpec{Size: storage, Medium: lll.StorageMediumMemory},
 		},
 	})
 
@@ -1257,7 +1256,7 @@ func TestBuildPod_MemoryMediumUsesEmptyDir(t *testing.T) {
 }
 
 // TestBuildPod_DefaultMediumUsesPVC is the negative guard: an empty
-// StorageMedium must still produce a PVC-backed volume so existing
+// storage.medium must still produce a PVC-backed volume so existing
 // clusters' Pods don't silently start writing to tmpfs after a controller
 // upgrade.
 func TestBuildPod_DefaultMediumUsesPVC(t *testing.T) {
@@ -1267,8 +1266,8 @@ func TestBuildPod_DefaultMediumUsesPVC(t *testing.T) {
 		Spec: lll.EtcdMemberSpec{
 			ClusterName: "test",
 			Version:     "3.5.17",
-			Storage:     quickQty(t, "1Gi"),
-			// StorageMedium left empty.
+			Storage:     lll.StorageSpec{Size: quickQty(t, "1Gi")},
+			// storage.medium left empty.
 		},
 	})
 	v := pod.Spec.Volumes[0]
@@ -1293,10 +1292,9 @@ func TestEnsurePVC_SkippedForMemoryMember(t *testing.T) {
 	member := &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "m-1", Namespace: "ns", UID: types.UID("mu")},
 		Spec: lll.EtcdMemberSpec{
-			ClusterName:   "test",
-			Version:       "3.5.17",
-			Storage:       quickQty(t, "1Gi"),
-			StorageMedium: lll.StorageMediumMemory,
+			ClusterName: "test",
+			Version:     "3.5.17",
+			Storage:     lll.StorageSpec{Size: quickQty(t, "1Gi"), Medium: lll.StorageMediumMemory},
 		},
 	}
 	c, _ := newTestClient(t, member)
@@ -1335,7 +1333,7 @@ func TestEnsurePod_CapturesUIDOfExistingPod(t *testing.T) {
 		Spec: lll.EtcdMemberSpec{
 			ClusterName:    "test",
 			Version:        "3.5.17",
-			Storage:        quickQty(t, "1Gi"),
+			Storage:        lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			InitialCluster: "m-1=" + peerURL("http", "m-1", "test", "ns"),
 			ClusterToken:   "ns-test-x",
 			Bootstrap:      true,
@@ -1385,8 +1383,7 @@ func TestReconcile_MemoryMemberDeletesSelfOnPodLoss(t *testing.T) {
 		Spec: lll.EtcdMemberSpec{
 			ClusterName:    "test",
 			Version:        "3.5.17",
-			Storage:        quickQty(t, "1Gi"),
-			StorageMedium:  lll.StorageMediumMemory,
+			Storage:        lll.StorageSpec{Size: quickQty(t, "1Gi"), Medium: lll.StorageMediumMemory},
 			InitialCluster: "m-1=" + peerURL("http", "m-1", "test", "ns"),
 			ClusterToken:   "ns-test-x",
 			Bootstrap:      true,
@@ -1447,8 +1444,7 @@ func TestReconcile_MemoryMemberStablePodIsNotLost(t *testing.T) {
 		Spec: lll.EtcdMemberSpec{
 			ClusterName:    "test",
 			Version:        "3.5.17",
-			Storage:        quickQty(t, "1Gi"),
-			StorageMedium:  lll.StorageMediumMemory,
+			Storage:        lll.StorageSpec{Size: quickQty(t, "1Gi"), Medium: lll.StorageMediumMemory},
 			InitialCluster: "m-1=" + peerURL("http", "m-1", "test", "ns"),
 			ClusterToken:   "ns-test-x",
 			Bootstrap:      true,
@@ -1499,8 +1495,7 @@ func TestUpdateStatus_MemoryMemberLeavesPVCNameEmpty(t *testing.T) {
 		Spec: lll.EtcdMemberSpec{
 			ClusterName:    "test",
 			Version:        "3.5.17",
-			Storage:        quickQty(t, "1Gi"),
-			StorageMedium:  lll.StorageMediumMemory,
+			Storage:        lll.StorageSpec{Size: quickQty(t, "1Gi"), Medium: lll.StorageMediumMemory},
 			InitialCluster: "m-1=" + peerURL("http", "m-1", "test", "ns"),
 			ClusterToken:   "ns-test-x",
 			Bootstrap:      true,
@@ -1546,7 +1541,7 @@ func TestIsBroken_MemoryMemberWithLostPodIsBroken(t *testing.T) {
 		{
 			name: "memory, UID recorded, Pod missing → broken",
 			m: lll.EtcdMember{
-				Spec:   lll.EtcdMemberSpec{StorageMedium: lll.StorageMediumMemory},
+				Spec:   lll.EtcdMemberSpec{Storage: lll.StorageSpec{Medium: lll.StorageMediumMemory}},
 				Status: lll.EtcdMemberStatus{PodUID: "u", PodName: ""},
 			},
 			want: true,
@@ -1554,7 +1549,7 @@ func TestIsBroken_MemoryMemberWithLostPodIsBroken(t *testing.T) {
 		{
 			name: "memory, UID recorded, Pod present → healthy",
 			m: lll.EtcdMember{
-				Spec:   lll.EtcdMemberSpec{StorageMedium: lll.StorageMediumMemory},
+				Spec:   lll.EtcdMemberSpec{Storage: lll.StorageSpec{Medium: lll.StorageMediumMemory}},
 				Status: lll.EtcdMemberStatus{PodUID: "u", PodName: "p"},
 			},
 			want: false,
@@ -1562,7 +1557,7 @@ func TestIsBroken_MemoryMemberWithLostPodIsBroken(t *testing.T) {
 		{
 			name: "memory, no UID yet (first reconcile) → not broken",
 			m: lll.EtcdMember{
-				Spec:   lll.EtcdMemberSpec{StorageMedium: lll.StorageMediumMemory},
+				Spec:   lll.EtcdMemberSpec{Storage: lll.StorageSpec{Medium: lll.StorageMediumMemory}},
 				Status: lll.EtcdMemberStatus{},
 			},
 			want: false,
@@ -1570,7 +1565,7 @@ func TestIsBroken_MemoryMemberWithLostPodIsBroken(t *testing.T) {
 		{
 			name: "PVC-backed, Pod missing → stub stays false",
 			m: lll.EtcdMember{
-				Spec:   lll.EtcdMemberSpec{StorageMedium: lll.StorageMediumDefault},
+				Spec:   lll.EtcdMemberSpec{Storage: lll.StorageSpec{Medium: lll.StorageMediumDefault}},
 				Status: lll.EtcdMemberStatus{PodUID: "u", PodName: ""},
 			},
 			want: false,
@@ -1601,7 +1596,7 @@ func TestEnsurePod_AppliesRoleLabelWhenIsVoter(t *testing.T) {
 		Spec: lll.EtcdMemberSpec{
 			ClusterName:    "test",
 			Version:        "3.5.17",
-			Storage:        quickQty(t, "1Gi"),
+			Storage:        lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			InitialCluster: "m-1=" + peerURL("http", "m-1", "test", "ns"),
 			ClusterToken:   "ns-test-x",
 			Bootstrap:      true,
@@ -1644,7 +1639,7 @@ func TestEnsurePod_StripsRoleLabelWhenNotVoter(t *testing.T) {
 	member := &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "m-1", Namespace: "ns", UID: types.UID("mu")},
 		Spec: lll.EtcdMemberSpec{
-			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			InitialCluster: "x", ClusterToken: "ns-test-x", Bootstrap: true,
 		},
 		Status: lll.EtcdMemberStatus{IsVoter: false},
@@ -1738,7 +1733,7 @@ func TestBuildPod_PlaintextHasNoTLSFlags(t *testing.T) {
 	r := &EtcdMemberReconciler{}
 	pod := r.buildPod(&lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "ns"},
-		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi")},
+		Spec:       lll.EtcdMemberSpec{ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")}},
 	})
 	cmd := pod.Spec.Containers[0].Command
 	if !cmdContains(cmd, "--listen-peer-urls=http://0.0.0.0:2380") {
@@ -1768,7 +1763,7 @@ func TestBuildPod_ClientTLSOnlyAddsServerCertButNoClientAuth(t *testing.T) {
 	pod := r.buildPod(&lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "ns"},
 		Spec: lll.EtcdMemberSpec{
-			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			TLS: &lll.EtcdMemberTLS{
 				ClientServerSecretRef: &corev1.LocalObjectReference{Name: "srv"},
 				ClientMTLS:            false,
@@ -1810,7 +1805,7 @@ func TestBuildPod_ClientMTLSAddsTrustedCAAndClientCertAuth(t *testing.T) {
 	pod := r.buildPod(&lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "ns"},
 		Spec: lll.EtcdMemberSpec{
-			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			TLS: &lll.EtcdMemberTLS{
 				ClientServerSecretRef: &corev1.LocalObjectReference{Name: "srv"},
 				ClientMTLS:            true,
@@ -1835,7 +1830,7 @@ func TestBuildPod_PeerTLSAlwaysMTLS(t *testing.T) {
 	pod := r.buildPod(&lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "ns"},
 		Spec: lll.EtcdMemberSpec{
-			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			TLS: &lll.EtcdMemberTLS{
 				PeerSecretRef: &corev1.LocalObjectReference{Name: "peer"},
 			},
@@ -1948,7 +1943,7 @@ func TestEnsurePod_BlocksOnMissingTLSSecret(t *testing.T) {
 	member := &lll.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "ns", UID: types.UID("mu")},
 		Spec: lll.EtcdMemberSpec{
-			ClusterName: "test", Version: "3.5.17", Storage: quickQty(t, "1Gi"),
+			ClusterName: "test", Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			TLS: &lll.EtcdMemberTLS{ClientServerSecretRef: &corev1.LocalObjectReference{Name: "missing"}},
 		},
 	}
