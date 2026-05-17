@@ -297,6 +297,96 @@ func TestCEL_TLSSubfieldChangeRejected(t *testing.T) {
 	}
 }
 
+// TestCEL_StorageClassNameAddRejected verifies that adding a
+// storageClassName after Create is rejected. A PVC's storageClassName
+// is itself immutable, so the operator can only honour a value chosen
+// at cluster-creation time.
+func TestCEL_StorageClassNameAddRejected(t *testing.T) {
+	skipIfNoEnvtest(t)
+	ctx := context.Background()
+
+	c := validCluster("sc-add")
+	if err := k8s.Create(ctx, c); err != nil {
+		t.Fatalf("Create cluster without storageClassName: %v", err)
+	}
+	t.Cleanup(func() { _ = k8s.Delete(ctx, c) })
+
+	got := &lll.EtcdCluster{}
+	if err := k8s.Get(ctx, ctrlclient.ObjectKeyFromObject(c), got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	sc := "replicated"
+	got.Spec.Storage.StorageClassName = &sc
+
+	err := k8s.Update(ctx, got)
+	if err == nil {
+		t.Fatalf("apiserver accepted storageClassName being added to existing cluster; expected rejection")
+	}
+	if !strings.Contains(err.Error(), "spec.storage.storageClassName cannot be added") {
+		t.Fatalf("error did not mention add/remove rejection: %v", err)
+	}
+}
+
+// TestCEL_StorageClassNameRemoveRejected mirrors the add case for the
+// removal direction.
+func TestCEL_StorageClassNameRemoveRejected(t *testing.T) {
+	skipIfNoEnvtest(t)
+	ctx := context.Background()
+
+	c := validCluster("sc-remove")
+	sc := "replicated"
+	c.Spec.Storage.StorageClassName = &sc
+	if err := k8s.Create(ctx, c); err != nil {
+		t.Fatalf("Create cluster with storageClassName: %v", err)
+	}
+	t.Cleanup(func() { _ = k8s.Delete(ctx, c) })
+
+	got := &lll.EtcdCluster{}
+	if err := k8s.Get(ctx, ctrlclient.ObjectKeyFromObject(c), got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	got.Spec.Storage.StorageClassName = nil
+
+	err := k8s.Update(ctx, got)
+	if err == nil {
+		t.Fatalf("apiserver accepted storageClassName being cleared; expected rejection")
+	}
+	if !strings.Contains(err.Error(), "spec.storage.storageClassName cannot be added") {
+		t.Fatalf("error did not mention add/remove rejection: %v", err)
+	}
+}
+
+// TestCEL_StorageClassNameChangeRejected verifies that swapping the
+// storageClassName for a different value post-create is rejected by
+// the content-immutability rule (separate from the add/remove rule).
+func TestCEL_StorageClassNameChangeRejected(t *testing.T) {
+	skipIfNoEnvtest(t)
+	ctx := context.Background()
+
+	c := validCluster("sc-change")
+	first := "replicated"
+	c.Spec.Storage.StorageClassName = &first
+	if err := k8s.Create(ctx, c); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	t.Cleanup(func() { _ = k8s.Delete(ctx, c) })
+
+	got := &lll.EtcdCluster{}
+	if err := k8s.Get(ctx, ctrlclient.ObjectKeyFromObject(c), got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	second := "local"
+	got.Spec.Storage.StorageClassName = &second
+
+	err := k8s.Update(ctx, got)
+	if err == nil {
+		t.Fatalf("apiserver accepted storageClassName value swap; expected rejection")
+	}
+	if !strings.Contains(err.Error(), "spec.storage.storageClassName is immutable") {
+		t.Fatalf("error did not mention content immutability: %v", err)
+	}
+}
+
 // TestCEL_HappyPathAccepts is a negative-side guard: a fully valid
 // cluster spec must pass the apiserver. Catches accidental rule
 // inversions and over-broad CEL expressions.
@@ -338,6 +428,13 @@ func TestCEL_HappyPathAccepts(t *testing.T) {
 						SecretRef: corev1.LocalObjectReference{Name: "fake-peer-tls"},
 					},
 				}
+			},
+		},
+		{
+			name: "storage class name on create",
+			mut: func(c *lll.EtcdCluster) {
+				sc := "replicated"
+				c.Spec.Storage.StorageClassName = &sc
 			},
 		},
 	}

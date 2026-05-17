@@ -146,6 +146,25 @@ spec:
                     - message: spec.storage.size cannot be shrunk
                       rule: quantity(string(self)).compareTo(quantity(string(oldSelf)))
                         >= 0
+                  storageClassName:
+                    description: |-
+                      StorageClassName selects the StorageClass for the per-member PVC.
+                      Mirrors corev1.PersistentVolumeClaimSpec.StorageClassName semantics:
+                      nil (the default) uses the namespace's default StorageClass; the
+                      empty string explicitly disables dynamic provisioning (a
+                      pre-provisioned PV must already match the PVC selector); any other
+                      value names a specific StorageClass.
+
+                      Ignored when Medium=Memory (no PVC is created).
+
+                      Immutable post-create — PersistentVolumeClaim.spec.storageClassName
+                      is itself immutable after PVC creation, so honouring a mid-life
+                      change would require a rolling PVC-recreation flow that this
+                      operator does not perform. The immutability rules live at the
+                      EtcdClusterSpec level (alongside the other pointer-field rules)
+                      because *string transition CEL on the inner field cannot fire when
+                      the field is being added from nil.
+                    type: string
                 type: object
               tls:
                 description: |-
