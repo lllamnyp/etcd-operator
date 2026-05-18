@@ -25,6 +25,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -2185,6 +2186,7 @@ func TestClusterUpdateStatus_NoChurnInSteadyState(t *testing.T) {
 			ClusterToken: "ns-test-x",
 			ClusterID:    "0000000000000abc",
 			ReadyMembers: 3,
+			Selector:     "etcd.lllamnyp.su/cluster=test",
 			Observed: &lll.ObservedClusterSpec{
 				Replicas: 3, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			},
@@ -2451,6 +2453,123 @@ func TestSpecEqualsObserved_StorageMediumMatters(t *testing.T) {
 	cluster.Status.Observed.Storage.Medium = lll.StorageMediumMemory
 	if !specEqualsObserved(cluster) {
 		t.Fatalf("specEqualsObserved must return true when all fields including storage.medium match")
+	}
+}
+
+// TestSpecEqualsObserved_ResourcesMatter guards the locking pattern for
+// the new spec.resources field. A mid-flight resource bump must register
+// as "spec ≠ observed" so the deadline gate gets a chance to fire when
+// the in-flight target is reached, then snapshot the new sizing.
+func TestSpecEqualsObserved_ResourcesMatter(t *testing.T) {
+	cluster := &lll.EtcdCluster{
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(3),
+			Version:  "3.5.17",
+			Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU: resource.MustParse("500m"),
+				},
+			},
+		},
+		Status: lll.EtcdClusterStatus{
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 3,
+				Version:  "3.5.17",
+				Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU: resource.MustParse("100m"), // mismatch
+					},
+				},
+			},
+		},
+	}
+	if specEqualsObserved(cluster) {
+		t.Fatalf("specEqualsObserved must return false when resources differ")
+	}
+
+	cluster.Status.Observed.Resources = *cluster.Spec.Resources.DeepCopy()
+	if !specEqualsObserved(cluster) {
+		t.Fatalf("specEqualsObserved must return true when resources match")
+	}
+}
+
+// TestBootstrap_PropagatesResourcesToSeed verifies the wiring of
+// spec.resources onto the seed EtcdMember at cluster creation. The
+// member controller reads its own Spec.Resources at buildPod time, so
+// any propagation gap shows up as the seed's container running with
+// the operator's hardcoded fall-through defaults instead of the
+// user's sizing.
+func TestBootstrap_PropagatesResourcesToSeed(t *testing.T) {
+	ctx := context.Background()
+	wantCPU := resource.MustParse("750m")
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "ns"},
+		Spec: lll.EtcdClusterSpec{
+			Replicas:  ptrInt32(3),
+			Version:   "3.5.17",
+			Storage:   lll.StorageSpec{Size: quickQty(t, "1Gi")},
+			Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: wantCPU}},
+		},
+	}
+	c, _ := newTestClient(t, cluster)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdeadbeef))}
+
+	reconcileUntilStable(t, r, c, "test", "ns", 8)
+
+	got := mustGet(t, c, "test", "ns", &lll.EtcdCluster{})
+	if got.Status.Observed == nil {
+		t.Fatalf("Status.Observed must be set after first reconciles")
+	}
+	if got.Status.Observed.Resources.Requests.Cpu().Cmp(wantCPU) != 0 {
+		t.Fatalf("Observed.Resources.Requests.cpu = %v; want %v", got.Status.Observed.Resources.Requests.Cpu(), wantCPU)
+	}
+
+	members := &lll.EtcdMemberList{}
+	if err := c.List(ctx, members, client.InNamespace("ns")); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(members.Items) != 1 {
+		t.Fatalf("expected exactly one seed member; got %d", len(members.Items))
+	}
+	if members.Items[0].Spec.Resources.Requests.Cpu().Cmp(wantCPU) != 0 {
+		t.Fatalf("seed Spec.Resources.Requests.cpu = %v; want %v",
+			members.Items[0].Spec.Resources.Requests.Cpu(), wantCPU)
+	}
+}
+
+// TestUpdateStatus_SetsScaleSelector covers the /scale subresource
+// contract: Status.Selector must carry the label-selector form for the
+// VPA admission controller (and any other Scales().Get() consumer) to
+// find the cluster's Pods. The minimal selector keyed on LabelCluster
+// matches every Pod the operator emits.
+func TestUpdateStatus_SetsScaleSelector(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "smk", Namespace: "ns"},
+		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(3), Version: "3.5.17",
+			Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
+		},
+		Status: lll.EtcdClusterStatus{
+			ClusterToken: "ns-smk-x", ClusterID: "0000000000000abc",
+			Observed: &lll.ObservedClusterSpec{
+				Replicas: 3, Version: "3.5.17", Storage: lll.StorageSpec{Size: quickQty(t, "1Gi")},
+			},
+		},
+	}
+	c, _ := newTestClient(t, cluster)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xabc))}
+
+	if _, err := r.updateStatus(ctx, cluster, nil); err != nil {
+		t.Fatalf("updateStatus: %v", err)
+	}
+
+	got := mustGet(t, c, "smk", "ns", &lll.EtcdCluster{})
+	want := "etcd.lllamnyp.su/cluster=smk"
+	if got.Status.Selector != want {
+		t.Fatalf("Status.Selector = %q; want %q", got.Status.Selector, want)
 	}
 }
 
