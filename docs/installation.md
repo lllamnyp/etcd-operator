@@ -133,7 +133,7 @@ See [concepts: TLS](concepts.md#tls) for the trade-offs (EKU `clientAuth` requir
 
 - cert-manager (any v1.x release) installed on the cluster *before* the operator starts. The operator probes the discovery API for `cert-manager.io/v1` at startup; if absent, clusters with `certManager` set are parked at `Available=False / CertManagerNotInstalled` and the operator never touches the GVK. Recovery is install-cert-manager + operator restart.
 - An `Issuer` (namespaced, in the EtcdCluster's namespace) or `ClusterIssuer` for each role. Most commonly a single Issuer per plane signs both the server and operator-client certs.
-- The operator's `--cluster-domain` flag must match the cluster's DNS suffix so the emitted SANs match what kube-dns returns for peer reverse-DNS. Defaults to `cluster.local`; set `--cluster-domain=cozy.local` on Cozystack, `--cluster-domain=...` elsewhere as appropriate.
+- The operator's cluster DNS suffix must match the cluster's actual suffix so the emitted SANs match what kube-dns returns for peer reverse-DNS. The operator auto-discovers it from `/etc/resolv.conf`'s `search` line at startup (covers `cluster.local`, `cozy.local`, and any other kubelet-injected suffix for normal cluster-pod deployments); falls back to `cluster.local` when auto-discovery yields nothing (hostNetwork pods, custom `dnsPolicy`). Override explicitly with `--cluster-domain=<suffix>` when neither path finds the right value.
 
 Required SANs on the per-cluster server cert (BYO must cover all of these because the cert is shared by every member; cert-manager mode emits them automatically based on `--cluster-domain`):
 

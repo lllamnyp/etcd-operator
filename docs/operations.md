@@ -569,7 +569,7 @@ kubectl describe certificate -n <ns> <cluster>-server
 
 A Certificate stuck at `Ready=False` is the most common failure mode. `kubectl describe certificate <cluster>-server` surfaces cert-manager's `Issuer`-side error (no matching `Issuer`, signing back-end unreachable, CA cert expired, etc.). If the operator probe didn't find cert-manager at startup, the EtcdCluster's status will read `Available=False / CertManagerNotInstalled` and no Certificates will be created — install cert-manager, then restart the operator (the discovery probe re-runs at every operator start).
 
-`--cluster-domain` mismatches are silent and the failure mode is "second member of the cluster crashloops with `discovery failed` / `EOF`". If your cluster's DNS suffix isn't `cluster.local`, set the operator's `--cluster-domain` flag accordingly (`cozy.local` on Cozystack) so the emitted SAN list matches kube-dns's reverse-DNS PTR records.
+`--cluster-domain` mismatches are silent and the failure mode is "second member of the cluster crashloops with `discovery failed` / `EOF`". The operator auto-discovers its DNS suffix from `/etc/resolv.conf`'s `search` line at startup, so for normal cluster-pod deployments — including Cozystack's `cozy.local` — no flag is required. If your operator runs with `hostNetwork: true` or a custom `dnsPolicy`, auto-discovery returns nothing and the operator falls back to `cluster.local`; set `--cluster-domain` explicitly in that case.
 
 ### Cert rotation
 
