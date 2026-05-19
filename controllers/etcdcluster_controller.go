@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -28,7 +29,9 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -62,6 +65,7 @@ type EtcdClusterReconciler struct {
 //+kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch
 //+kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+//+kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch
 
 func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
@@ -83,6 +87,11 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	if err := r.ensureServices(ctx, cluster); err != nil {
 		log.Error(err, "failed to ensure services")
+		return ctrl.Result{}, err
+	}
+
+	if err := r.reconcileTLSCertificates(ctx, cluster); err != nil {
+		log.Error(err, "failed to reconcile cert-manager Certificates")
 		return ctrl.Result{}, err
 	}
 
@@ -1238,6 +1247,181 @@ func (r *EtcdClusterReconciler) reconcilePDB(
 	orig := pdb.DeepCopy()
 	pdb.Spec.MaxUnavailable = &max
 	return r.Patch(ctx, pdb, client.MergeFrom(orig))
+}
+
+// ── cert-manager Certificates ────────────────────────────────────────────
+
+// reconcileTLSCertificates emits cert-manager.io/v1 Certificate resources
+// for each role configured under spec.tls.{client,peer}.certManager.
+// Resulting Secrets carry the kubernetes.io/tls shape (tls.crt + tls.key
+// + ca.crt) and are mounted into the etcd Pods by the existing BYO code
+// path — buildPod and buildOperatorTLSConfig consume the Secret by name
+// regardless of source.
+//
+// No-op when the cluster has no cert-manager-driven TLS configured. We
+// use unstructured.Unstructured to avoid a dependency on the cert-manager
+// Go module; the Certificate shape is stable and well-documented at
+// https://cert-manager.io/docs/usage/certificate/.
+func (r *EtcdClusterReconciler) reconcileTLSCertificates(ctx context.Context, cluster *lll.EtcdCluster) error {
+	if cluster.Spec.TLS == nil {
+		return nil
+	}
+
+	if c := cluster.Spec.TLS.Client; c != nil && c.CertManager != nil {
+		// Server cert (and its issuer's CA, exposed via ca.crt).
+		if err := r.ensureCertificate(ctx, cluster, certificateSpec{
+			name:        cluster.Name + "-server",
+			secretName:  cluster.Name + "-server-tls",
+			commonName:  cluster.Name + "-server",
+			dnsNames:    serverCertDNSNames(cluster),
+			ipAddresses: []string{"127.0.0.1"},
+			usages:      []string{"server auth", "client auth", "digital signature", "key encipherment"},
+			issuerRef:   c.CertManager.ServerIssuerRef,
+		}); err != nil {
+			return err
+		}
+		// Operator-client cert — only when mTLS is selected.
+		if c.CertManager.OperatorClientIssuerRef != nil {
+			if err := r.ensureCertificate(ctx, cluster, certificateSpec{
+				name:       cluster.Name + "-operator-client",
+				secretName: cluster.Name + "-operator-client-tls",
+				commonName: cluster.Name + "-operator-client",
+				usages:     []string{"client auth", "digital signature", "key encipherment"},
+				issuerRef:  *c.CertManager.OperatorClientIssuerRef,
+			}); err != nil {
+				return err
+			}
+		}
+	}
+
+	if p := cluster.Spec.TLS.Peer; p != nil && p.CertManager != nil {
+		if err := r.ensureCertificate(ctx, cluster, certificateSpec{
+			name:       cluster.Name + "-peer",
+			secretName: cluster.Name + "-peer-tls",
+			commonName: cluster.Name + "-peer",
+			dnsNames:   peerCertDNSNames(cluster),
+			usages:     []string{"server auth", "client auth", "digital signature", "key encipherment"},
+			issuerRef:  p.CertManager.IssuerRef,
+		}); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// certificateSpec collects the fields of a cert-manager Certificate we
+// actually populate. Keeps reconcileTLSCertificates readable and lets the
+// construction helper stay one place rather than three.
+type certificateSpec struct {
+	name        string
+	secretName  string
+	commonName  string
+	dnsNames    []string
+	ipAddresses []string
+	usages      []string
+	issuerRef   lll.IssuerReference
+}
+
+// ensureCertificate Creates-or-Patches a cert-manager.io/v1 Certificate.
+// Owner-ref points at the EtcdCluster so the Certificate (and through
+// it, the Secret) GCs on cluster delete. Unstructured-based to keep us
+// free of the cert-manager Go module dep — the underlying CRD shape has
+// been stable since cert-manager v1.0.
+func (r *EtcdClusterReconciler) ensureCertificate(ctx context.Context, cluster *lll.EtcdCluster, spec certificateSpec) error {
+	cert := &unstructured.Unstructured{}
+	cert.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "cert-manager.io", Version: "v1", Kind: "Certificate",
+	})
+	cert.SetName(spec.name)
+	cert.SetNamespace(cluster.Namespace)
+
+	issuerRefMap := map[string]any{
+		"name":  spec.issuerRef.Name,
+		"group": "cert-manager.io",
+	}
+	if spec.issuerRef.Kind != "" {
+		issuerRefMap["kind"] = spec.issuerRef.Kind
+	} else {
+		issuerRefMap["kind"] = "Issuer"
+	}
+
+	desiredSpec := map[string]any{
+		"secretName": spec.secretName,
+		"commonName": spec.commonName,
+		"issuerRef":  issuerRefMap,
+		"privateKey": map[string]any{
+			"algorithm": "RSA",
+			"size":      int64(2048),
+		},
+		"usages": toAnySlice(spec.usages),
+	}
+	if len(spec.dnsNames) > 0 {
+		desiredSpec["dnsNames"] = toAnySlice(spec.dnsNames)
+	}
+	if len(spec.ipAddresses) > 0 {
+		desiredSpec["ipAddresses"] = toAnySlice(spec.ipAddresses)
+	}
+
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(cert.GroupVersionKind())
+	err := r.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: spec.name}, existing)
+	switch {
+	case errors.IsNotFound(err):
+		cert.Object["spec"] = desiredSpec
+		if err := controllerutil.SetControllerReference(cluster, cert, r.Scheme); err != nil {
+			return err
+		}
+		return r.Create(ctx, cert)
+	case err != nil:
+		return err
+	}
+	// Drift reconcile on the operator-owned fields.
+	currentSpec, _, _ := unstructured.NestedMap(existing.Object, "spec")
+	if !reflect.DeepEqual(currentSpec, desiredSpec) {
+		original := existing.DeepCopy()
+		_ = unstructured.SetNestedMap(existing.Object, desiredSpec, "spec")
+		return r.Patch(ctx, existing, client.MergeFrom(original))
+	}
+	return nil
+}
+
+func toAnySlice(in []string) []any {
+	out := make([]any, len(in))
+	for i, s := range in {
+		out[i] = s
+	}
+	return out
+}
+
+// serverCertDNSNames builds the SAN list for the server cert. The
+// wildcard short and FQDN forms cover both the operator's per-pod-DNS
+// dials and etcd's own grpc-gateway loopback. The cluster-domain is
+// hardcoded to "cluster.local" in this v1 — non-standard cluster
+// domains (e.g. Cozystack's cozy.local) are an edge case to be wired
+// through as a config option.
+func serverCertDNSNames(cluster *lll.EtcdCluster) []string {
+	wild := fmt.Sprintf("*.%s.%s.svc", cluster.Name, cluster.Namespace)
+	svc := fmt.Sprintf("%s.%s.svc", cluster.Name, cluster.Namespace)
+	clientSvc := fmt.Sprintf("%s-client.%s.svc", cluster.Name, cluster.Namespace)
+	return []string{
+		wild,
+		wild + ".cluster.local",
+		svc,
+		svc + ".cluster.local",
+		clientSvc,
+		clientSvc + ".cluster.local",
+		"localhost",
+	}
+}
+
+// peerCertDNSNames builds the peer-cert SAN list. The FQDN-wildcard
+// form is load-bearing: etcd's peer-mTLS verifier reverse-DNS-looks-up
+// the connecting peer's source IP and the resulting PTR is the
+// fully-qualified pod hostname.
+func peerCertDNSNames(cluster *lll.EtcdCluster) []string {
+	wild := fmt.Sprintf("*.%s.%s.svc", cluster.Name, cluster.Namespace)
+	return []string{wild, wild + ".cluster.local"}
 }
 
 // ── Services ─────────────────────────────────────────────────────────────
