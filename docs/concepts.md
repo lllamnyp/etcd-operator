@@ -258,6 +258,8 @@ The CRD shape enforces exactly one source per subtree via CEL (`secretRef` XOR `
 
 **Single-Issuer assumption.** In the happy path the same Issuer signs both the server cert and the operator-client cert, so the CA visible in each Secret's `ca.crt` is the same content — doubling as etcd's `--trusted-ca-file`. Splitting the two Issuers across different root CAs would require the user to ensure both root CAs reach the server's trust bundle; that case is an edge to discuss later.
 
+**cert-manager not installed.** The operator probes the discovery API for `cert-manager.io/v1` at startup. When it isn't registered, a cluster whose `spec.tls` references `certManager` is parked at `Available=False / CertManagerNotInstalled` and the operator never touches the cert-manager.io GVK — avoiding the controller-runtime cached-client failure mode where a missing CRD traps the reflector in a permanent LIST retry. Recovery is "install cert-manager, restart the operator"; the discovery probe re-runs at every operator start.
+
 ### What the operator does NOT manage (yet)
 
 - **Cert rotation.** cert-manager handles renewal of operator-emitted Certificates automatically (the resulting Secret gets new bytes); the operator does NOT yet watch the Secret and roll Pods. In-place rotation requires manual one-Pod-at-a-time `kubectl delete pod`.

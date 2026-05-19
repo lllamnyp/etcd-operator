@@ -55,6 +55,14 @@ type EtcdClusterReconciler struct {
 	// EtcdClientFactory builds an etcd client. Tests inject a fake;
 	// production wiring uses DefaultEtcdClientFactory.
 	EtcdClientFactory EtcdClientFactory
+
+	// CertManagerAvailable reports whether the cert-manager.io/v1 API
+	// is registered on this cluster. Detected once at operator startup
+	// via the discovery API. When false, clusters using
+	// spec.tls.{client,peer}.certManager are surfaced as terminally
+	// Available=False/CertManagerNotInstalled rather than being
+	// reconciled into an informer hot-loop.
+	CertManagerAvailable bool
 }
 
 //+kubebuilder:rbac:groups=lllamnyp.su,resources=etcdclusters,verbs=get;list;watch
@@ -1264,6 +1272,42 @@ func (r *EtcdClusterReconciler) reconcilePDB(
 // https://cert-manager.io/docs/usage/certificate/.
 func (r *EtcdClusterReconciler) reconcileTLSCertificates(ctx context.Context, cluster *lll.EtcdCluster) error {
 	if cluster.Spec.TLS == nil {
+		return nil
+	}
+
+	needsCertManager := false
+	if c := cluster.Spec.TLS.Client; c != nil && c.CertManager != nil {
+		needsCertManager = true
+	}
+	if p := cluster.Spec.TLS.Peer; p != nil && p.CertManager != nil {
+		needsCertManager = true
+	}
+	if !needsCertManager {
+		return nil
+	}
+
+	// cert-manager.io CRDs were absent at operator startup. The cluster's
+	// spec cannot be satisfied: no Secrets will materialise, the member
+	// controller's checkTLSSecretsAvailable gate will never pass, and no
+	// Pods will be created. Surface the dead-end as a terminal status
+	// condition and refuse to touch the GVK — leaving the cached client
+	// alone keeps controller-runtime's reflector out of a permanent
+	// retry-LIST loop on a kind the apiserver doesn't know.
+	//
+	// Recovery is install-cert-manager + restart-operator. The discovery
+	// probe in main.go re-runs at every operator start.
+	if !r.CertManagerAvailable {
+		changed := setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionFalse,
+			"CertManagerNotInstalled",
+			"spec.tls.{client,peer}.certManager is set but cert-manager.io/v1 is not registered on this cluster; install cert-manager and restart the operator, or switch to BYO Secrets")
+		if changed {
+			if err := r.Status().Update(ctx, cluster); err != nil {
+				if errors.IsConflict(err) {
+					return nil
+				}
+				return err
+			}
+		}
 		return nil
 	}
 

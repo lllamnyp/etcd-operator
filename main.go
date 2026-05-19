@@ -24,9 +24,12 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/discovery"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -91,9 +94,21 @@ func main() {
 		os.Exit(1)
 	}
 
+	certManagerAvailable, err := detectCertManager(mgr.GetConfig())
+	if err != nil {
+		setupLog.Error(err, "unable to probe discovery API for cert-manager")
+		os.Exit(1)
+	}
+	if certManagerAvailable {
+		setupLog.Info("cert-manager.io/v1 API detected; spec.tls.{client,peer}.certManager will be honored")
+	} else {
+		setupLog.Info("cert-manager.io/v1 API not detected; clusters using spec.tls.{client,peer}.certManager will surface Available=False/CertManagerNotInstalled")
+	}
+
 	if err = (&controllers.EtcdClusterReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:               mgr.GetClient(),
+		Scheme:               mgr.GetScheme(),
+		CertManagerAvailable: certManagerAvailable,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "EtcdCluster")
 		os.Exit(1)
@@ -121,4 +136,38 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+// detectCertManager probes the apiserver's discovery API for the
+// cert-manager.io/v1 Certificate kind. We detect once at startup rather
+// than lazily on first use because:
+//
+//   - Lazily-detected absence trips controller-runtime's cached client into
+//     a permanent reflector retry loop (informer LIST keeps returning
+//     NoKindMatch). One-shot detection lets us skip the cache entirely
+//     when the CRD is missing, and use the cache normally when it isn't.
+//   - The signal is environmental: cert-manager is either installed or
+//     it isn't. Installing it after the operator starts requires an
+//     operator restart for the flag to flip — acceptable for v1, the
+//     standard deploy story has cert-manager as a Helm dep / prereq.
+func detectCertManager(cfg *rest.Config) (bool, error) {
+	dc, err := discovery.NewDiscoveryClientForConfig(cfg)
+	if err != nil {
+		return false, err
+	}
+	resources, err := dc.ServerResourcesForGroupVersion("cert-manager.io/v1")
+	if err != nil {
+		// IsNotFound — group/version isn't registered. That's the "no
+		// cert-manager" case, not an error.
+		if apierrors.IsNotFound(err) || discovery.IsGroupDiscoveryFailedError(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	for _, r := range resources.APIResources {
+		if r.Kind == "Certificate" {
+			return true, nil
+		}
+	}
+	return false, nil
 }

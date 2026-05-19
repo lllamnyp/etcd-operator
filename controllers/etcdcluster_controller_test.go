@@ -2883,7 +2883,7 @@ func TestReconcileTLSCertificates_EmitsExpectedCertificates(t *testing.T) {
 		},
 	}
 	c, _ := newTestClient(t, cluster)
-	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead))}
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), EtcdClientFactory: factoryReturning(newFakeEtcd(0xdead)), CertManagerAvailable: true}
 
 	if err := r.reconcileTLSCertificates(ctx, cluster); err != nil {
 		t.Fatalf("reconcileTLSCertificates: %v", err)
@@ -3023,6 +3023,64 @@ func TestReconcileTLSCertificates_EmitsExpectedCertificates(t *testing.T) {
 	}
 }
 
+// TestReconcileTLSCertificates_TerminalWhenCertManagerMissing covers the
+// dead-end case: spec.tls uses certManager but the apiserver doesn't
+// know about cert-manager.io. We must surface a terminal
+// Available=False/CertManagerNotInstalled condition, return without
+// error (so the reconcile doesn't retry-loop), and NOT touch the
+// cert-manager.io GVK (which would trip controller-runtime's cached
+// client into a permanent reflector LIST retry).
+func TestReconcileTLSCertificates_TerminalWhenCertManagerMissing(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "ns", UID: types.UID("cluster-uid")},
+		Spec: lll.EtcdClusterSpec{
+			TLS: &lll.EtcdClusterTLS{Client: &lll.ClientTLS{CertManager: &lll.ClientCertManagerTLS{
+				ServerIssuerRef: lll.IssuerReference{Name: "my-ca"},
+			}}},
+		},
+	}
+	c, _ := newTestClient(t, cluster)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), CertManagerAvailable: false}
+
+	if err := r.reconcileTLSCertificates(ctx, cluster); err != nil {
+		t.Fatalf("reconcileTLSCertificates returned err; should be nil (no retry): %v", err)
+	}
+
+	got := mustGet(t, c, "etcd", "ns", &lll.EtcdCluster{})
+	var avail *metav1.Condition
+	for i := range got.Status.Conditions {
+		if got.Status.Conditions[i].Type == lll.ClusterAvailable {
+			avail = &got.Status.Conditions[i]
+			break
+		}
+	}
+	if avail == nil {
+		t.Fatalf("expected Available condition; got %v", got.Status.Conditions)
+	}
+	if avail.Status != metav1.ConditionFalse {
+		t.Fatalf("Available.Status = %q; want False", avail.Status)
+	}
+	if avail.Reason != "CertManagerNotInstalled" {
+		t.Fatalf("Available.Reason = %q; want CertManagerNotInstalled", avail.Reason)
+	}
+
+	// AND no Certificate was attempted — without the gate, the cached
+	// client's first Get on cert-manager.io/v1 would have set up an
+	// informer. The List below confirms zero Certificates exist; we
+	// can't directly observe whether an informer was created in this
+	// in-memory fake, but the absent Create is the controller-side
+	// invariant that matters.
+	certs := &unstructured.UnstructuredList{}
+	certs.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "cert-manager.io", Version: "v1", Kind: "CertificateList",
+	})
+	_ = c.List(ctx, certs, client.InNamespace("ns"))
+	if len(certs.Items) != 0 {
+		t.Fatalf("no cert-manager Certificate should be created when CertManagerAvailable=false; got %d", len(certs.Items))
+	}
+}
+
 // TestReconcileTLSCertificates_ServerTLSOnlyOmitsOperatorClient pins the
 // mTLS toggle in cert-manager mode: an unset OperatorClientIssuerRef
 // must NOT emit an operator-client Certificate. Without this guard, the
@@ -3040,7 +3098,7 @@ func TestReconcileTLSCertificates_ServerTLSOnlyOmitsOperatorClient(t *testing.T)
 		},
 	}
 	c, _ := newTestClient(t, cluster)
-	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t)}
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), CertManagerAvailable: true}
 
 	if err := r.reconcileTLSCertificates(ctx, cluster); err != nil {
 		t.Fatalf("reconcileTLSCertificates: %v", err)
