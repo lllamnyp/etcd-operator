@@ -24,6 +24,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -541,8 +542,14 @@ func (r *EtcdMemberReconciler) ensurePodAbsent(ctx context.Context, member *lll.
 // CPU + 128Mi memory requests, no limits) preserves the operator's
 // pre-existing default behaviour for clusters that don't opt into
 // per-cluster sizing.
+//
+// The "user set anything" check is structural deep-equality against
+// the zero value rather than just `len(Requests) > 0 || len(Limits) > 0`
+// — DynamicResourceAllocation's Claims field is the third axis of
+// ResourceRequirements and would otherwise be silently swallowed by
+// the default fall-through.
 func containerResources(member *lll.EtcdMember) corev1.ResourceRequirements {
-	if len(member.Spec.Resources.Requests) > 0 || len(member.Spec.Resources.Limits) > 0 {
+	if !equality.Semantic.DeepEqual(member.Spec.Resources, corev1.ResourceRequirements{}) {
 		return *member.Spec.Resources.DeepCopy()
 	}
 	return corev1.ResourceRequirements{

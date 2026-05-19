@@ -225,8 +225,6 @@ The cluster DNS suffix is environment-dependent — `cluster.local` on most upst
 
 Every member Pod exposes a plaintext metrics listener on container port 2381 (named `metrics`) regardless of TLS state. etcd is started with `--listen-metrics-urls=http://0.0.0.0:2381`; the readiness probe targets `:2381/health` unconditionally. Bound to `0.0.0.0` rather than `localhost` because kubelet's HTTPGet probe dials the Pod IP, not loopback — a `127.0.0.1`-only listener would be unreachable from the kubelet. The same listener is what Prometheus-style scrapers (Cozystack's `VMPodScrape`, kube-prometheus's `PodMonitor`, etc.) target via the named `metrics` port. `/health` and `/metrics` are the only things exposed on this port; neither is sensitive (both are already reachable via the TLS-protected client API).
 
-Plaintext clusters keep probing `2379/health` directly — no behavioural change.
-
 ### What the operator does NOT manage (Phase 1)
 
 - **Cert issuance.** The user creates the Secrets out-of-band. cert-manager integration is a Phase 2 follow-up.

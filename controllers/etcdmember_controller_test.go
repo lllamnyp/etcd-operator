@@ -2010,6 +2010,35 @@ func TestBuildPod_UsesSpecResources(t *testing.T) {
 	}
 }
 
+// TestBuildPod_ClaimsOnlyResourcesNotDroppedToDefault covers the
+// edge case where a user sets ResourceRequirements.Claims (the
+// DynamicResourceAllocation axis) but leaves Requests and Limits
+// empty. A naive `len(Requests) > 0 || len(Limits) > 0` predicate
+// would mistake that for "user set nothing" and silently drop the
+// claims onto the floor; containerResources uses semantic deep-equality
+// against the zero value to avoid the trap.
+func TestBuildPod_ClaimsOnlyResourcesNotDroppedToDefault(t *testing.T) {
+	r := &EtcdMemberReconciler{}
+	in := corev1.ResourceRequirements{
+		Claims: []corev1.ResourceClaim{{Name: "gpu"}},
+	}
+	pod := r.buildPod(&lll.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "ns"},
+		Spec: lll.EtcdMemberSpec{
+			ClusterName: "test", Version: "3.5.17",
+			Storage:   lll.StorageSpec{Size: quickQty(t, "1Gi")},
+			Resources: in,
+		},
+	})
+	got := pod.Spec.Containers[0].Resources
+	if len(got.Claims) != 1 || got.Claims[0].Name != "gpu" {
+		t.Fatalf("Claims dropped on the floor; got %+v", got.Claims)
+	}
+	if len(got.Requests) != 0 || len(got.Limits) != 0 {
+		t.Fatalf("default-fallthrough should not fire when only Claims is set; got %+v", got)
+	}
+}
+
 // TestBuildPod_DefaultsResourcesWhenUnset preserves the pre-existing
 // 100m/128Mi request defaults for clusters that don't opt into custom
 // sizing. The fall-through behaviour matters: regressing to "no
