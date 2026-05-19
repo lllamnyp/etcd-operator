@@ -19,7 +19,6 @@ package controllers
 import (
 	"context"
 	"fmt"
-	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -63,6 +62,17 @@ type EtcdClusterReconciler struct {
 	// Available=False/CertManagerNotInstalled rather than being
 	// reconciled into an informer hot-loop.
 	CertManagerAvailable bool
+
+	// ClusterDomain is the DNS suffix used for the cluster-domain half
+	// of Kubernetes service / pod DNS (e.g. "cluster.local",
+	// "cozy.local"). Threaded into the cert-manager-emitted Certificate
+	// SAN lists so the FQDN form (`*.<cluster>.<ns>.svc.<cluster-domain>`)
+	// matches what kube-dns returns for the peer reverse-DNS lookup
+	// etcd uses to authenticate incoming peer mTLS connections.
+	//
+	// Defaults to "cluster.local" when empty. Override at operator
+	// startup with the --cluster-domain flag.
+	ClusterDomain string
 }
 
 //+kubebuilder:rbac:groups=lllamnyp.su,resources=etcdclusters,verbs=get;list;watch
@@ -73,6 +83,12 @@ type EtcdClusterReconciler struct {
 //+kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch
 //+kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// `delete` is intentionally omitted from the certificates verb list:
+// each Certificate is owned by the EtcdCluster via SetControllerReference,
+// and spec.tls is CEL-immutable post-create, so the only Certificate
+// deletion path is the apiserver's owner-ref GC cascading from a cluster
+// delete. If a future change relaxes the spec.tls immutability rule,
+// add `delete` here.
 //+kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch
 
 func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -90,6 +106,29 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// resources are cascaded out via owner refs; recreating a Service for a
 	// Terminating cluster races against the GC and pollutes logs.
 	if !cluster.DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, nil
+	}
+
+	// Terminal-config gate. spec.tls.{client,peer}.certManager requires
+	// cert-manager.io/v1 to be registered on the apiserver (detected at
+	// operator startup). When it isn't, the cluster cannot form a single
+	// Pod (the member controller is gated on Secret existence; cert-
+	// manager would never materialise it). Surface Available=False/
+	// CertManagerNotInstalled and stop here so the rest of Reconcile
+	// (which would clobber this condition with ClusterUnreachable /
+	// WaitingForSeed once it tries to bootstrap a member) doesn't run.
+	if !r.CertManagerAvailable && hasCertManagerTLS(cluster) {
+		changed := setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionFalse,
+			"CertManagerNotInstalled",
+			"spec.tls.{client,peer}.certManager is set but cert-manager.io/v1 is not registered on this cluster; install cert-manager and restart the operator, or switch to BYO Secrets")
+		if changed {
+			if err := r.Status().Update(ctx, cluster); err != nil {
+				if errors.IsConflict(err) {
+					return ctrl.Result{Requeue: true}, nil
+				}
+				return ctrl.Result{}, err
+			}
+		}
 		return ctrl.Result{}, nil
 	}
 
@@ -1270,45 +1309,34 @@ func (r *EtcdClusterReconciler) reconcilePDB(
 // use unstructured.Unstructured to avoid a dependency on the cert-manager
 // Go module; the Certificate shape is stable and well-documented at
 // https://cert-manager.io/docs/usage/certificate/.
+// hasCertManagerTLS reports whether either TLS subtree on the cluster
+// requests operator-driven cert-manager issuance. Used by the Reconcile
+// gate to decide whether the missing-cert-manager terminal path applies.
+func hasCertManagerTLS(cluster *lll.EtcdCluster) bool {
+	if cluster == nil || cluster.Spec.TLS == nil {
+		return false
+	}
+	if c := cluster.Spec.TLS.Client; c != nil && c.CertManager != nil {
+		return true
+	}
+	if p := cluster.Spec.TLS.Peer; p != nil && p.CertManager != nil {
+		return true
+	}
+	return false
+}
+
 func (r *EtcdClusterReconciler) reconcileTLSCertificates(ctx context.Context, cluster *lll.EtcdCluster) error {
+	// Callers (Reconcile) have already filtered out the
+	// "needs cert-manager but it's missing" case via hasCertManagerTLS +
+	// r.CertManagerAvailable. Anything that reaches this function either
+	// doesn't use cert-manager (no-op) or has cert-manager available.
 	if cluster.Spec.TLS == nil {
 		return nil
 	}
 
-	needsCertManager := false
-	if c := cluster.Spec.TLS.Client; c != nil && c.CertManager != nil {
-		needsCertManager = true
-	}
-	if p := cluster.Spec.TLS.Peer; p != nil && p.CertManager != nil {
-		needsCertManager = true
-	}
-	if !needsCertManager {
-		return nil
-	}
-
-	// cert-manager.io CRDs were absent at operator startup. The cluster's
-	// spec cannot be satisfied: no Secrets will materialise, the member
-	// controller's checkTLSSecretsAvailable gate will never pass, and no
-	// Pods will be created. Surface the dead-end as a terminal status
-	// condition and refuse to touch the GVK — leaving the cached client
-	// alone keeps controller-runtime's reflector out of a permanent
-	// retry-LIST loop on a kind the apiserver doesn't know.
-	//
-	// Recovery is install-cert-manager + restart-operator. The discovery
-	// probe in main.go re-runs at every operator start.
-	if !r.CertManagerAvailable {
-		changed := setClusterCondition(cluster, lll.ClusterAvailable, metav1.ConditionFalse,
-			"CertManagerNotInstalled",
-			"spec.tls.{client,peer}.certManager is set but cert-manager.io/v1 is not registered on this cluster; install cert-manager and restart the operator, or switch to BYO Secrets")
-		if changed {
-			if err := r.Status().Update(ctx, cluster); err != nil {
-				if errors.IsConflict(err) {
-					return nil
-				}
-				return err
-			}
-		}
-		return nil
+	domain := r.ClusterDomain
+	if domain == "" {
+		domain = "cluster.local"
 	}
 
 	if c := cluster.Spec.TLS.Client; c != nil && c.CertManager != nil {
@@ -1317,7 +1345,7 @@ func (r *EtcdClusterReconciler) reconcileTLSCertificates(ctx context.Context, cl
 			name:        cluster.Name + "-server",
 			secretName:  cluster.Name + "-server-tls",
 			commonName:  cluster.Name + "-server",
-			dnsNames:    serverCertDNSNames(cluster),
+			dnsNames:    serverCertDNSNames(cluster, domain),
 			ipAddresses: []string{"127.0.0.1"},
 			usages:      []string{"server auth", "client auth", "digital signature", "key encipherment"},
 			issuerRef:   c.CertManager.ServerIssuerRef,
@@ -1343,7 +1371,7 @@ func (r *EtcdClusterReconciler) reconcileTLSCertificates(ctx context.Context, cl
 			name:       cluster.Name + "-peer",
 			secretName: cluster.Name + "-peer-tls",
 			commonName: cluster.Name + "-peer",
-			dnsNames:   peerCertDNSNames(cluster),
+			dnsNames:   peerCertDNSNames(cluster, domain),
 			usages:     []string{"server auth", "client auth", "digital signature", "key encipherment"},
 			issuerRef:  p.CertManager.IssuerRef,
 		}); err != nil {
@@ -1367,18 +1395,52 @@ type certificateSpec struct {
 	issuerRef   lll.IssuerReference
 }
 
-// ensureCertificate Creates-or-Patches a cert-manager.io/v1 Certificate.
-// Owner-ref points at the EtcdCluster so the Certificate (and through
-// it, the Secret) GCs on cluster delete. Unstructured-based to keep us
-// free of the cert-manager Go module dep — the underlying CRD shape has
-// been stable since cert-manager v1.0.
+// ensureCertificate Creates a cert-manager.io/v1 Certificate at the
+// operator's desired shape if one doesn't already exist; takes no
+// action if it does. Owner-ref points at the EtcdCluster so the
+// Certificate (and through it the Secret cert-manager produces) GCs
+// on cluster delete. Unstructured-based to keep us free of the
+// cert-manager Go module dep — the underlying CRD shape has been
+// stable since cert-manager v1.0.
+//
+// Create-once rather than Create-or-Patch: the operator never has a
+// legitimate reason to mutate an existing Certificate. spec.tls is
+// CEL-immutable post-create; the SAN list is derived from immutable
+// identifiers (cluster name, namespace, cluster-domain); the issuer
+// is locked the same way. Reconciling drift on every loop would fight
+// cert-manager's webhook over its defaulted optional fields
+// (revisionHistoryLimit, privateKey.rotationPolicy, …) — MergeFrom-
+// based patches null them out, cert-manager re-defaults them, the
+// audit log fills up. The simpler invariant is: we own the shape at
+// creation, after that the resource is cert-manager's territory.
+//
+// A future operator version that needs to evolve emitted Certificate
+// shape (e.g. new SAN policy) should ship a one-off migration step
+// distinct from steady-state reconcile.
 func (r *EtcdClusterReconciler) ensureCertificate(ctx context.Context, cluster *lll.EtcdCluster, spec certificateSpec) error {
-	cert := &unstructured.Unstructured{}
-	cert.SetGroupVersionKind(schema.GroupVersionKind{
+	gvk := schema.GroupVersionKind{
 		Group: "cert-manager.io", Version: "v1", Kind: "Certificate",
-	})
+	}
+
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(gvk)
+	err := r.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: spec.name}, existing)
+	switch {
+	case err == nil:
+		// Already created in a previous reconcile (or by the same
+		// reconcile that's now retrying). Leave it alone.
+		return nil
+	case !errors.IsNotFound(err):
+		return err
+	}
+
+	cert := &unstructured.Unstructured{}
+	cert.SetGroupVersionKind(gvk)
 	cert.SetName(spec.name)
 	cert.SetNamespace(cluster.Namespace)
+	if err := controllerutil.SetControllerReference(cluster, cert, r.Scheme); err != nil {
+		return err
+	}
 
 	issuerRefMap := map[string]any{
 		"name":  spec.issuerRef.Name,
@@ -1390,6 +1452,10 @@ func (r *EtcdClusterReconciler) ensureCertificate(ctx context.Context, cluster *
 		issuerRefMap["kind"] = "Issuer"
 	}
 
+	// privateKey.{algorithm,size} pinned to RSA-2048: matches cert-
+	// manager's own default today, but pinning shields us against a
+	// future cert-manager default flip (e.g. to ECDSA) that some etcd
+	// peers might not negotiate.
 	desiredSpec := map[string]any{
 		"secretName": spec.secretName,
 		"commonName": spec.commonName,
@@ -1406,28 +1472,9 @@ func (r *EtcdClusterReconciler) ensureCertificate(ctx context.Context, cluster *
 	if len(spec.ipAddresses) > 0 {
 		desiredSpec["ipAddresses"] = toAnySlice(spec.ipAddresses)
 	}
+	cert.Object["spec"] = desiredSpec
 
-	existing := &unstructured.Unstructured{}
-	existing.SetGroupVersionKind(cert.GroupVersionKind())
-	err := r.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: spec.name}, existing)
-	switch {
-	case errors.IsNotFound(err):
-		cert.Object["spec"] = desiredSpec
-		if err := controllerutil.SetControllerReference(cluster, cert, r.Scheme); err != nil {
-			return err
-		}
-		return r.Create(ctx, cert)
-	case err != nil:
-		return err
-	}
-	// Drift reconcile on the operator-owned fields.
-	currentSpec, _, _ := unstructured.NestedMap(existing.Object, "spec")
-	if !reflect.DeepEqual(currentSpec, desiredSpec) {
-		original := existing.DeepCopy()
-		_ = unstructured.SetNestedMap(existing.Object, desiredSpec, "spec")
-		return r.Patch(ctx, existing, client.MergeFrom(original))
-	}
-	return nil
+	return r.Create(ctx, cert)
 }
 
 func toAnySlice(in []string) []any {
@@ -1441,20 +1488,19 @@ func toAnySlice(in []string) []any {
 // serverCertDNSNames builds the SAN list for the server cert. The
 // wildcard short and FQDN forms cover both the operator's per-pod-DNS
 // dials and etcd's own grpc-gateway loopback. The cluster-domain is
-// hardcoded to "cluster.local" in this v1 — non-standard cluster
-// domains (e.g. Cozystack's cozy.local) are an edge case to be wired
-// through as a config option.
-func serverCertDNSNames(cluster *lll.EtcdCluster) []string {
+// passed in from the operator's --cluster-domain flag (default
+// "cluster.local"; Cozystack uses "cozy.local").
+func serverCertDNSNames(cluster *lll.EtcdCluster, clusterDomain string) []string {
 	wild := fmt.Sprintf("*.%s.%s.svc", cluster.Name, cluster.Namespace)
 	svc := fmt.Sprintf("%s.%s.svc", cluster.Name, cluster.Namespace)
 	clientSvc := fmt.Sprintf("%s-client.%s.svc", cluster.Name, cluster.Namespace)
 	return []string{
 		wild,
-		wild + ".cluster.local",
+		wild + "." + clusterDomain,
 		svc,
-		svc + ".cluster.local",
+		svc + "." + clusterDomain,
 		clientSvc,
-		clientSvc + ".cluster.local",
+		clientSvc + "." + clusterDomain,
 		"localhost",
 	}
 }
@@ -1462,10 +1508,10 @@ func serverCertDNSNames(cluster *lll.EtcdCluster) []string {
 // peerCertDNSNames builds the peer-cert SAN list. The FQDN-wildcard
 // form is load-bearing: etcd's peer-mTLS verifier reverse-DNS-looks-up
 // the connecting peer's source IP and the resulting PTR is the
-// fully-qualified pod hostname.
-func peerCertDNSNames(cluster *lll.EtcdCluster) []string {
+// fully-qualified pod hostname (`<pod>.<service>.<ns>.svc.<cluster-domain>`).
+func peerCertDNSNames(cluster *lll.EtcdCluster, clusterDomain string) []string {
 	wild := fmt.Sprintf("*.%s.%s.svc", cluster.Name, cluster.Namespace)
-	return []string{wild, wild + ".cluster.local"}
+	return []string{wild, wild + "." + clusterDomain}
 }
 
 // ── Services ─────────────────────────────────────────────────────────────

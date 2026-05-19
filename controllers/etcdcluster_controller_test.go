@@ -3023,28 +3023,53 @@ func TestReconcileTLSCertificates_EmitsExpectedCertificates(t *testing.T) {
 	}
 }
 
-// TestReconcileTLSCertificates_TerminalWhenCertManagerMissing covers the
-// dead-end case: spec.tls uses certManager but the apiserver doesn't
-// know about cert-manager.io. We must surface a terminal
-// Available=False/CertManagerNotInstalled condition, return without
-// error (so the reconcile doesn't retry-loop), and NOT touch the
-// cert-manager.io GVK (which would trip controller-runtime's cached
-// client into a permanent reflector LIST retry).
-func TestReconcileTLSCertificates_TerminalWhenCertManagerMissing(t *testing.T) {
+// TestReconcile_CertManagerMissingIsTerminal exercises the full
+// Reconcile against a cluster with spec.tls.client.certManager set and
+// CertManagerAvailable=false. The contract has three pieces, ALL of
+// which need the gate to live at the top of Reconcile rather than
+// inside the cert-emission helper:
+//
+//  1. The Available condition reads CertManagerNotInstalled (not
+//     ClusterUnreachable or WaitingForSeed, which is what later stages
+//     of Reconcile would write if they got to run).
+//  2. No EtcdMember CR is bootstrapped — the member controller would
+//     park it indefinitely waiting for a Secret that's never coming.
+//  3. No cert-manager.io/v1 GVK is touched (no Create, no Get) —
+//     controller-runtime's cached client would otherwise set up an
+//     informer for the unknown kind on first Get and the reflector
+//     would retry-LIST forever.
+//
+// Pinning the contract via the helper alone (the prior version of this
+// test) misses pieces 1 and 2: Reconcile would clobber the condition
+// and create the EtcdMember anyway. This integration-shaped variant
+// catches that.
+func TestReconcile_CertManagerMissingIsTerminal(t *testing.T) {
 	ctx := context.Background()
 	cluster := &lll.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "ns", UID: types.UID("cluster-uid")},
 		Spec: lll.EtcdClusterSpec{
+			Replicas: ptrInt32(3),
+			Version:  "3.5.17",
+			Storage:  lll.StorageSpec{Size: quickQty(t, "1Gi")},
 			TLS: &lll.EtcdClusterTLS{Client: &lll.ClientTLS{CertManager: &lll.ClientCertManagerTLS{
 				ServerIssuerRef: lll.IssuerReference{Name: "my-ca"},
 			}}},
 		},
 	}
 	c, _ := newTestClient(t, cluster)
-	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), CertManagerAvailable: false}
+	r := &EtcdClusterReconciler{
+		Client:               c,
+		Scheme:               testScheme(t),
+		EtcdClientFactory:    factoryReturning(newFakeEtcd(0xdead)),
+		CertManagerAvailable: false,
+	}
 
-	if err := r.reconcileTLSCertificates(ctx, cluster); err != nil {
-		t.Fatalf("reconcileTLSCertificates returned err; should be nil (no retry): %v", err)
+	// Run Reconcile a couple of times — once to install the condition,
+	// then again to make sure no later reconcile path overrides it.
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "etcd", Namespace: "ns"}}); err != nil {
+			t.Fatalf("Reconcile #%d: unexpected error: %v", i, err)
+		}
 	}
 
 	got := mustGet(t, c, "etcd", "ns", &lll.EtcdCluster{})
@@ -3062,15 +3087,17 @@ func TestReconcileTLSCertificates_TerminalWhenCertManagerMissing(t *testing.T) {
 		t.Fatalf("Available.Status = %q; want False", avail.Status)
 	}
 	if avail.Reason != "CertManagerNotInstalled" {
-		t.Fatalf("Available.Reason = %q; want CertManagerNotInstalled", avail.Reason)
+		t.Fatalf("Available.Reason = %q; want CertManagerNotInstalled (any other reason means a later reconcile path clobbered it)", avail.Reason)
 	}
 
-	// AND no Certificate was attempted — without the gate, the cached
-	// client's first Get on cert-manager.io/v1 would have set up an
-	// informer. The List below confirms zero Certificates exist; we
-	// can't directly observe whether an informer was created in this
-	// in-memory fake, but the absent Create is the controller-side
-	// invariant that matters.
+	// No EtcdMember was bootstrapped.
+	members := &lll.EtcdMemberList{}
+	_ = c.List(ctx, members, client.InNamespace("ns"))
+	if len(members.Items) != 0 {
+		t.Fatalf("expected zero EtcdMember CRs for a terminally-misconfigured cluster; got %d", len(members.Items))
+	}
+
+	// No Certificate was created.
 	certs := &unstructured.UnstructuredList{}
 	certs.SetGroupVersionKind(schema.GroupVersionKind{
 		Group: "cert-manager.io", Version: "v1", Kind: "CertificateList",
@@ -3104,6 +3131,7 @@ func TestReconcileTLSCertificates_ServerTLSOnlyOmitsOperatorClient(t *testing.T)
 		t.Fatalf("reconcileTLSCertificates: %v", err)
 	}
 
+	// 1. Operator-client Certificate must NOT exist.
 	opCert := &unstructured.Unstructured{}
 	opCert.SetGroupVersionKind(schema.GroupVersionKind{
 		Group: "cert-manager.io", Version: "v1", Kind: "Certificate",
@@ -3111,5 +3139,159 @@ func TestReconcileTLSCertificates_ServerTLSOnlyOmitsOperatorClient(t *testing.T)
 	err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "etcd-operator-client"}, opCert)
 	if err == nil {
 		t.Fatalf("server-TLS-only mode must NOT emit operator-client Certificate; got %+v", opCert.Object)
+	}
+
+	// 2. Server Certificate MUST still exist, fully wired. Regressing
+	//    this (an empty emit, or one missing issuerRef/SANs) would slip
+	//    past the original narrower test.
+	serverCert := &unstructured.Unstructured{}
+	serverCert.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "cert-manager.io", Version: "v1", Kind: "Certificate",
+	})
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "etcd-server"}, serverCert); err != nil {
+		t.Fatalf("Get Certificate/etcd-server: %v", err)
+	}
+	sn, _, _ := unstructured.NestedString(serverCert.Object, "spec", "secretName")
+	if sn != "etcd-server-tls" {
+		t.Fatalf("server Certificate spec.secretName = %q; want etcd-server-tls", sn)
+	}
+	issuer, _, _ := unstructured.NestedString(serverCert.Object, "spec", "issuerRef", "name")
+	if issuer != "my-ca" {
+		t.Fatalf("server Certificate spec.issuerRef.name = %q; want my-ca", issuer)
+	}
+	group, _, _ := unstructured.NestedString(serverCert.Object, "spec", "issuerRef", "group")
+	if group != "cert-manager.io" {
+		t.Fatalf("server Certificate spec.issuerRef.group = %q; want cert-manager.io", group)
+	}
+	dnsAny, _, _ := unstructured.NestedSlice(serverCert.Object, "spec", "dnsNames")
+	if len(dnsAny) == 0 {
+		t.Fatalf("server Certificate has empty dnsNames; want wildcard + FQDN + service + localhost")
+	}
+	ipsAny, _, _ := unstructured.NestedSlice(serverCert.Object, "spec", "ipAddresses")
+	foundLoopback := false
+	for _, ip := range ipsAny {
+		if s, ok := ip.(string); ok && s == "127.0.0.1" {
+			foundLoopback = true
+			break
+		}
+	}
+	if !foundLoopback {
+		t.Fatalf("server Certificate missing 127.0.0.1 IP SAN; got %v", ipsAny)
+	}
+}
+
+// TestReconcileTLSCertificates_ClusterIssuerKind exercises the
+// ClusterIssuer code path, which is the standard production setup
+// (one cluster-wide CA serving many namespaces). Without this the
+// regression "operator silently writes kind: Issuer regardless of
+// what the user set" would slip through the prior test which only
+// covered the namespaced-Issuer kind.
+func TestReconcileTLSCertificates_ClusterIssuerKind(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "ns", UID: types.UID("cluster-uid")},
+		Spec: lll.EtcdClusterSpec{
+			TLS: &lll.EtcdClusterTLS{
+				Client: &lll.ClientTLS{CertManager: &lll.ClientCertManagerTLS{
+					ServerIssuerRef:         lll.IssuerReference{Name: "shared-ca", Kind: "ClusterIssuer"},
+					OperatorClientIssuerRef: &lll.IssuerReference{Name: "shared-ca", Kind: "ClusterIssuer"},
+				}},
+				Peer: &lll.PeerTLS{CertManager: &lll.PeerCertManagerTLS{
+					IssuerRef: lll.IssuerReference{Name: "shared-peer-ca", Kind: "ClusterIssuer"},
+				}},
+			},
+		},
+	}
+	c, _ := newTestClient(t, cluster)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), CertManagerAvailable: true}
+
+	if err := r.reconcileTLSCertificates(ctx, cluster); err != nil {
+		t.Fatalf("reconcileTLSCertificates: %v", err)
+	}
+
+	for _, n := range []string{"etcd-server", "etcd-operator-client", "etcd-peer"} {
+		got := &unstructured.Unstructured{}
+		got.SetGroupVersionKind(schema.GroupVersionKind{
+			Group: "cert-manager.io", Version: "v1", Kind: "Certificate",
+		})
+		if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: n}, got); err != nil {
+			t.Fatalf("Certificate/%s not created: %v", n, err)
+		}
+		kind, _, _ := unstructured.NestedString(got.Object, "spec", "issuerRef", "kind")
+		if kind != "ClusterIssuer" {
+			t.Fatalf("Certificate/%s spec.issuerRef.kind = %q; want ClusterIssuer", n, kind)
+		}
+	}
+}
+
+// TestEnsureCertificate_DoesNotPatchExistingCertificate covers
+// reviewer blocker 3: an existing Certificate may carry fields the
+// operator doesn't own (cert-manager-defaulted revisionHistoryLimit,
+// privateKey.rotationPolicy, etc.). The reconciler must NOT issue a
+// Patch on every reconcile that would null those out. Pre-populate a
+// Certificate with extra spec keys and assert ensureCertificate
+// leaves it untouched.
+func TestEnsureCertificate_DoesNotPatchExistingCertificate(t *testing.T) {
+	ctx := context.Background()
+	cluster := &lll.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "ns", UID: types.UID("cluster-uid")},
+	}
+
+	preExisting := &unstructured.Unstructured{}
+	preExisting.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "cert-manager.io", Version: "v1", Kind: "Certificate",
+	})
+	preExisting.SetName("etcd-server")
+	preExisting.SetNamespace("ns")
+	preExisting.Object["spec"] = map[string]any{
+		"secretName": "etcd-server-tls",
+		"commonName": "etcd-server",
+		"issuerRef": map[string]any{
+			"name":  "my-ca",
+			"kind":  "Issuer",
+			"group": "cert-manager.io",
+		},
+		// Fields cert-manager would default — operator doesn't own them.
+		"revisionHistoryLimit": int64(1),
+		"privateKey": map[string]any{
+			"algorithm":      "RSA",
+			"size":           int64(2048),
+			"rotationPolicy": "Never",
+			"encoding":       "PKCS1",
+		},
+	}
+
+	c, _ := newTestClient(t, cluster, preExisting)
+	r := &EtcdClusterReconciler{Client: c, Scheme: testScheme(t), CertManagerAvailable: true}
+
+	if err := r.ensureCertificate(ctx, cluster, certificateSpec{
+		name:       "etcd-server",
+		secretName: "etcd-server-tls",
+		commonName: "etcd-server",
+		issuerRef:  lll.IssuerReference{Name: "my-ca", Kind: "Issuer"},
+		dnsNames:   []string{"localhost"},
+		usages:     []string{"server auth", "client auth"},
+	}); err != nil {
+		t.Fatalf("ensureCertificate: %v", err)
+	}
+
+	// Re-read the Certificate. cert-manager-defaulted fields must still
+	// be present at their original values.
+	got := &unstructured.Unstructured{}
+	got.SetGroupVersionKind(preExisting.GroupVersionKind())
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "etcd-server"}, got); err != nil {
+		t.Fatalf("re-Get: %v", err)
+	}
+	rhl, found, _ := unstructured.NestedInt64(got.Object, "spec", "revisionHistoryLimit")
+	if !found || rhl != 1 {
+		t.Fatalf("spec.revisionHistoryLimit lost or mutated; got %v (found=%v)", rhl, found)
+	}
+	rp, found, _ := unstructured.NestedString(got.Object, "spec", "privateKey", "rotationPolicy")
+	if !found || rp != "Never" {
+		t.Fatalf("spec.privateKey.rotationPolicy lost or mutated; got %v (found=%v)", rp, found)
+	}
+	enc, found, _ := unstructured.NestedString(got.Object, "spec", "privateKey", "encoding")
+	if !found || enc != "PKCS1" {
+		t.Fatalf("spec.privateKey.encoding lost or mutated; got %v (found=%v)", enc, found)
 	}
 }

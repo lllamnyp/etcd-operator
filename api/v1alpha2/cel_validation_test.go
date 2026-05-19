@@ -546,6 +546,20 @@ func TestCEL_HappyPathAccepts(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "cert-manager mTLS with ClusterIssuer kind",
+			mut: func(c *lll.EtcdCluster) {
+				c.Spec.TLS = &lll.EtcdClusterTLS{
+					Client: &lll.ClientTLS{CertManager: &lll.ClientCertManagerTLS{
+						ServerIssuerRef:         lll.IssuerReference{Name: "shared-ca", Kind: "ClusterIssuer"},
+						OperatorClientIssuerRef: &lll.IssuerReference{Name: "shared-ca", Kind: "ClusterIssuer"},
+					}},
+					Peer: &lll.PeerTLS{CertManager: &lll.PeerCertManagerTLS{
+						IssuerRef: lll.IssuerReference{Name: "shared-peer-ca", Kind: "ClusterIssuer"},
+					}},
+				}
+			},
+		},
 	}
 
 	for _, tc := range cases {

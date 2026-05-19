@@ -57,11 +57,16 @@ func main() {
 	var metricsAddr string
 	var enableLeaderElection bool
 	var probeAddr string
+	var clusterDomain string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
+	flag.StringVar(&clusterDomain, "cluster-domain", "cluster.local",
+		"DNS suffix used by the Kubernetes cluster (e.g. 'cluster.local', 'cozy.local'). "+
+			"Threaded into cert-manager-emitted Certificate SANs so the FQDN form "+
+			"matches what kube-dns returns for peer reverse-DNS verification.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -100,15 +105,17 @@ func main() {
 		os.Exit(1)
 	}
 	if certManagerAvailable {
-		setupLog.Info("cert-manager.io/v1 API detected; spec.tls.{client,peer}.certManager will be honored")
+		setupLog.Info("cert-manager.io/v1 API detected; spec.tls.{client,peer}.certManager will be honored",
+			"clusterDomain", clusterDomain)
 	} else {
-		setupLog.Info("cert-manager.io/v1 API not detected; clusters using spec.tls.{client,peer}.certManager will surface Available=False/CertManagerNotInstalled")
+		setupLog.Info("cert-manager.io/v1 API not detected; Reconcile will short-circuit clusters using spec.tls.{client,peer}.certManager with Available=False/CertManagerNotInstalled")
 	}
 
 	if err = (&controllers.EtcdClusterReconciler{
 		Client:               mgr.GetClient(),
 		Scheme:               mgr.GetScheme(),
 		CertManagerAvailable: certManagerAvailable,
+		ClusterDomain:        clusterDomain,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "EtcdCluster")
 		os.Exit(1)
