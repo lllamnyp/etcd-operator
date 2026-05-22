@@ -254,7 +254,7 @@ The cluster controller emits up to three `cert-manager.io/v1` `Certificate` reso
 
 The CRD shape enforces exactly one source per subtree via CEL (`secretRef` XOR `certManager`), and `tls.client.operatorClientSecretRef` cannot coexist with `tls.client.certManager` — the mTLS toggle in cert-manager mode lives at `certManager.operatorClientIssuerRef`.
 
-**Cluster DNS suffix.** The emitted SANs hardcode `cluster.local`. Most upstream k8s clusters use this; Cozystack (`cozy.local`) and other non-default-domain clusters need to fall back to BYO Secrets until a `clusterDomain` override lands. This is the one happy-path-only edge in this revision.
+**Cluster DNS suffix.** The FQDN form of the emitted SANs (`*.<cluster>.<ns>.svc.<cluster-domain>`) needs the cluster's actual DNS suffix. The operator auto-discovers it from `/etc/resolv.conf`'s `search` line at startup — covering `cluster.local`, Cozystack's `cozy.local`, and any other kubelet-injected suffix for normal cluster-pod deployments — and falls back to `cluster.local` only when auto-discovery yields nothing (hostNetwork pods, custom `dnsPolicy`). Override explicitly with `--cluster-domain=<suffix>` when neither path finds the right value. See [installation: prerequisites for cert-manager mode](installation.md#prerequisites-for-cert-manager-mode).
 
 **Single-Issuer assumption.** In the happy path the same Issuer signs both the server cert and the operator-client cert, so the CA visible in each Secret's `ca.crt` is the same content — doubling as etcd's `--trusted-ca-file`. Splitting the two Issuers across different root CAs would require the user to ensure both root CAs reach the server's trust bundle; that case is an edge to discuss later.
 
@@ -331,6 +331,6 @@ A few things that recur in similar operators but are intentionally absent here:
 
 - **No automatic broken-member replacement for PVC clusters.** `isBroken` is a real predicate only for memory-backed members (Pod lost → memory gone → member replaced); for PVC-backed members it stays a stub. The replacement policy (corruption? irrecoverable crashloop? quorum-loss handling?) is a richer decision and not yet wired up. Broken PVC members stay broken and require an explicit user action (see [operations.md](operations.md#broken-member)).
 - **No leader-aware client routing.** Each etcd-client call balanced by clientv3 lands on whatever endpoint is first responsive. Filtering to non-learner endpoints (the issue #12 fix) handles the "rpc not supported for learner" case, but heavy `MemberList` traffic can still spread across followers. A leader-aware proxy or a sidecar that intercepts apiserver→etcd traffic is the proper fix; not in scope here.
-- **No TLS, no auth/RBAC inside etcd.** v1alpha2 ships HTTP-only. Adding TLS means wiring cert-manager (or equivalent), rotating certs, and threading them through the Pod spec. Doable but a separate concern.
+- **No auth/RBAC inside etcd.** Transport TLS is supported (BYO Secrets or operator-emitted cert-manager Certificates — see [TLS](#tls)), but etcd's own username/password and role-based authorization layer is not wired up. A separate concern from transport security.
 
 See [`What's not supported`](../README.md#whats-not-supported-yet) in the README for the running follow-up list.
