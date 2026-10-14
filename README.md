@@ -1,96 +1,47 @@
-# etcd-operator
+# etcd-operator has moved to [cozystack/etcd-operator](https://github.com/cozystack/etcd-operator)
 
-A Kubernetes operator for running [etcd](https://etcd.io/) clusters. Status: **early alpha** — API is `lllamnyp.su/v1alpha2` and will likely change.
+> [!IMPORTANT]
+> **This repository is retired and read-only.** Development continues at
+> **<https://github.com/cozystack/etcd-operator>**. Open issues, pull requests,
+> releases, the Helm chart and the container image all live there now.
 
-## What it does
+## What happened to the work here
 
-The operator manages etcd clusters via two custom resources:
+Nothing was lost. This repository's `master` branch, up to and including
+[#26](https://github.com/lllamnyp/etcd-operator/pull/26) (commit `9a6cc65`), is
+part of the `main` branch history of
+[cozystack/etcd-operator](https://github.com/cozystack/etcd-operator) unchanged,
+so every feature built here (learner-mode scaling, scale to zero, memory-backed
+storage, CEL validation, PodDisruptionBudget, TLS via Secrets or cert-manager,
+`spec.resources` and the `/scale` subresource) ships in the Cozystack releases.
+Development continued there from the next commit onward.
 
-- **`EtcdCluster`** — what the user creates. Captures cluster-wide intent: replica count, etcd version, per-member storage size, a progress deadline.
-- **`EtcdMember`** — what the operator creates. One per etcd member. Owns its Pod and PVC. Operator-managed; users should not edit these directly.
+The issues filed here are kept for reference. File new issues and pull
+requests at
+[cozystack/etcd-operator](https://github.com/cozystack/etcd-operator/issues).
 
-There is no StatefulSet. Each member's Pod and PVC are reconciled independently so the operator can model protocol-aware lifecycle (learner-mode joins, member-id assignment, graceful removal, scale-to-zero pause/resume) without fighting StatefulSet's "all replicas are one workload" assumption.
+## Names that changed in the move
 
-The full design rationale is in [docs/concepts.md](docs/concepts.md).
+| What | Here (retired) | Now |
+|---|---|---|
+| Repository | `github.com/lllamnyp/etcd-operator` | [`github.com/cozystack/etcd-operator`](https://github.com/cozystack/etcd-operator) |
+| Go module | `github.com/lllamnyp/etcd-operator` | `github.com/cozystack/etcd-operator` |
+| API group | `lllamnyp.su/v1alpha2` | `etcd-operator.cozystack.io/v1alpha2` |
+| Cluster label | `etcd.lllamnyp.su/cluster` | `etcd-operator.cozystack.io/cluster` |
+| Operator image | `docker.io/lllamnyp/etcd-operator` (no new builds) | `ghcr.io/cozystack/etcd-operator` |
+| Helm chart | none | `oci://ghcr.io/cozystack/charts/etcd-operator` |
 
-## What's supported today
+The API group changed, so the Cozystack operator does not pick up `EtcdCluster`
+objects created under `lllamnyp.su`. A spec written for this repository is still
+valid there once its `apiVersion` is changed. Applying it creates a new, empty
+etcd cluster, though. To carry data over, take an `etcdctl snapshot` and restore
+it at bootstrap with `spec.bootstrap.restore`.
 
-- **Bootstrap** of new clusters. Single seed first, learner-mode adds afterwards.
-- **Scale up / down**: cluster controller adds members one at a time as learners and promotes them; scale-down picks the most-recently-created member, runs `MemberRemove` via a finalizer, then GCs the Pod and PVC.
-- **Scale to zero (pause/resume)**: `spec.replicas: 0` parks the surviving member via `spec.dormant=true`; the Pod is deleted, the PVC stays owned by the `EtcdMember`. Scaling back up to ≥ 1 flips `spec.dormant=false` on the same member; etcd resumes from the existing data dir with the same cluster ID and member ID.
-- **Pod restart / node failure**: data PVC is preserved, the new Pod reads the existing WAL and rejoins with the same member ID.
-- **Memory-backed storage (opt-in)**: `spec.storage.medium: Memory` switches each member's data dir to a tmpfs `emptyDir` whose lifetime is bound to the Pod. Members that lose their Pod (eviction, node failure) lose their data; the operator detects this, removes the member from etcd, and replaces it via the existing scale-up path. Suits scenarios where the etcd state is reconstructable and replication absorbs single-member losses. Remaining production hardening (anti-affinity / resource defaults) is tracked in [#16](https://github.com/lllamnyp/etcd-operator/issues/16); see [docs/concepts.md](docs/concepts.md#storage).
-- **Apiserver-enforced validation**: CEL rules on the CRD (k8s 1.29+) reject `replicas: 0` with `storage.medium: Memory`, `storage.size: 0` with `storage.medium: Memory`, `storage.medium` changes after creation, and `storage.size` shrinks. No webhook / cert-manager dependency.
-- **PodDisruptionBudget**: per-cluster PDB selects voting members only (`role=voter`); `maxUnavailable = (voters-1)/2` so `kubectl drain` cannot voluntarily push the cluster below quorum.
-- **TLS (BYO Secrets or cert-manager)**: `spec.tls.client` / `spec.tls.peer` enable TLS on each surface independently. Material comes from either user-provided Secrets (`serverSecretRef` / `operatorClientSecretRef` / `secretRef`) or operator-emitted `cert-manager.io/v1` Certificates (`certManager.{serverIssuerRef,operatorClientIssuerRef,issuerRef}`) — mutually exclusive per subtree, enforced by CEL. mTLS is the implicit mode when an operator-client source is supplied; server-TLS-only when it isn't. The whole `tls` subtree is CEL-locked immutable post-create. cert-manager-emitted certs auto-renew via cert-manager; Pod-side rotation is a manual one-at-a-time `kubectl delete pod` either way. See [docs/concepts.md](docs/concepts.md#tls).
-- **Resource sizing**: `spec.resources` (a `corev1.ResourceRequirements`) sets the etcd container's CPU/memory requests and limits. Unset uses a conservative 100m/128Mi-request default. Updates take effect on newly-created members; pair with a `VerticalPodAutoscaler` targeting the cluster for live recommendation/rollout.
-- **Monitoring / autoscaling hooks**: every member Pod always exposes a plaintext `metrics` container port at `2381` (etcd's `/health` + Prometheus `/metrics`) for `VMPodScrape` / `PodMonitor`. The `EtcdCluster` CRD exposes the `/scale` subresource with a populated `status.selector`, making it a valid target for `kubectl scale` and `VerticalPodAutoscaler.targetRef`.
-- **Locking pattern**: `status.observed` snapshots the in-flight target so mid-flight spec edits don't corrupt consensus; `progressDeadline` bounds how long the operator will spend trying to reach a target.
-- **Cluster deletion**: cascading owner refs clean up everything; finalizers detect "the whole cluster is going away" and skip etcd-side removal to avoid deadlock.
-
-## What's not supported (yet)
-
-No auth/RBAC inside etcd. No in-place version upgrades (changing `spec.version` only affects newly-created members). No PVC resizing — see [#2](https://github.com/lllamnyp/etcd-operator/issues/2). No automatic broken-member replacement for PVC-backed clusters (memory-backed members do auto-replace on Pod loss; `status.brokenMembers` reads 0 in practice — see [docs/concepts.md](docs/concepts.md#storage)). No backups, no defragmentation scheduling, no PodAntiAffinity by default (tracked in [#16](https://github.com/lllamnyp/etcd-operator/issues/16)). See the [issue tracker](https://github.com/lllamnyp/etcd-operator/issues) for the running follow-up list.
-
-## Quick start
-
-```sh
-# 1. Install CRDs and the operator. Builds an image and pushes it to your
-#    registry; substitute IMG= for a prebuilt tag if you have one. The cluster
-#    must be able to pull from <your-registry> — for local clusters (kind /
-#    minikube / k3d) sideload the image or use an ephemeral registry such as
-#    ttl.sh, otherwise the operator Deployment will sit in ImagePullBackOff.
-make install
-make docker-build docker-push deploy IMG=<your-registry>/etcd-operator:<tag>
-
-# 2. Create a cluster.
-cat <<'EOF' | kubectl apply -f -
-apiVersion: lllamnyp.su/v1alpha2
-kind: EtcdCluster
-metadata:
-  name: my-etcd
-  namespace: default
-spec:
-  replicas: 3
-  version: 3.5.17
-  storage:
-    size: 1Gi
-EOF
-
-# 3. Wait for ready and inspect.
-kubectl get etcdcluster.lllamnyp.su my-etcd -w
-POD=$(kubectl get pod -l etcd.lllamnyp.su/cluster=my-etcd \
-  -o jsonpath='{.items[0].metadata.name}')
-kubectl exec -it "$POD" -- etcdctl --endpoints=http://localhost:2379 \
-  member list -w table
-```
-
-Member names are apiserver-assigned (`GenerateName="<cluster>-"`) — don't hard-code them; use the cluster label selector.
-
-For step-by-step setup, RBAC, image versions, and teardown see [docs/installation.md](docs/installation.md).
-
-## Documentation
-
-- **[Installation](docs/installation.md)** — deploy the operator, create your first cluster, networking pitfalls, upgrades.
-- **[Concepts](docs/concepts.md)** — design rationale: locking pattern, single-seed bootstrap, GenerateName naming, scale-to-zero mechanics, conditions reference.
-- **[Operations](docs/operations.md)** — runbook for day-2: scaling, pausing/resuming, decoding conditions, escalating stuck reconciles, broken-member recovery.
-
-## Testing
-
-```sh
-go test ./controllers/...
-```
-
-The suite uses controller-runtime's fake client and a fake etcd client; no envtest assets needed at the unit level. Pinned behaviours:
-
-- **Bootstrap** — single-seed creation, idempotent recovery, `GenerateName`-assigned names.
-- **Locking pattern** — `status.observed` / `progressDeadline` lock the in-flight target; bootstrap-deadline is terminal.
-- **Scale up** — learner-mode add, readiness gate before the next step, crash-recovery branches between `Create` / `MemberAddAsLearner` / `Patch(initialCluster)`.
-- **Scale down** — `CreationTimestamp` DESC (name DESC tiebreak) victim selection, finalizer-driven `MemberRemove`.
-- **Scale to zero** — 1→0 Patches `spec.dormant=true`; 0→1 flips it back; dormant member's Pod is gone but its PVC is preserved.
-- **Discovery** — seed found via `spec.bootstrap=true`; etcd client endpoints filtered to voters (`MemberReady=True`) so `MemberList` doesn't route to a learner.
-- **Status no-churn** — steady-state reconciles don't repeatedly mutate status.
+Start with the
+[installation guide](https://github.com/cozystack/etcd-operator/blob/main/docs/installation.md)
+in the new repository. The `docs/` directory here describes the code as it
+stood at `9a6cc65` and is not maintained.
 
 ## License
 
-Apache 2.0. See `LICENSE`.
+Apache 2.0.
