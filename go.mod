@@ -1,3 +1,4 @@
+// Deprecated: moved to github.com/cozystack/etcd-operator.
 module github.com/lllamnyp/etcd-operator
 
 go 1.25.0
